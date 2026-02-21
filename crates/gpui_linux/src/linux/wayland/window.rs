@@ -1124,6 +1124,10 @@ impl PlatformWindow for WaylandWindow {
             .detach();
     }
 
+    fn set_position(&self, _origin: Point<Pixels>) {
+        log::debug!("Wayland compositor controls window positioning");
+    }
+
     fn scale_factor(&self) -> f32 {
         self.borrow().scale
     }
