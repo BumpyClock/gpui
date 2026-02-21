@@ -1,0 +1,7 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     '/Users/adityasharma/Projects/gpui/target/debug/build/aws-lc-sys-2c29910a094848bd/out/memcmp_invalid_stripped_check'
+relocations:
+  - { offset: 0x26, size: 0x8, addend: 0x0, symName: _main, symObjAddr: 0x0, symBinAddr: 0x100000608, symSize: 0x78 }
+  - { offset: 0x51, size: 0x8, addend: 0x0, symName: _main, symObjAddr: 0x0, symBinAddr: 0x100000608, symSize: 0x78 }
+...

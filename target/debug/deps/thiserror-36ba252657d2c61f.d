@@ -1,0 +1,14 @@
+/Users/adityasharma/Projects/gpui/target/debug/deps/thiserror-36ba252657d2c61f.d: /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/lib.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/aserror.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/display.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/var.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/private.rs /Users/adityasharma/Projects/gpui/target/debug/build/thiserror-5826aed58bb4e0cc/out/private.rs
+
+/Users/adityasharma/Projects/gpui/target/debug/deps/libthiserror-36ba252657d2c61f.rlib: /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/lib.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/aserror.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/display.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/var.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/private.rs /Users/adityasharma/Projects/gpui/target/debug/build/thiserror-5826aed58bb4e0cc/out/private.rs
+
+/Users/adityasharma/Projects/gpui/target/debug/deps/libthiserror-36ba252657d2c61f.rmeta: /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/lib.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/aserror.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/display.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/var.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/private.rs /Users/adityasharma/Projects/gpui/target/debug/build/thiserror-5826aed58bb4e0cc/out/private.rs
+
+/Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/lib.rs:
+/Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/aserror.rs:
+/Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/display.rs:
+/Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/var.rs:
+/Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/private.rs:
+/Users/adityasharma/Projects/gpui/target/debug/build/thiserror-5826aed58bb4e0cc/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/adityasharma/Projects/gpui/target/debug/build/thiserror-5826aed58bb4e0cc/out

@@ -1,0 +1,10 @@
+/Users/adityasharma/Projects/gpui/target/debug/deps/xattr-e889eec5b676b4fd.d: /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/lib.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/error.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/sys/mod.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/util.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/sys/linux_macos/mod.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/sys/linux_macos/macos.rs
+
+/Users/adityasharma/Projects/gpui/target/debug/deps/libxattr-e889eec5b676b4fd.rmeta: /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/lib.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/error.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/sys/mod.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/util.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/sys/linux_macos/mod.rs /Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/sys/linux_macos/macos.rs
+
+/Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/lib.rs:
+/Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/error.rs:
+/Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/sys/mod.rs:
+/Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/util.rs:
+/Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/sys/linux_macos/mod.rs:
+/Users/adityasharma/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-0.2.3/src/sys/linux_macos/macos.rs:
