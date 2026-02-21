@@ -29,12 +29,10 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
-    pub(crate) has_shadow: bool,
-    pub(crate) visible: bool,
 }
 
 #[derive(Clone)]
-pub(crate) struct TestWindow(pub(crate) Rc<Mutex<TestWindowState>>);
+pub struct TestWindow(pub(crate) Rc<Mutex<TestWindowState>>);
 
 impl HasWindowHandle for TestWindow {
     fn window_handle(
@@ -53,7 +51,7 @@ impl HasDisplayHandle for TestWindow {
 }
 
 impl TestWindow {
-    pub fn new(
+    pub(crate) fn new(
         handle: AnyWindowHandle,
         params: WindowParams,
         platform: Weak<TestPlatform>,
@@ -76,8 +74,6 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
-            has_shadow: true,
-            visible: true,
         })))
     }
 
@@ -135,21 +131,6 @@ impl PlatformWindow for TestWindow {
     fn resize(&mut self, size: Size<Pixels>) {
         let mut lock = self.0.lock();
         lock.bounds.size = size;
-    }
-
-    fn set_position(&self, origin: Point<Pixels>) {
-        let mut lock = self.0.lock();
-        lock.bounds.origin = origin;
-    }
-
-    fn set_has_shadow(&self, has_shadow: bool) {
-        let mut lock = self.0.lock();
-        lock.has_shadow = has_shadow;
-    }
-
-    fn set_visible(&self, visible: bool) {
-        let mut lock = self.0.lock();
-        lock.visible = visible;
     }
 
     fn scale_factor(&self) -> f32 {

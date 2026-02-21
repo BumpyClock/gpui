@@ -60,7 +60,7 @@ impl Animation {
 
     /// Set the easing function to use for this animation.
     /// The easing function will take a time delta between 0 and 1 and return a new delta
-    /// between 0 and 1.
+    /// between 0 and 1
     pub fn with_easing(mut self, easing: impl Fn(f32) -> f32 + 'static) -> Self {
         self.easing = Rc::new(easing);
         self.easing_bounds = EasingBounds::Bounded;
@@ -319,7 +319,6 @@ mod easing {
                 }
                 y / y1
             } else {
-                // Critically damped approximation.
                 let exp = (-omega0 * t).exp();
                 let y = 1.0 - exp * (1.0 + omega0 * t);
                 let y1 = 1.0 - (-omega0).exp() * (1.0 + omega0);

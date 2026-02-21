@@ -16,26 +16,30 @@ use std::{
 };
 
 #[allow(non_camel_case_types, unused)]
-pub(crate) type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
+#[expect(missing_docs)]
+pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 
-pub(crate) type DrawOrder = u32;
+#[expect(missing_docs)]
+pub type DrawOrder = u32;
 
 #[derive(Default)]
-pub(crate) struct Scene {
+#[expect(missing_docs)]
+pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
-    pub(crate) shadows: Vec<Shadow>,
-    pub(crate) backdrop_blurs: Vec<BackdropBlur>,
-    pub(crate) quads: Vec<Quad>,
-    pub(crate) paths: Vec<Path<ScaledPixels>>,
-    pub(crate) underlines: Vec<Underline>,
-    pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
-    pub(crate) subpixel_sprites: Vec<SubpixelSprite>,
-    pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
-    pub(crate) surfaces: Vec<PaintSurface>,
+    pub shadows: Vec<Shadow>,
+    pub backdrop_blurs: Vec<BackdropBlur>,
+    pub quads: Vec<Quad>,
+    pub paths: Vec<Path<ScaledPixels>>,
+    pub underlines: Vec<Underline>,
+    pub monochrome_sprites: Vec<MonochromeSprite>,
+    pub subpixel_sprites: Vec<SubpixelSprite>,
+    pub polychrome_sprites: Vec<PolychromeSprite>,
+    pub surfaces: Vec<PaintSurface>,
 }
 
+#[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
@@ -158,33 +162,24 @@ impl Scene {
         ),
         allow(dead_code)
     )]
-    pub(crate) fn batches(&self) -> impl Iterator<Item = PrimitiveBatch<'_>> {
+    pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
         BatchIterator {
-            shadows: &self.shadows,
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
-            backdrop_blurs: &self.backdrop_blurs,
             backdrop_blurs_start: 0,
             backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
-            quads: &self.quads,
             quads_start: 0,
             quads_iter: self.quads.iter().peekable(),
-            paths: &self.paths,
             paths_start: 0,
             paths_iter: self.paths.iter().peekable(),
-            underlines: &self.underlines,
             underlines_start: 0,
             underlines_iter: self.underlines.iter().peekable(),
-            monochrome_sprites: &self.monochrome_sprites,
             monochrome_sprites_start: 0,
             monochrome_sprites_iter: self.monochrome_sprites.iter().peekable(),
-            subpixel_sprites: &self.subpixel_sprites,
             subpixel_sprites_start: 0,
             subpixel_sprites_iter: self.subpixel_sprites.iter().peekable(),
-            polychrome_sprites: &self.polychrome_sprites,
             polychrome_sprites_start: 0,
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
-            surfaces: &self.surfaces,
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
         }
@@ -219,7 +214,8 @@ pub(crate) enum PaintOperation {
 }
 
 #[derive(Clone)]
-pub(crate) enum Primitive {
+#[expect(missing_docs)]
+pub enum Primitive {
     Shadow(Shadow),
     BackdropBlur(BackdropBlur),
     Quad(Quad),
@@ -231,22 +227,19 @@ pub(crate) enum Primitive {
     Surface(PaintSurface),
 }
 
+#[expect(missing_docs)]
 impl Primitive {
-    pub fn bounds(&self) -> Bounds<ScaledPixels> {
+    pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
-            Primitive::Shadow(shadow) => shadow.bounds,
-            Primitive::BackdropBlur(blur) => blur.bounds,
-            Primitive::Quad(quad) => transformed_scaled_bounds(quad.bounds, quad.transformation),
-            Primitive::Path(path) => path.bounds,
-            Primitive::Underline(underline) => underline.bounds,
-            Primitive::MonochromeSprite(sprite) => sprite.bounds,
-            Primitive::SubpixelSprite(sprite) => sprite.bounds,
-            Primitive::PolychromeSprite(sprite) => {
-                transformed_scaled_bounds(sprite.bounds, sprite.transformation)
-            }
-            Primitive::Surface(surface) => {
-                transformed_scaled_bounds(surface.bounds, surface.transformation)
-            }
+            Primitive::Shadow(shadow) => &shadow.bounds,
+            Primitive::BackdropBlur(blur) => &blur.bounds,
+            Primitive::Quad(quad) => &quad.bounds,
+            Primitive::Path(path) => &path.bounds,
+            Primitive::Underline(underline) => &underline.bounds,
+            Primitive::MonochromeSprite(sprite) => &sprite.bounds,
+            Primitive::SubpixelSprite(sprite) => &sprite.bounds,
+            Primitive::PolychromeSprite(sprite) => &sprite.bounds,
+            Primitive::Surface(surface) => &surface.bounds,
         }
     }
 
@@ -265,39 +258,6 @@ impl Primitive {
     }
 }
 
-fn transformed_scaled_bounds(
-    bounds: Bounds<ScaledPixels>,
-    transform: TransformationMatrix,
-) -> Bounds<ScaledPixels> {
-    if transform.is_unit() {
-        return bounds;
-    }
-
-    let corners = [
-        bounds.origin,
-        bounds.top_right(),
-        bounds.bottom_left(),
-        bounds.bottom_right(),
-    ];
-    let mut min_x = f32::INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-
-    for corner in corners {
-        let point = transform.apply_scaled(corner);
-        min_x = min_x.min(point.x.0);
-        min_y = min_y.min(point.y.0);
-        max_x = max_x.max(point.x.0);
-        max_y = max_y.max(point.y.0);
-    }
-
-    Bounds::new(
-        Point::new(ScaledPixels(min_x), ScaledPixels(min_y)),
-        Size::new(ScaledPixels(max_x - min_x), ScaledPixels(max_y - min_y)),
-    )
-}
-
 #[cfg_attr(
     all(
         any(target_os = "linux", target_os = "freebsd"),
@@ -306,37 +266,28 @@ fn transformed_scaled_bounds(
     allow(dead_code)
 )]
 struct BatchIterator<'a> {
-    shadows: &'a [Shadow],
     shadows_start: usize,
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
-    backdrop_blurs: &'a [BackdropBlur],
     backdrop_blurs_start: usize,
     backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
-    quads: &'a [Quad],
     quads_start: usize,
     quads_iter: Peekable<slice::Iter<'a, Quad>>,
-    paths: &'a [Path<ScaledPixels>],
     paths_start: usize,
     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
-    underlines: &'a [Underline],
     underlines_start: usize,
     underlines_iter: Peekable<slice::Iter<'a, Underline>>,
-    monochrome_sprites: &'a [MonochromeSprite],
     monochrome_sprites_start: usize,
     monochrome_sprites_iter: Peekable<slice::Iter<'a, MonochromeSprite>>,
-    subpixel_sprites: &'a [SubpixelSprite],
     subpixel_sprites_start: usize,
     subpixel_sprites_iter: Peekable<slice::Iter<'a, SubpixelSprite>>,
-    polychrome_sprites: &'a [PolychromeSprite],
     polychrome_sprites_start: usize,
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
-    surfaces: &'a [PaintSurface],
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
-    type Item = PrimitiveBatch<'a>;
+    type Item = PrimitiveBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
@@ -394,9 +345,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     shadows_end += 1;
                 }
                 self.shadows_start = shadows_end;
-                Some(PrimitiveBatch::Shadows(
-                    &self.shadows[shadows_start..shadows_end],
-                ))
+                Some(PrimitiveBatch::Shadows(shadows_start..shadows_end))
             }
             PrimitiveKind::BackdropBlur => {
                 let blurs_start = self.backdrop_blurs_start;
@@ -410,9 +359,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     blurs_end += 1;
                 }
                 self.backdrop_blurs_start = blurs_end;
-                Some(PrimitiveBatch::BackdropBlurs(
-                    &self.backdrop_blurs[blurs_start..blurs_end],
-                ))
+                Some(PrimitiveBatch::BackdropBlurs(blurs_start..blurs_end))
             }
             PrimitiveKind::Quad => {
                 let quads_start = self.quads_start;
@@ -426,7 +373,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     quads_end += 1;
                 }
                 self.quads_start = quads_end;
-                Some(PrimitiveBatch::Quads(&self.quads[quads_start..quads_end]))
+                Some(PrimitiveBatch::Quads(quads_start..quads_end))
             }
             PrimitiveKind::Path => {
                 let paths_start = self.paths_start;
@@ -440,7 +387,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     paths_end += 1;
                 }
                 self.paths_start = paths_end;
-                Some(PrimitiveBatch::Paths(&self.paths[paths_start..paths_end]))
+                Some(PrimitiveBatch::Paths(paths_start..paths_end))
             }
             PrimitiveKind::Underline => {
                 let underlines_start = self.underlines_start;
@@ -454,9 +401,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     underlines_end += 1;
                 }
                 self.underlines_start = underlines_end;
-                Some(PrimitiveBatch::Underlines(
-                    &self.underlines[underlines_start..underlines_end],
-                ))
+                Some(PrimitiveBatch::Underlines(underlines_start..underlines_end))
             }
             PrimitiveKind::MonochromeSprite => {
                 let texture_id = self.monochrome_sprites_iter.peek().unwrap().tile.texture_id;
@@ -476,7 +421,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.monochrome_sprites_start = sprites_end;
                 Some(PrimitiveBatch::MonochromeSprites {
                     texture_id,
-                    sprites: &self.monochrome_sprites[sprites_start..sprites_end],
+                    range: sprites_start..sprites_end,
                 })
             }
             PrimitiveKind::SubpixelSprite => {
@@ -497,13 +442,13 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.subpixel_sprites_start = sprites_end;
                 Some(PrimitiveBatch::SubpixelSprites {
                     texture_id,
-                    sprites: &self.subpixel_sprites[sprites_start..sprites_end],
+                    range: sprites_start..sprites_end,
                 })
             }
             PrimitiveKind::PolychromeSprite => {
                 let texture_id = self.polychrome_sprites_iter.peek().unwrap().tile.texture_id;
                 let sprites_start = self.polychrome_sprites_start;
-                let mut sprites_end = self.polychrome_sprites_start + 1;
+                let mut sprites_end = sprites_start + 1;
                 self.polychrome_sprites_iter.next();
                 while self
                     .polychrome_sprites_iter
@@ -518,7 +463,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.polychrome_sprites_start = sprites_end;
                 Some(PrimitiveBatch::PolychromeSprites {
                     texture_id,
-                    sprites: &self.polychrome_sprites[sprites_start..sprites_end],
+                    range: sprites_start..sprites_end,
                 })
             }
             PrimitiveKind::Surface => {
@@ -533,9 +478,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     surfaces_end += 1;
                 }
                 self.surfaces_start = surfaces_end;
-                Some(PrimitiveBatch::Surfaces(
-                    &self.surfaces[surfaces_start..surfaces_end],
-                ))
+                Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
         }
     }
@@ -549,31 +492,33 @@ impl<'a> Iterator for BatchIterator<'a> {
     ),
     allow(dead_code)
 )]
-pub(crate) enum PrimitiveBatch<'a> {
-    Shadows(&'a [Shadow]),
-    BackdropBlurs(&'a [BackdropBlur]),
-    Quads(&'a [Quad]),
-    Paths(&'a [Path<ScaledPixels>]),
-    Underlines(&'a [Underline]),
+#[expect(missing_docs)]
+pub enum PrimitiveBatch {
+    Shadows(Range<usize>),
+    BackdropBlurs(Range<usize>),
+    Quads(Range<usize>),
+    Paths(Range<usize>),
+    Underlines(Range<usize>),
     MonochromeSprites {
         texture_id: AtlasTextureId,
-        sprites: &'a [MonochromeSprite],
+        range: Range<usize>,
     },
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     SubpixelSprites {
         texture_id: AtlasTextureId,
-        sprites: &'a [SubpixelSprite],
+        range: Range<usize>,
     },
     PolychromeSprites {
         texture_id: AtlasTextureId,
-        sprites: &'a [PolychromeSprite],
+        range: Range<usize>,
     },
-    Surfaces(&'a [PaintSurface]),
+    Surfaces(Range<usize>),
 }
 
 #[derive(Default, Debug, Clone)]
 #[repr(C)]
-pub(crate) struct Quad {
+#[expect(missing_docs)]
+pub struct Quad {
     pub order: DrawOrder,
     pub border_style: BorderStyle,
     pub bounds: Bounds<ScaledPixels>,
@@ -582,7 +527,6 @@ pub(crate) struct Quad {
     pub border_color: Hsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
-    pub transformation: TransformationMatrix,
 }
 
 impl From<Quad> for Primitive {
@@ -593,7 +537,8 @@ impl From<Quad> for Primitive {
 
 #[derive(Debug, Clone)]
 #[repr(C)]
-pub(crate) struct Underline {
+#[expect(missing_docs)]
+pub struct Underline {
     pub order: DrawOrder,
     pub pad: u32, // align to 8 bytes
     pub bounds: Bounds<ScaledPixels>,
@@ -611,7 +556,8 @@ impl From<Underline> for Primitive {
 
 #[derive(Debug, Clone)]
 #[repr(C)]
-pub(crate) struct Shadow {
+#[expect(missing_docs)]
+pub struct Shadow {
     pub order: DrawOrder,
     pub blur_radius: ScaledPixels,
     pub bounds: Bounds<ScaledPixels>,
@@ -628,14 +574,14 @@ impl From<Shadow> for Primitive {
 
 #[derive(Debug, Clone)]
 #[repr(C)]
-pub(crate) struct BackdropBlur {
+#[expect(missing_docs)]
+pub struct BackdropBlur {
     pub order: DrawOrder,
-    pub blur_radius: ScaledPixels,
-    pub opacity: f32,
-    pub pad: f32,
+    pub pad: u32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
+    pub blur_radius: ScaledPixels,
 }
 
 impl From<BackdropBlur> for Primitive {
@@ -675,6 +621,11 @@ impl TransformationMatrix {
             rotation_scale: [[1.0, 0.0], [0.0, 1.0]],
             translation: [0.0, 0.0],
         }
+    }
+
+    /// Returns true when this transform is identity.
+    pub fn is_unit(&self) -> bool {
+        *self == Self::unit()
     }
 
     /// Move the origin by a given point
@@ -760,48 +711,29 @@ impl TransformationMatrix {
                 *output_cell += self.rotation_scale[i][k] * *input_cell;
             }
         }
-        Point::new(output[0].into(), output[1].into())
-    }
-
-    /// Returns `true` when this matrix is identity.
-    pub fn is_unit(&self) -> bool {
-        *self == Self::unit()
-    }
-
-    /// Returns `true` when this matrix only contains translation.
-    pub fn is_translation_only(&self) -> bool {
-        self.rotation_scale == [[1.0, 0.0], [0.0, 1.0]]
-    }
-
-    /// Scale only the translation component.
-    pub fn scale_translation(self, factor: f32) -> Self {
-        Self {
-            translation: [self.translation[0] * factor, self.translation[1] * factor],
-            ..self
-        }
+        Point::new(ScaledPixels(output[0]), ScaledPixels(output[1]))
     }
 
     /// Attempt to compute inverse matrix.
     pub fn try_inverse(&self) -> Option<Self> {
-        let a = self.rotation_scale[0][0];
-        let b = self.rotation_scale[0][1];
-        let c = self.rotation_scale[1][0];
-        let d = self.rotation_scale[1][1];
+        let [[a, b], [c, d]] = self.rotation_scale;
         let det = a * d - b * c;
-        if !det.is_finite() || det.abs() < f32::EPSILON {
+        if det.abs() < f32::EPSILON {
             return None;
         }
-
         let inv_det = 1.0 / det;
-        let inv_rotation = [[d * inv_det, -b * inv_det], [-c * inv_det, a * inv_det]];
+        let inv_rotation_scale = [[d * inv_det, -b * inv_det], [-c * inv_det, a * inv_det]];
+
         let tx = self.translation[0];
         let ty = self.translation[1];
+        let inv_translation = [
+            -(inv_rotation_scale[0][0] * tx + inv_rotation_scale[0][1] * ty),
+            -(inv_rotation_scale[1][0] * tx + inv_rotation_scale[1][1] * ty),
+        ];
+
         Some(Self {
-            rotation_scale: inv_rotation,
-            translation: [
-                -(inv_rotation[0][0] * tx + inv_rotation[0][1] * ty),
-                -(inv_rotation[1][0] * tx + inv_rotation[1][1] * ty),
-            ],
+            rotation_scale: inv_rotation_scale,
+            translation: inv_translation,
         })
     }
 }
@@ -814,7 +746,8 @@ impl Default for TransformationMatrix {
 
 #[derive(Clone, Debug)]
 #[repr(C)]
-pub(crate) struct MonochromeSprite {
+#[expect(missing_docs)]
+pub struct MonochromeSprite {
     pub order: DrawOrder,
     pub pad: u32, // align to 8 bytes
     pub bounds: Bounds<ScaledPixels>,
@@ -832,7 +765,8 @@ impl From<MonochromeSprite> for Primitive {
 
 #[derive(Clone, Debug)]
 #[repr(C)]
-pub(crate) struct SubpixelSprite {
+#[expect(missing_docs)]
+pub struct SubpixelSprite {
     pub order: DrawOrder,
     pub pad: u32, // align to 8 bytes
     pub bounds: Bounds<ScaledPixels>,
@@ -850,7 +784,8 @@ impl From<SubpixelSprite> for Primitive {
 
 #[derive(Clone, Debug)]
 #[repr(C)]
-pub(crate) struct PolychromeSprite {
+#[expect(missing_docs)]
+pub struct PolychromeSprite {
     pub order: DrawOrder,
     pub pad: u32, // align to 8 bytes
     pub grayscale: bool,
@@ -859,7 +794,6 @@ pub(crate) struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
-    pub transformation: TransformationMatrix,
 }
 
 impl From<PolychromeSprite> for Primitive {
@@ -869,11 +803,11 @@ impl From<PolychromeSprite> for Primitive {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PaintSurface {
+#[expect(missing_docs)]
+pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    pub transformation: TransformationMatrix,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
 }
@@ -885,17 +819,19 @@ impl From<PaintSurface> for Primitive {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct PathId(pub(crate) usize);
+#[expect(missing_docs)]
+pub struct PathId(pub usize);
 
 /// A line made up of a series of vertices and control points.
 #[derive(Clone, Debug)]
+#[expect(missing_docs)]
 pub struct Path<P: Clone + Debug + Default + PartialEq> {
-    pub(crate) id: PathId,
-    pub(crate) order: DrawOrder,
-    pub(crate) bounds: Bounds<P>,
-    pub(crate) content_mask: ContentMask<P>,
-    pub(crate) vertices: Vec<PathVertex<P>>,
-    pub(crate) color: Background,
+    pub id: PathId,
+    pub order: DrawOrder,
+    pub bounds: Bounds<P>,
+    pub content_mask: ContentMask<P>,
+    pub vertices: Vec<PathVertex<P>>,
+    pub color: Background,
     start: Point<P>,
     current: Point<P>,
     contour_count: usize,
@@ -1019,7 +955,8 @@ where
     T: Clone + Debug + Default + PartialEq + PartialOrd + Add<T, Output = T> + Sub<Output = T>,
 {
     #[allow(unused)]
-    pub(crate) fn clipped_bounds(&self) -> Bounds<T> {
+    #[expect(missing_docs)]
+    pub fn clipped_bounds(&self) -> Bounds<T> {
         self.bounds.intersect(&self.content_mask.bounds)
     }
 }
@@ -1032,12 +969,14 @@ impl From<Path<ScaledPixels>> for Primitive {
 
 #[derive(Clone, Debug)]
 #[repr(C)]
-pub(crate) struct PathVertex<P: Clone + Debug + Default + PartialEq> {
-    pub(crate) xy_position: Point<P>,
-    pub(crate) st_position: Point<f32>,
-    pub(crate) content_mask: ContentMask<P>,
+#[expect(missing_docs)]
+pub struct PathVertex<P: Clone + Debug + Default + PartialEq> {
+    pub xy_position: Point<P>,
+    pub st_position: Point<f32>,
+    pub content_mask: ContentMask<P>,
 }
 
+#[expect(missing_docs)]
 impl PathVertex<Pixels> {
     pub fn scale(&self, factor: f32) -> PathVertex<ScaledPixels> {
         PathVertex {
@@ -1045,31 +984,5 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ScaledPixels, TransformationMatrix, point};
-    use crate::{px, size};
-
-    #[test]
-    fn transformation_matrix_inverse_round_trips_points() {
-        let matrix = TransformationMatrix::unit()
-            .translate(point(ScaledPixels(12.0), ScaledPixels(-5.0)))
-            .scale(size(1.5, 0.75));
-        let inverse = matrix.try_inverse().expect("invertible matrix");
-        let original = point(px(20.0), px(16.0));
-        let transformed = matrix.apply(original);
-        let recovered = inverse.apply(transformed);
-
-        assert!((recovered.x.0 - original.x.0).abs() < 1e-4);
-        assert!((recovered.y.0 - original.y.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn transformation_matrix_inverse_returns_none_for_singular() {
-        let matrix = TransformationMatrix::unit().scale(size(0.0, 1.0));
-        assert!(matrix.try_inverse().is_none());
     }
 }

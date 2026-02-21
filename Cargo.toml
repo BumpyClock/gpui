@@ -2,7 +2,12 @@
 resolver = "2"
 members = [
     "crates/gpui",
+    "crates/gpui_linux",
+    "crates/gpui_macos",
     "crates/gpui_macros",
+    "crates/gpui_platform",
+    "crates/gpui_wgpu",
+    "crates/gpui_windows",
     "crates/gpui_tokio",
     "crates/collections",
     "crates/refineable",
@@ -35,7 +40,12 @@ edition = "2024"
 collections = { path = "crates/collections", version = "0.1.0" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
 gpui = { path = "crates/gpui", default-features = false }
+gpui_linux = { path = "crates/gpui_linux", default-features = false }
+gpui_macos = { path = "crates/gpui_macos", default-features = false }
 gpui_macros = { path = "crates/gpui_macros" }
+gpui_platform = { path = "crates/gpui_platform", default-features = false }
+gpui_wgpu = { path = "crates/gpui_wgpu" }
+gpui_windows = { path = "crates/gpui_windows", default-features = false }
 gpui_tokio = { path = "crates/gpui_tokio" }
 http_client = { path = "crates/http_client" }
 http_client_tls = { path = "crates/http_client_tls" }
@@ -98,6 +108,7 @@ metal = "0.29"
 naga = { version = "25.0", features = ["wgsl-in"] }
 objc = "0.2"
 parking_lot = "0.12.1"
+percent-encoding = "2.3.2"
 postage = { version = "0.5", features = ["futures-traits"] }
 pretty_assertions = { version = "1.3.0", features = ["unstable"] }
 proc-macro2 = "1.0.93"
@@ -146,6 +157,7 @@ unicode-segmentation = "1.10"
 url = "2.2"
 uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
 walkdir = "2.5"
+wgpu = "28.0"
 which = "6.0.0"
 windows-core = "0.61"
 windows-numerics = "0.2"

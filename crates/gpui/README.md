@@ -51,30 +51,6 @@ GPUI offers three different [registers](<https://en.wikipedia.org/wiki/Register_
 
 Each of these registers has one or more corresponding contexts that can be accessed from all GPUI services. This context is your main interface to GPUI, and is used extensively throughout the framework.
 
-## Animation APIs
-
-`Animation` supports both bounded and unbounded easing outputs:
-
-- `Animation::with_easing(...)` keeps eased values in `[0, 1]` (safe for opacity/visibility).
-- `Animation::with_unbounded_easing(...)` allows overshoot values (for transform-like motion such as translate/scale/rotate).
-- `Animation::with_easing_bounds(min, max)` constrains easing output to a custom range.
-
-When using unbounded easing, keep it to transform properties and avoid applying overshoot curves to opacity/visibility.
-
-Example:
-
-```rust
-use std::time::Duration;
-use gpui::{Animation, AnimationExt, div, px};
-
-let spring_like = Animation::new(Duration::from_millis(180))
-    .with_unbounded_easing(gpui::spring(0.75, 1.8));
-
-let el = div().with_animation("card-enter", spring_like, |el, delta| {
-    el.translate_y(px(8.0 * (1.0 - delta)))
-});
-```
-
 ## Other Resources
 
 In addition to the systems above, GPUI provides a range of smaller services that are useful for building complex applications:

@@ -84,6 +84,14 @@ impl IntoElement for String {
     }
 }
 
+impl IntoElement for Cow<'static, str> {
+    type Element = SharedString;
+
+    fn into_element(self) -> Self::Element {
+        self.into()
+    }
+}
+
 impl Element for SharedString {
     type RequestLayoutState = TextLayout;
     type PrepaintState = ();
@@ -873,14 +881,14 @@ impl Element for InteractiveText {
 
                     // Use bounds instead of testing hitbox since this is called during prepaint.
                     let check_is_hovered_during_prepaint = Rc::new({
-                        let hitbox = hitbox.clone();
+                        let source_bounds = hitbox.bounds;
                         let text_layout = text_layout.clone();
                         let pending_mouse_down = interactive_state.mouse_down_index.clone();
                         move |window: &Window| {
                             text_layout
                                 .index_for_position(window.mouse_position())
                                 .is_ok()
-                                && hitbox.contains_window_point(window.mouse_position())
+                                && source_bounds.contains(&window.mouse_position())
                                 && pending_mouse_down.get().is_none()
                         }
                     });
@@ -922,5 +930,19 @@ impl IntoElement for InteractiveText {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_into_element_for() {
+        use crate::{ParentElement as _, SharedString, div};
+        use std::borrow::Cow;
+
+        let _ = div().child("static str");
+        let _ = div().child("String".to_string());
+        let _ = div().child(Cow::Borrowed("Cow"));
+        let _ = div().child(SharedString::from("SharedString"));
     }
 }

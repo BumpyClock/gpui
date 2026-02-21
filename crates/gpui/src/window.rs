@@ -3,7 +3,8 @@ use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
+    Capslock,
+    Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
     FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
     KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
@@ -14,7 +15,7 @@ use crate::{
     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
     ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
     SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
+    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     point, prelude::*, px, rems, size, transparent_black,
@@ -59,7 +60,8 @@ mod prompts;
 use crate::util::atomic_incr_if_not_zero;
 pub use prompts::*;
 
-pub(crate) const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(864.));
+/// Default window size used when no explicit size is provided.
+pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(864.));
 
 /// A 6:5 aspect ratio minimum window size to be used for functional,
 /// additional-to-main-Zed windows, like the settings and rules library windows.
@@ -786,7 +788,6 @@ pub(crate) struct DeferredDraw {
     rem_size: Pixels,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
-    element_transform: TransformationMatrix,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
 }
@@ -903,18 +904,17 @@ impl Frame {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
-            if !hitbox.contains_window_point(position) {
-                continue;
-            }
-
-            hit_test.ids.push(hitbox.id);
-            if !set_hover_hitbox_count && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
-            {
-                hit_test.hover_hitbox_count = hit_test.ids.len();
-                set_hover_hitbox_count = true;
-            }
-            if hitbox.behavior == HitboxBehavior::BlockMouse {
-                break;
+            if hitbox.contains_window_point(position) {
+                hit_test.ids.push(hitbox.id);
+                if !set_hover_hitbox_count
+                    && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
+                {
+                    hit_test.hover_hitbox_count = hit_test.ids.len();
+                    set_hover_hitbox_count = true;
+                }
+                if hitbox.behavior == HitboxBehavior::BlockMouse {
+                    break;
+                }
             }
         }
         if !set_hover_hitbox_count {
@@ -971,7 +971,6 @@ pub struct Window {
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
-    pub(crate) element_transform_stack: Vec<TransformationMatrix>,
     pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
@@ -1191,7 +1190,6 @@ impl Window {
                 focus,
                 show,
                 display_id,
-                has_shadow,
                 window_min_size,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
@@ -1219,6 +1217,7 @@ impl Window {
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+        let last_frame_time = Rc::new(Cell::new(None));
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1251,6 +1250,20 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
+                let thermal_state = cx.update(|cx| cx.thermal_state());
+
+                if thermal_state == ThermalState::Serious || thermal_state == ThermalState::Critical
+                {
+                    let now = Instant::now();
+                    let last_frame_time = last_frame_time.replace(Some(now));
+
+                    if let Some(last_frame) = last_frame_time
+                        && now.duration_since(last_frame) < Duration::from_micros(16667)
+                    {
+                        return;
+                    }
+                }
+
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
                     handle
@@ -1321,6 +1334,7 @@ impl Window {
             move |active| {
                 handle
                     .update(&mut cx, |_, window, cx| {
+                        window.active.set(active);
                         if active {
                             if let Some(focus_id) = window.focus_before_deactivation.take() {
                                 window.focus = Some(focus_id);
@@ -1328,8 +1342,6 @@ impl Window {
                         } else {
                             window.focus_before_deactivation = window.focus.take();
                         }
-
-                        window.active.set(active);
                         window.modifiers = window.platform_window.modifiers();
                         window.capslock = window.platform_window.capslock();
                         window
@@ -1457,7 +1469,6 @@ impl Window {
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
-            element_transform_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
             requested_autoscroll: None,
@@ -1509,7 +1520,8 @@ impl Window {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DispatchEventResult {
+#[expect(missing_docs)]
+pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
 }
@@ -1979,11 +1991,6 @@ impl Window {
         self.platform_window.resize(size);
     }
 
-    /// Enable or disable the window shadow.
-    pub fn set_has_shadow(&self, has_shadow: bool) {
-        self.platform_window.set_has_shadow(has_shadow);
-    }
-
     /// Show or hide the window.
     pub fn set_visible(&self, visible: bool) {
         self.platform_window.set_visible(visible);
@@ -2087,6 +2094,11 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Sets whether the platform window shadow should be enabled.
+    pub fn set_has_shadow(&self, has_shadow: bool) {
+        self.platform_window.set_has_shadow(has_shadow);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);
@@ -2134,10 +2146,22 @@ impl Window {
         element_id: ElementId,
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
-        self.element_id_stack.push(element_id);
-        let global_id = GlobalElementId(Arc::from(&*self.element_id_stack));
+        self.with_id(element_id, |this| {
+            let global_id = GlobalElementId(Arc::from(&*this.element_id_stack));
 
-        let result = f(&global_id, self);
+            f(&global_id, this)
+        })
+    }
+
+    /// Calls the provided closure with the element ID pushed on the stack.
+    #[inline]
+    pub fn with_id<R>(
+        &mut self,
+        element_id: impl Into<ElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.element_id_stack.push(element_id.into());
+        let result = f(self);
         self.element_id_stack.pop();
         result
     }
@@ -2301,9 +2325,8 @@ impl Window {
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {
-        let mut entities_ref = cx.entities.accessed_entities.borrow_mut();
+        let mut entities_ref = cx.entities.accessed_entities.get_mut();
         let mut entities = mem::take(entities_ref.deref_mut());
-        drop(entities_ref);
         let handle = self.handle;
         cx.record_entities_accessed(
             handle,
@@ -2311,7 +2334,7 @@ impl Window {
             self.invalidator.clone(),
             &entities,
         );
-        let mut entities_ref = cx.entities.accessed_entities.borrow_mut();
+        let mut entities_ref = cx.entities.accessed_entities.get_mut();
         mem::swap(&mut entities, entities_ref.deref_mut());
     }
 
@@ -2476,7 +2499,6 @@ impl Window {
 
     fn prepaint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
-        assert_eq!(self.element_transform_stack.len(), 0);
 
         let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
         for deferred_draw_ix in deferred_draw_indices {
@@ -2493,14 +2515,12 @@ impl Window {
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
                     window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                        window.with_element_transform(deferred_draw.element_transform, |window| {
-                            window.with_absolute_element_offset(
-                                deferred_draw.absolute_offset,
-                                |window| {
-                                    element.prepaint(window, cx);
-                                },
-                            );
-                        });
+                        window.with_absolute_element_offset(
+                            deferred_draw.absolute_offset,
+                            |window| {
+                                element.prepaint(window, cx);
+                            },
+                        );
                     });
                 })
             } else {
@@ -2517,12 +2537,10 @@ impl Window {
         self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
         self.text_style_stack.clear();
-        self.element_transform_stack.clear();
     }
 
     fn paint_deferred_draws(&mut self, deferred_draw_indices: &[usize], cx: &mut App) {
         assert_eq!(self.element_id_stack.len(), 0);
-        assert_eq!(self.element_transform_stack.len(), 0);
 
         let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
         for deferred_draw_ix in deferred_draw_indices {
@@ -2537,9 +2555,7 @@ impl Window {
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
                     window.with_rem_size(Some(deferred_draw.rem_size), |window| {
-                        window.with_element_transform(deferred_draw.element_transform, |window| {
-                            element.paint(window, cx);
-                        });
+                        element.paint(window, cx);
                     })
                 })
             } else {
@@ -2550,7 +2566,6 @@ impl Window {
         }
         self.next_frame.deferred_draws = deferred_draws;
         self.element_id_stack.clear();
-        self.element_transform_stack.clear();
     }
 
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
@@ -2608,7 +2623,6 @@ impl Window {
                     priority: deferred_draw.priority,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
-                    element_transform: deferred_draw.element_transform,
                     prepaint_range: deferred_draw.prepaint_range.clone(),
                     paint_range: deferred_draw.paint_range.clone(),
                 }),
@@ -2773,24 +2787,6 @@ impl Window {
         result
     }
 
-    /// Invoke the function with an additional element transform applied.
-    pub fn with_element_transform<R>(
-        &mut self,
-        transform: TransformationMatrix,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        self.invalidator.debug_assert_paint_or_prepaint();
-        if transform.is_unit() {
-            return f(self);
-        }
-
-        let composed = self.element_transform().compose(transform);
-        self.element_transform_stack.push(composed);
-        let result = f(self);
-        self.element_transform_stack.pop();
-        result
-    }
-
     pub(crate) fn with_element_opacity<R>(
         &mut self,
         opacity: Option<f32>,
@@ -2900,29 +2896,6 @@ impl Window {
             .unwrap_or_default()
     }
 
-    /// Obtain the current element transform in logical pixels.
-    pub fn element_transform(&self) -> TransformationMatrix {
-        self.invalidator.debug_assert_paint_or_prepaint();
-        self.element_transform_stack
-            .last()
-            .copied()
-            .unwrap_or_else(TransformationMatrix::unit)
-    }
-
-    fn element_render_transform(&self, scale_factor: f32) -> TransformationMatrix {
-        self.element_transform().scale_translation(scale_factor)
-    }
-
-    fn transformed_element_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
-        transformed_bounds(bounds, self.element_transform())
-    }
-
-    fn transformed_content_mask(&self, mask: ContentMask<Pixels>) -> ContentMask<Pixels> {
-        ContentMask {
-            bounds: transformed_bounds(mask.bounds, self.element_transform()),
-        }
-    }
-
     /// Obtain the current element opacity. This method should only be called during the
     /// prepaint phase of element drawing.
     #[inline]
@@ -2980,11 +2953,6 @@ impl Window {
                 }
             })
         })
-    }
-
-    /// Immediately push an element ID onto the stack. Useful for simplifying IDs in lists
-    pub fn with_id<R>(&mut self, id: impl Into<ElementId>, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.with_global_id(id.into(), |_, window| f(window))
     }
 
     /// Use a piece of state that exists as long this element is being rendered in consecutive frames, without needing to specify a key
@@ -3152,7 +3120,6 @@ impl Window {
             priority,
             element: Some(element),
             absolute_offset,
-            element_transform: self.element_transform(),
             prepaint_range: PrepaintStateIndex::default()..PrepaintStateIndex::default(),
             paint_range: PaintIndex::default()..PaintIndex::default(),
         });
@@ -3167,9 +3134,8 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let content_mask = self.transformed_content_mask(self.content_mask());
-        let transformed_bounds = self.transformed_element_bounds(bounds);
-        let clipped_bounds = transformed_bounds.intersect(&content_mask.bounds);
+        let content_mask = self.content_mask();
+        let clipped_bounds = bounds.intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
             self.next_frame
                 .scene
@@ -3197,15 +3163,14 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let transform = self.element_transform();
-        let content_mask = self.transformed_content_mask(self.content_mask());
+        let content_mask = self.content_mask();
         let opacity = self.element_opacity();
         for shadow in shadows {
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor),
-                bounds: transformed_bounds(shadow_bounds, transform).scale(scale_factor),
+                bounds: shadow_bounds.scale(scale_factor),
                 content_mask: content_mask.scale(scale_factor),
                 corner_radii: corner_radii.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
@@ -3213,7 +3178,7 @@ impl Window {
         }
     }
 
-    /// Paint a blur over the content behind the given bounds at the current z-index.
+    /// Paint a backdrop blur region into the scene for the next frame.
     pub fn paint_backdrop_blur(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -3221,24 +3186,15 @@ impl Window {
         blur_radius: Pixels,
     ) {
         self.invalidator.debug_assert_paint();
-        if blur_radius <= Pixels::ZERO {
-            return;
-        }
-
         let scale_factor = self.scale_factor();
-        let content_mask = self.transformed_content_mask(self.content_mask());
-        let transformed_bounds = self.transformed_element_bounds(bounds);
-        let opacity = self.element_opacity();
-        let scaled_blur = blur_radius.scale(scale_factor);
-        let pad = scaled_blur * 2.0;
+        let content_mask = self.content_mask();
         self.next_frame.scene.insert_primitive(BackdropBlur {
             order: 0,
-            blur_radius: scaled_blur,
-            opacity,
-            pad: pad.0,
-            bounds: transformed_bounds.scale(scale_factor),
+            pad: 0,
+            bounds: bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             corner_radii: corner_radii.scale(scale_factor),
+            blur_radius: blur_radius.scale(scale_factor),
         });
     }
 
@@ -3255,8 +3211,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let render_transform = self.element_render_transform(scale_factor);
-        let content_mask = self.transformed_content_mask(self.content_mask());
+        let content_mask = self.content_mask();
         let opacity = self.element_opacity();
         self.next_frame.scene.insert_primitive(Quad {
             order: 0,
@@ -3267,7 +3222,6 @@ impl Window {
             corner_radii: quad.corner_radii.scale(scale_factor),
             border_widths: quad.border_widths.scale(scale_factor),
             border_style: quad.border_style,
-            transformation: render_transform,
         });
     }
 
@@ -3278,16 +3232,9 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let transform = self.element_transform();
-        let content_mask = self.transformed_content_mask(self.content_mask());
+        let content_mask = self.content_mask();
         let opacity = self.element_opacity();
         path.content_mask = content_mask;
-        if !transform.is_unit() {
-            path.bounds = transformed_bounds(path.bounds, transform);
-            for vertex in &mut path.vertices {
-                vertex.xy_position = transform.apply(vertex.xy_position);
-            }
-        }
         let color: Background = color.into();
         path.color = color.opacity(opacity);
         self.next_frame
@@ -3316,14 +3263,13 @@ impl Window {
             origin,
             size: size(width, height),
         };
-        let content_mask = self.transformed_content_mask(self.content_mask());
-        let transformed_bounds = self.transformed_element_bounds(bounds);
+        let content_mask = self.content_mask();
         let element_opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
             pad: 0,
-            bounds: transformed_bounds.scale(scale_factor),
+            bounds: bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             color: style.color.unwrap_or_default().opacity(element_opacity),
             thickness: style.thickness.scale(scale_factor),
@@ -3348,14 +3294,13 @@ impl Window {
             origin,
             size: size(width, height),
         };
-        let content_mask = self.transformed_content_mask(self.content_mask());
-        let transformed_bounds = self.transformed_element_bounds(bounds);
+        let content_mask = self.content_mask();
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
             pad: 0,
-            bounds: transformed_bounds.scale(scale_factor),
+            bounds: bounds.scale(scale_factor),
             content_mask: content_mask.scale(scale_factor),
             thickness: style.thickness.scale(scale_factor),
             color: style.color.unwrap_or_default().opacity(opacity),
@@ -3383,7 +3328,6 @@ impl Window {
 
         let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
-        let transform = self.element_render_transform(scale_factor);
         let glyph_origin = origin.scale(scale_factor);
 
         let subpixel_variant = Point {
@@ -3414,9 +3358,7 @@ impl Window {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
             };
-            let content_mask = self
-                .transformed_content_mask(self.content_mask())
-                .scale(scale_factor);
+            let content_mask = self.content_mask().scale(scale_factor);
 
             if subpixel_rendering {
                 self.next_frame.scene.insert_primitive(SubpixelSprite {
@@ -3426,7 +3368,7 @@ impl Window {
                     content_mask,
                     color: color.opacity(element_opacity),
                     tile,
-                    transformation: transform,
+                    transformation: TransformationMatrix::unit(),
                 });
             } else {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
@@ -3436,7 +3378,7 @@ impl Window {
                     content_mask,
                     color: color.opacity(element_opacity),
                     tile,
-                    transformation: transform,
+                    transformation: TransformationMatrix::unit(),
                 });
             }
         }
@@ -3480,7 +3422,6 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let render_transform = self.element_render_transform(scale_factor);
         let glyph_origin = origin.scale(scale_factor);
         let params = RenderGlyphParams {
             font_id,
@@ -3507,9 +3448,7 @@ impl Window {
                 origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
                 size: tile.bounds.size.map(Into::into),
             };
-            let content_mask = self
-                .transformed_content_mask(self.content_mask())
-                .scale(scale_factor);
+            let content_mask = self.content_mask().scale(scale_factor);
             let opacity = self.element_opacity();
 
             self.next_frame.scene.insert_primitive(PolychromeSprite {
@@ -3521,7 +3460,6 @@ impl Window {
                 content_mask,
                 tile,
                 opacity,
-                transformation: render_transform,
             });
         }
         Ok(())
@@ -3543,9 +3481,6 @@ impl Window {
 
         let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
-        let transform = self
-            .element_render_transform(scale_factor)
-            .compose(transformation);
 
         let bounds = bounds.scale(scale_factor);
         let params = RenderSvgParams {
@@ -3567,9 +3502,7 @@ impl Window {
         else {
             return Ok(());
         };
-        let content_mask = self
-            .transformed_content_mask(self.content_mask())
-            .scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
         let svg_bounds = Bounds {
             origin: bounds.center()
                 - Point::new(
@@ -3591,7 +3524,7 @@ impl Window {
             content_mask,
             color: color.opacity(element_opacity),
             tile,
-            transformation: transform,
+            transformation,
         });
 
         Ok(())
@@ -3612,11 +3545,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let render_transform = self.element_render_transform(scale_factor);
-        let bounds = bounds
-            .scale(scale_factor)
-            .map_origin(|origin| origin.floor())
-            .map_size(|size| size.ceil());
+        let bounds = bounds.scale(scale_factor);
         let params = RenderImageParams {
             image_id: data.id,
             frame_index,
@@ -3634,9 +3563,7 @@ impl Window {
                 )))
             })?
             .expect("Callback above only returns Some");
-        let content_mask = self
-            .transformed_content_mask(self.content_mask())
-            .scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
         let corner_radii = corner_radii.scale(scale_factor);
         let opacity = self.element_opacity();
 
@@ -3644,12 +3571,13 @@ impl Window {
             order: 0,
             pad: 0,
             grayscale,
-            bounds,
+            bounds: bounds
+                .map_origin(|origin| origin.floor())
+                .map_size(|size| size.ceil()),
             content_mask,
             corner_radii,
             tile,
             opacity,
-            transformation: render_transform,
         });
         Ok(())
     }
@@ -3664,16 +3592,12 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let render_transform = self.element_render_transform(scale_factor);
         let bounds = bounds.scale(scale_factor);
-        let content_mask = self
-            .transformed_content_mask(self.content_mask())
-            .scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
-            transformation: render_transform,
             image_buffer,
         });
     }
@@ -3784,11 +3708,11 @@ impl Window {
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
-        let transform = self.element_transform();
+        let transform = TransformationMatrix::unit();
         self.insert_hitbox_transformed(bounds, transform, behavior)
     }
 
-    /// This method should only be called as part of the prepaint phase of element drawing.
+    /// Inserts a hitbox with an explicit transform from local to window space.
     pub fn insert_hitbox_transformed(
         &mut self,
         local_bounds: Bounds<Pixels>,
@@ -3798,10 +3722,7 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
 
         let content_mask = self.content_mask();
-        let transformed_mask = ContentMask {
-            bounds: transformed_bounds(content_mask.bounds, transform),
-        };
-        let mut id = self.next_hitbox_id;
+        let id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {
             id,
@@ -3809,7 +3730,9 @@ impl Window {
             local_bounds,
             transform,
             inverse_transform: transform.try_inverse(),
-            content_mask: transformed_mask,
+            content_mask: ContentMask {
+                bounds: transformed_bounds(content_mask.bounds, transform),
+            },
             behavior,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
@@ -3861,6 +3784,7 @@ impl Window {
         self.rendered_entity_stack.last().copied().unwrap()
     }
 
+    #[inline]
     pub(crate) fn with_rendered_view<R>(
         &mut self,
         id: EntityId,
@@ -5692,145 +5616,5 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        Bounds, ContentMask, Hitbox, HitboxBehavior, HitboxId, ScaledPixels, TransformationMatrix,
-        transformed_bounds,
-    };
-    use crate::{point, px, size};
-
-    #[test]
-    fn transformed_bounds_translates_axis_aligned_bounds() {
-        let bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(40.0), px(30.0)));
-        let transform =
-            TransformationMatrix::unit().translate(point(ScaledPixels(8.0), ScaledPixels(-5.0)));
-        let transformed = transformed_bounds(bounds, transform);
-
-        assert_eq!(transformed.origin, point(px(18.0), px(15.0)));
-        assert_eq!(transformed.size, bounds.size);
-    }
-
-    #[test]
-    fn transformed_hitbox_uses_inverse_transform_for_contains() {
-        let local_bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(40.0), px(30.0)));
-        let transform =
-            TransformationMatrix::unit().translate(point(ScaledPixels(8.0), ScaledPixels(-5.0)));
-        let bounds = transformed_bounds(local_bounds, transform);
-        let hitbox = Hitbox {
-            id: HitboxId(1),
-            bounds,
-            local_bounds,
-            transform,
-            inverse_transform: transform.try_inverse(),
-            content_mask: ContentMask {
-                bounds: Bounds::new(point(px(0.0), px(0.0)), size(px(500.0), px(500.0))),
-            },
-            behavior: HitboxBehavior::Normal,
-        };
-
-        assert!(hitbox.contains_window_point(point(px(20.0), px(30.0))));
-        assert!(!hitbox.contains_window_point(point(px(0.0), px(0.0))));
-    }
-
-    #[test]
-    fn transformed_hitbox_window_to_local_round_trips_scale_translate() {
-        let local_bounds = Bounds::new(point(px(10.0), px(20.0)), size(px(40.0), px(30.0)));
-        let transform = TransformationMatrix::unit()
-            .translate(point(ScaledPixels(12.0), ScaledPixels(-7.0)))
-            .scale(size(1.5, 0.75));
-        let bounds = transformed_bounds(local_bounds, transform);
-        let hitbox = Hitbox {
-            id: HitboxId(2),
-            bounds,
-            local_bounds,
-            transform,
-            inverse_transform: transform.try_inverse(),
-            content_mask: ContentMask {
-                bounds: Bounds::new(
-                    point(px(-1000.0), px(-1000.0)),
-                    size(px(5000.0), px(5000.0)),
-                ),
-            },
-            behavior: HitboxBehavior::Normal,
-        };
-
-        let local_point = point(px(28.0), px(33.0));
-        let window_point = transform.apply(local_point);
-        let recovered = hitbox
-            .window_to_local(window_point)
-            .expect("invertible transform");
-
-        assert!((recovered.x.0 - local_point.x.0).abs() < 1e-3);
-        assert!((recovered.y.0 - local_point.y.0).abs() < 1e-3);
-        assert!(hitbox.contains_window_point(window_point));
-    }
-
-    #[test]
-    fn transformed_hitbox_handles_composed_parent_child_transform() {
-        let local_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(100.0), px(60.0)));
-        let parent = TransformationMatrix::unit()
-            .translate(point(ScaledPixels(24.0), ScaledPixels(16.0)))
-            .scale(size(1.1, 1.0));
-        let child = TransformationMatrix::unit()
-            .translate(point(ScaledPixels(9.0), ScaledPixels(3.0)))
-            .scale(size(0.8, 1.25));
-        let transform = parent.compose(child);
-        let bounds = transformed_bounds(local_bounds, transform);
-        let hitbox = Hitbox {
-            id: HitboxId(3),
-            bounds,
-            local_bounds,
-            transform,
-            inverse_transform: transform.try_inverse(),
-            content_mask: ContentMask {
-                bounds: Bounds::new(
-                    point(px(-1000.0), px(-1000.0)),
-                    size(px(5000.0), px(5000.0)),
-                ),
-            },
-            behavior: HitboxBehavior::Normal,
-        };
-
-        let local_inside = point(px(25.0), px(20.0));
-        let window_inside = transform.apply(local_inside);
-        assert!(hitbox.contains_window_point(window_inside));
-
-        let recovered = hitbox
-            .window_to_local(window_inside)
-            .expect("invertible transform");
-        assert!((recovered.x.0 - local_inside.x.0).abs() < 1e-3);
-        assert!((recovered.y.0 - local_inside.y.0).abs() < 1e-3);
-    }
-
-    #[test]
-    fn transformed_hitbox_respects_transformed_content_mask() {
-        let local_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(100.0), px(100.0)));
-        let local_mask_bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(30.0), px(30.0)));
-        let transform = TransformationMatrix::unit()
-            .translate(point(ScaledPixels(40.0), ScaledPixels(20.0)))
-            .scale(size(1.2, 1.2));
-        let bounds = transformed_bounds(local_bounds, transform);
-        let transformed_mask = transformed_bounds(local_mask_bounds, transform);
-        let hitbox = Hitbox {
-            id: HitboxId(4),
-            bounds,
-            local_bounds,
-            transform,
-            inverse_transform: transform.try_inverse(),
-            content_mask: ContentMask {
-                bounds: transformed_mask,
-            },
-            behavior: HitboxBehavior::Normal,
-        };
-
-        let point_inside_local_bounds_outside_mask = transform.apply(point(px(80.0), px(80.0)));
-        let point_inside_mask = transform.apply(point(px(10.0), px(10.0)));
-
-        assert!(!hitbox.contains_window_point(point_inside_local_bounds_outside_mask));
-        assert!(hitbox.contains_window_point(point_inside_mask));
     }
 }
