@@ -32,6 +32,9 @@ mod shader_compilation {
         let modules = [
             "quad",
             "shadow",
+            "backdrop_blur",
+            "backdrop_blur_downsample",
+            "backdrop_blur_upsample",
             "path_rasterization",
             "path_sprite",
             "underline",

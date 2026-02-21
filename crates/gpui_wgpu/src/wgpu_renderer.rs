@@ -1,9 +1,9 @@
 use crate::{WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, BackdropBlur, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite,
+    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
+    SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::num::NonZeroU64;
@@ -72,6 +72,7 @@ pub struct WgpuSurfaceConfig {
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
+    backdrop_blurs: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
@@ -110,6 +111,8 @@ pub struct WgpuRenderer {
     path_intermediate_view: wgpu::TextureView,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    backdrop_texture: wgpu::Texture,
+    backdrop_view: wgpu::TextureView,
     rendering_params: RenderingParameters,
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
@@ -253,6 +256,12 @@ impl WgpuRenderer {
             config.size.width.0 as u32,
             config.size.height.0 as u32,
         );
+        let (backdrop_texture, backdrop_view) = Self::create_backdrop_texture(
+            &device,
+            surface_format,
+            config.size.width.0 as u32,
+            config.size.height.0 as u32,
+        );
 
         let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
             &device,
@@ -333,6 +342,8 @@ impl WgpuRenderer {
             path_intermediate_view,
             path_msaa_texture,
             path_msaa_view,
+            backdrop_texture,
+            backdrop_view,
             rendering_params,
             dual_source_blending,
             adapter_info,
@@ -562,6 +573,16 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
         );
+        let backdrop_blurs = create_pipeline(
+            "backdrop_blurs",
+            "vs_backdrop_blur",
+            "fs_backdrop_blur",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+        );
 
         let path_rasterization = create_pipeline(
             "path_rasterization",
@@ -685,6 +706,7 @@ impl WgpuRenderer {
         WgpuPipelines {
             quads,
             shadows,
+            backdrop_blurs,
             path_rasterization,
             paths,
             underlines,
@@ -713,6 +735,30 @@ impl WgpuRenderer {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
+    fn create_backdrop_texture(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("backdrop_texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -777,6 +823,14 @@ impl WgpuRenderer {
             .unwrap_or((None, None));
             self.path_msaa_texture = path_msaa_texture;
             self.path_msaa_view = path_msaa_view;
+            let (backdrop_texture, backdrop_view) = Self::create_backdrop_texture(
+                &self.device,
+                self.surface_config.format,
+                self.surface_config.width,
+                self.surface_config.height,
+            );
+            self.backdrop_texture = backdrop_texture;
+            self.backdrop_view = backdrop_view;
         }
     }
 
@@ -916,7 +970,47 @@ impl WgpuRenderer {
                             &mut instance_offset,
                             &mut pass,
                         ),
-                        PrimitiveBatch::BackdropBlurs(_range) => true,
+                        PrimitiveBatch::BackdropBlurs(range) => {
+                            let blurs = &scene.backdrop_blurs[range];
+                            if blurs.is_empty() {
+                                continue;
+                            }
+                            drop(pass);
+                            encoder.copy_texture_to_texture(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: &frame.texture,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: &self.backdrop_texture,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                wgpu::Extent3d {
+                                    width: self.surface_config.width,
+                                    height: self.surface_config.height,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_backdrop"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &frame_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+                            self.draw_backdrop_blurs(blurs, &mut instance_offset, &mut pass)
+                        }
                         PrimitiveBatch::Paths(range) => {
                             let paths = &scene.paths[range];
                             if paths.is_empty() {
@@ -1042,6 +1136,23 @@ impl WgpuRenderer {
             data,
             shadows.len() as u32,
             &self.pipelines.shadows,
+            instance_offset,
+            pass,
+        )
+    }
+
+    fn draw_backdrop_blurs(
+        &self,
+        blurs: &[BackdropBlur],
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        let data = unsafe { Self::instance_bytes(blurs) };
+        self.draw_instances_with_texture(
+            data,
+            blurs.len() as u32,
+            &self.backdrop_view,
+            &self.pipelines.backdrop_blurs,
             instance_offset,
             pass,
         )

@@ -1019,6 +1019,94 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     return blend_color(input.color, alpha);
 }
 
+// --- backdrop blurs --- //
+
+struct BackdropBlur {
+    order: u32,
+    pad: u32,
+    bounds: Bounds,
+    content_mask: Bounds,
+    corner_radii: Corners,
+    blur_radius: f32,
+}
+@group(1) @binding(0) var<storage, read> b_backdrop_blurs: array<BackdropBlur>;
+
+struct BackdropBlurVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) blur_id: u32,
+    //TODO: use `clip_distance` once Naga supports it
+    @location(3) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_backdrop_blur(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> BackdropBlurVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let blur = b_backdrop_blurs[instance_id];
+    let pad = blur.pad;
+    var padded_bounds = blur.bounds;
+    padded_bounds.origin -= vec2<f32>(pad, pad);
+    padded_bounds.size += vec2<f32>(pad * 2u, pad * 2u);
+
+    let padded_size = vec2<f32>(blur.bounds.size + vec2<f32>(pad * 2u, pad * 2u));
+    let original_size = vec2<f32>(blur.bounds.size);
+    let unit_vertex_original = (unit_vertex * padded_size - vec2<f32>(pad, pad)) / original_size;
+
+    var out = BackdropBlurVarying();
+    out.position = to_device_position(unit_vertex, padded_bounds);
+    out.blur_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex_original, blur.bounds, blur.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let blur = b_backdrop_blurs[input.blur_id];
+    let viewport = globals.viewport_size;
+    let uv = input.position.xy / viewport;
+    let texel = 1.0 / max(viewport, vec2<f32>(1.0));
+    let radius_scale = max(blur.blur_radius / 3.0, 1.0);
+    let step = texel * radius_scale;
+
+    var accum_linear = vec3<f32>(0.0);
+    var accum_alpha = 0.0;
+    var weight_sum = 0.0;
+
+    let weights = array<f32, 9>(0.204164, 0.123841, 0.123841, 0.123841, 0.123841, 0.0751136, 0.0751136, 0.0751136, 0.0751136);
+    let offsets = array<vec2<f32>, 9>(
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(step.x, 0.0),
+        vec2<f32>(-step.x, 0.0),
+        vec2<f32>(0.0, step.y),
+        vec2<f32>(0.0, -step.y),
+        vec2<f32>(step.x, step.y),
+        vec2<f32>(-step.x, step.y),
+        vec2<f32>(step.x, -step.y),
+        vec2<f32>(-step.x, -step.y),
+    );
+
+    for (var i = 0u; i < 9u; i += 1u) {
+        let w = weights[i];
+        let sample = textureSample(t_sprite, s_sprite, uv + offsets[i]);
+        if (sample.a > 0.0) {
+            accum_linear += srgb_to_linear(sample.rgb / sample.a) * sample.a * w;
+            accum_alpha += sample.a * w;
+        }
+        weight_sum += w;
+    }
+
+    let safe_alpha = max(accum_alpha, 0.0001);
+    let blurred_rgb = linear_to_srgb(accum_linear / safe_alpha);
+
+    let distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+    let mask_alpha = saturate(0.5 - distance);
+    let alpha = (accum_alpha / max(weight_sum, 0.0001)) * mask_alpha;
+    return blend_color(vec4<f32>(blurred_rgb, 1.0), alpha);
+}
+
 // --- path rasterization --- //
 
 struct PathRasterizationVertex {

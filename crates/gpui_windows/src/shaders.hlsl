@@ -509,6 +509,158 @@ struct QuadFragmentInput {
 
 StructuredBuffer<Quad> quads: register(t1);
 
+/*
+**
+**              Backdrop blur
+**
+*/
+
+struct BackdropBlur {
+    uint order;
+    uint pad;
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+    float blur_radius;
+};
+
+struct BackdropBlurParams {
+    float2 input_size;
+    float offset;
+    float pad;
+};
+
+StructuredBuffer<BackdropBlurParams> backdrop_blur_params: register(t1);
+StructuredBuffer<BackdropBlur> backdrop_blurs: register(t1);
+
+struct BackdropBlurVertexOutput {
+    nointerpolation uint blur_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct BackdropBlurFragmentInput {
+    nointerpolation uint blur_id: TEXCOORD0;
+    float4 position: SV_Position;
+};
+
+struct BackdropBlurPassVertexOutput {
+    float4 position: SV_Position;
+    float2 uv: TEXCOORD0;
+};
+
+BackdropBlurPassVertexOutput backdrop_blur_downsample_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    float2 device_position = unit_vertex * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    BackdropBlurPassVertexOutput output;
+    output.position = float4(device_position, 0.0, 1.0);
+    output.uv = unit_vertex;
+    return output;
+}
+
+BackdropBlurPassVertexOutput backdrop_blur_upsample_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    float2 device_position = unit_vertex * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    BackdropBlurPassVertexOutput output;
+    output.position = float4(device_position, 0.0, 1.0);
+    output.uv = unit_vertex;
+    return output;
+}
+
+float4 backdrop_blur_downsample_fragment(BackdropBlurPassVertexOutput input) : SV_Target {
+    BackdropBlurParams params = backdrop_blur_params[0];
+    float2 texel = 1.0 / max(params.input_size, float2(1.0, 1.0));
+    float2 offset = texel * (params.offset + 0.5);
+    float3 rgb_sum = float3(0.0, 0.0, 0.0);
+    float alpha_sum = 0.0;
+    float4 sample = t_sprite.Sample(s_sprite, input.uv + float2(-offset.x, -offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+        alpha_sum += sample.a;
+    }
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(offset.x, -offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+        alpha_sum += sample.a;
+    }
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(-offset.x, offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+        alpha_sum += sample.a;
+    }
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(offset.x, offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+        alpha_sum += sample.a;
+    }
+    float alpha = alpha_sum * 0.25;
+    float safe_alpha = max(alpha_sum, 0.0001);
+    float3 rgb = linear_to_srgb(rgb_sum / safe_alpha) * alpha;
+    return float4(rgb, alpha);
+}
+
+float4 backdrop_blur_upsample_fragment(BackdropBlurPassVertexOutput input) : SV_Target {
+    BackdropBlurParams params = backdrop_blur_params[0];
+    float2 texel = 1.0 / max(params.input_size, float2(1.0, 1.0));
+    float2 offset = texel * (params.offset + 0.5);
+    float3 rgb_sum = float3(0.0, 0.0, 0.0);
+    float alpha_sum = 0.0;
+    float4 sample = t_sprite.Sample(s_sprite, input.uv + float2(-offset.x, -offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+        alpha_sum += sample.a;
+    }
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(offset.x, -offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+        alpha_sum += sample.a;
+    }
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(-offset.x, offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+        alpha_sum += sample.a;
+    }
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(offset.x, offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+        alpha_sum += sample.a;
+    }
+    float alpha = alpha_sum * 0.25;
+    float safe_alpha = max(alpha_sum, 0.0001);
+    float3 rgb = linear_to_srgb(rgb_sum / safe_alpha) * alpha;
+    return float4(rgb, alpha);
+}
+
+BackdropBlurVertexOutput backdrop_blur_vertex(uint vertex_id: SV_VertexID, uint blur_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BackdropBlur blur = backdrop_blurs[blur_id];
+    float pad = float(blur.pad);
+    Bounds padded_bounds = blur.bounds;
+    padded_bounds.origin -= float2(pad, pad);
+    padded_bounds.size += float2(pad * 2.0, pad * 2.0);
+    float2 padded_size = blur.bounds.size + float2(pad * 2.0, pad * 2.0);
+    float2 unit_vertex_original = (unit_vertex * padded_size - float2(pad, pad)) / blur.bounds.size;
+    float4 device_position = to_device_position(unit_vertex, padded_bounds);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex_original, blur.bounds, blur.content_mask);
+
+    BackdropBlurVertexOutput output;
+    output.position = device_position;
+    output.blur_id = blur_id;
+    output.clip_distance = clip_distance;
+    return output;
+}
+
+float4 backdrop_blur_fragment(BackdropBlurFragmentInput input) : SV_Target {
+    BackdropBlur blur = backdrop_blurs[input.blur_id];
+    float2 viewport = global_viewport_size;
+    float2 uv = input.position.xy / viewport;
+    float4 color = t_sprite.Sample(s_sprite, uv);
+
+    float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+    float alpha = saturate(0.5 - distance);
+    return color * alpha;
+}
+
 QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint quad_id: SV_InstanceID) {
     float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
     Quad quad = quads[quad_id];

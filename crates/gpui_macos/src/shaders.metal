@@ -63,6 +63,162 @@ struct QuadFragmentInput {
   float4 background_color1 [[flat]];
 };
 
+struct BackdropBlurVertexOutput {
+  uint blur_id [[flat]];
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropBlurFragmentInput {
+  uint blur_id [[flat]];
+  float4 position [[position]];
+};
+
+struct BackdropBlurPassVertexOutput {
+  float4 position [[position]];
+  float2 uv;
+};
+
+vertex BackdropBlurPassVertexOutput backdrop_blur_downsample_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurPassInputIndex_Vertices)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float2 device_position =
+      unit_vertex * float2(2., -2.) + float2(-1., 1.);
+  return BackdropBlurPassVertexOutput{float4(device_position, 0., 1.), unit_vertex};
+}
+
+vertex BackdropBlurPassVertexOutput backdrop_blur_upsample_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurPassInputIndex_Vertices)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float2 device_position =
+      unit_vertex * float2(2., -2.) + float2(-1., 1.);
+  return BackdropBlurPassVertexOutput{float4(device_position, 0., 1.), unit_vertex};
+}
+
+fragment float4 backdrop_blur_downsample_fragment(
+    BackdropBlurPassVertexOutput input [[stage_in]],
+    constant BackdropBlurParams *params [[buffer(BackdropBlurPassInputIndex_Params)]],
+    texture2d<float> source_texture [[texture(BackdropBlurPassInputIndex_SourceTexture)]]) {
+  constexpr sampler blur_sampler(mag_filter::linear, min_filter::linear,
+                                 address::clamp_to_edge);
+  float2 input_size = float2((float)params->input_size.width,
+                             (float)params->input_size.height);
+  float2 texel = 1.0 / max(input_size, float2(1.0));
+  float2 offset = texel * (params->offset + 0.5);
+  float3 rgb_sum = float3(0.0);
+  float alpha_sum = 0.0;
+  float4 sample = source_texture.sample(blur_sampler, input.uv + float2(-offset.x, -offset.y));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+    alpha_sum += sample.a;
+  }
+  sample = source_texture.sample(blur_sampler, input.uv + float2(offset.x, -offset.y));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+    alpha_sum += sample.a;
+  }
+  sample = source_texture.sample(blur_sampler, input.uv + float2(-offset.x, offset.y));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+    alpha_sum += sample.a;
+  }
+  sample = source_texture.sample(blur_sampler, input.uv + float2(offset.x, offset.y));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+    alpha_sum += sample.a;
+  }
+  float alpha = alpha_sum * 0.25;
+  float safe_alpha = max(alpha_sum, 0.0001);
+  float3 rgb = linear_to_srgb(rgb_sum / safe_alpha) * alpha;
+  return float4(rgb, alpha);
+}
+
+fragment float4 backdrop_blur_upsample_fragment(
+    BackdropBlurPassVertexOutput input [[stage_in]],
+    constant BackdropBlurParams *params [[buffer(BackdropBlurPassInputIndex_Params)]],
+    texture2d<float> source_texture [[texture(BackdropBlurPassInputIndex_SourceTexture)]]) {
+  constexpr sampler blur_sampler(mag_filter::linear, min_filter::linear,
+                                 address::clamp_to_edge);
+  float2 input_size = float2((float)params->input_size.width,
+                             (float)params->input_size.height);
+  float2 texel = 1.0 / max(input_size, float2(1.0));
+  float2 offset = texel * (params->offset + 0.5);
+  float3 rgb_sum = float3(0.0);
+  float alpha_sum = 0.0;
+  float4 sample = source_texture.sample(blur_sampler, input.uv + float2(-offset.x, -offset.y));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+    alpha_sum += sample.a;
+  }
+  sample = source_texture.sample(blur_sampler, input.uv + float2(offset.x, -offset.y));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+    alpha_sum += sample.a;
+  }
+  sample = source_texture.sample(blur_sampler, input.uv + float2(-offset.x, offset.y));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+    alpha_sum += sample.a;
+  }
+  sample = source_texture.sample(blur_sampler, input.uv + float2(offset.x, offset.y));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+    alpha_sum += sample.a;
+  }
+  float alpha = alpha_sum * 0.25;
+  float safe_alpha = max(alpha_sum, 0.0001);
+  float3 rgb = linear_to_srgb(rgb_sum / safe_alpha) * alpha;
+  return float4(rgb, alpha);
+}
+
+vertex BackdropBlurVertexOutput backdrop_blur_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
+    constant Size_DevicePixels *viewport_size [[buffer(BackdropBlurInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  BackdropBlur blur = blurs[blur_id];
+  float pad = blur.pad;
+  Bounds_ScaledPixels padded_bounds = blur.bounds;
+  padded_bounds.origin.x -= pad;
+  padded_bounds.origin.y -= pad;
+  padded_bounds.size.width += pad * 2.0;
+  padded_bounds.size.height += pad * 2.0;
+  float2 padded_size = float2(blur.bounds.size.width + pad * 2.0,
+                              blur.bounds.size.height + pad * 2.0);
+  float2 original_size = float2(blur.bounds.size.width, blur.bounds.size.height);
+  float2 unit_vertex_original = (unit_vertex * padded_size - float2(pad, pad)) / original_size;
+  float4 device_position =
+      to_device_position(unit_vertex, padded_bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex_original, blur.bounds,
+                                                 blur.content_mask.bounds);
+  return BackdropBlurVertexOutput{
+      blur_id,
+      device_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 backdrop_blur_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
+    constant Size_DevicePixels *viewport_size [[buffer(BackdropBlurInputIndex_ViewportSize)]],
+    texture2d<float> backdrop_texture [[texture(BackdropBlurInputIndex_BackdropTexture)]]) {
+  BackdropBlur blur = blurs[input.blur_id];
+  float2 viewport = float2(viewport_size->width, viewport_size->height);
+  float2 uv = input.position.xy / viewport;
+
+  constexpr sampler blur_sampler(mag_filter::linear, min_filter::linear,
+                                 address::clamp_to_edge);
+
+  float4 color = backdrop_texture.sample(blur_sampler, uv);
+  float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+  float alpha = clamp(0.5 - distance, 0.0, 1.0);
+  return color * alpha;
+}
+
 vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
                                     uint quad_id [[instance_id]],
                                     constant float2 *unit_vertices
