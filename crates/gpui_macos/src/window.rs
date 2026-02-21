@@ -1054,12 +1054,21 @@ impl PlatformWindow for MacWindow {
         this.foreground_executor
             .spawn(async move {
                 unsafe {
+                    let screen: id = msg_send![window, screen];
+                    if screen == nil {
+                        return;
+                    }
+                    let screen_frame = NSScreen::frame(screen);
+                    let frame = NSWindow::frame(window);
+                    let ns_origin = NSPoint::new(
+                        (screen_frame.origin.x as f32 + origin.x.as_f32()) as f64,
+                        (screen_frame.size.height as f32 + screen_frame.origin.y as f32
+                            - origin.y.as_f32()
+                            - frame.size.height as f32) as f64,
+                    );
                     let _: () = msg_send![
                         window,
-                        setFrameOrigin: NSPoint::new(
-                            origin.x.as_f32() as f64,
-                            origin.y.as_f32() as f64
-                        )
+                        setFrameOrigin: ns_origin
                     ];
                 }
             })
