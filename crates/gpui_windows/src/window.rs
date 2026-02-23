@@ -422,7 +422,7 @@ impl WindowsWindow {
         );
 
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            (WS_EX_TOOLWINDOW, WINDOW_STYLE(0x0))
+            (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WINDOW_STYLE(0x0))
         } else {
             let mut dwstyle = WS_SYSMENU;
 
@@ -621,6 +621,19 @@ impl PlatformWindow for WindowsWindow {
                     )
                     .context("unable to set window position")
                     .log_err();
+                }
+            })
+            .detach();
+    }
+
+    fn set_visible(&self, visible: bool) {
+        let hwnd = self.0.hwnd;
+        self.0
+            .executor
+            .spawn(async move {
+                unsafe {
+                    let cmd = if visible { SW_SHOWNOACTIVATE } else { SW_HIDE };
+                    ShowWindowAsync(hwnd, cmd).ok().log_err();
                 }
             })
             .detach();

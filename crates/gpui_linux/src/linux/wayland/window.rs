@@ -1128,6 +1128,16 @@ impl PlatformWindow for WaylandWindow {
         log::debug!("Wayland compositor controls window positioning");
     }
 
+    fn set_visible(&self, visible: bool) {
+        let state = self.borrow();
+        if visible {
+            state.surface.commit();
+        } else {
+            state.surface.attach(None, 0, 0);
+            state.surface.commit();
+        }
+    }
+
     fn scale_factor(&self) -> f32 {
         self.borrow().scale
     }

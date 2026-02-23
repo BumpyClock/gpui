@@ -66,6 +66,7 @@ x11rb::atom_manager! {
         _NET_WM_STATE_FULLSCREEN,
         _NET_WM_STATE_HIDDEN,
         _NET_WM_STATE_FOCUSED,
+        _NET_WM_STATE_ABOVE,
         _NET_ACTIVE_WINDOW,
         _NET_WM_SYNC_REQUEST,
         _NET_WM_SYNC_REQUEST_COUNTER,
@@ -549,6 +550,16 @@ impl X11WindowState {
                         atoms._NET_WM_WINDOW_TYPE,
                         xproto::AtomEnum::ATOM,
                         &[atoms._NET_WM_WINDOW_TYPE_NOTIFICATION],
+                    ),
+                )?;
+                check_reply(
+                    || "X11 ChangeProperty32 setting _NET_WM_STATE_ABOVE for pop-up failed.",
+                    xcb.change_property32(
+                        xproto::PropMode::REPLACE,
+                        x_window,
+                        atoms._NET_WM_STATE,
+                        xproto::AtomEnum::ATOM,
+                        &[atoms._NET_WM_STATE_ABOVE],
                     ),
                 )?;
             }
@@ -1305,6 +1316,23 @@ impl PlatformWindow for X11Window {
             ),
         )
         .log_err();
+        xcb_flush(&self.0.xcb);
+    }
+
+    fn set_visible(&self, visible: bool) {
+        if visible {
+            check_reply(
+                || "X11 MapWindow failed.",
+                self.0.xcb.map_window(self.0.x_window),
+            )
+            .log_err();
+        } else {
+            check_reply(
+                || "X11 UnmapWindow failed.",
+                self.0.xcb.unmap_window(self.0.x_window),
+            )
+            .log_err();
+        }
         xcb_flush(&self.0.xcb);
     }
 
