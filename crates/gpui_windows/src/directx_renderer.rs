@@ -447,6 +447,54 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    pub(crate) fn update_transparency(&mut self, transparent: bool) {
+        if !transparent || self.direct_composition.is_some() {
+            return;
+        }
+
+        self.enable_direct_composition_for_transparency()
+            .context("Failed to enable transparency in DirectXRenderer")
+            .log_err();
+    }
+
+    fn enable_direct_composition_for_transparency(&mut self) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let dxgi_device = devices
+            .dxgi_device
+            .as_ref()
+            .context("dxgi device missing for DirectComposition")?;
+        let width = self.width.max(1);
+        let height = self.height.max(1);
+
+        unsafe { devices.device_context.OMSetRenderTargets(None, None) };
+
+        let swap_chain =
+            create_swap_chain_for_composition(&devices.dxgi_factory, &devices.device, width, height)
+                .context("Failed to create composition swap chain")?;
+        let direct_composition =
+            DirectComposition::new(dxgi_device, self.hwnd).context("Creating DirectComposition")?;
+        direct_composition
+            .set_swap_chain(&swap_chain)
+            .context("Setting swap chain for DirectComposition")?;
+
+        let resources = self.resources.as_mut().context("resources missing")?;
+        resources.render_target.take();
+        resources.render_target_view.take();
+        resources.swap_chain = swap_chain;
+        resources
+            .recreate_resources(devices, width, height)
+            .context("Recreating DirectX resources for transparency")?;
+
+        unsafe {
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+        }
+
+        self.direct_composition = Some(direct_composition);
+        Ok(())
+    }
+
     fn upload_scene_buffers(&mut self, scene: &Scene) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
 
