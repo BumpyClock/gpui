@@ -603,8 +603,8 @@ impl PlatformWindow for WindowsWindow {
     fn set_position(&self, origin: Point<Pixels>) {
         let hwnd = self.0.hwnd;
         let scale_factor = self.scale_factor();
-        let x = (origin.x.0 * scale_factor) as i32;
-        let y = (origin.y.0 * scale_factor) as i32;
+        let x = (origin.x.as_f32() * scale_factor) as i32;
+        let y = (origin.y.as_f32() * scale_factor) as i32;
 
         self.0
             .executor
