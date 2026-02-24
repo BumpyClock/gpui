@@ -910,6 +910,30 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow_mut().update_transparency(!opaque);
     }
 
+    fn set_has_shadow(&self, has_shadow: bool) {
+        let hwnd = self.0.hwnd;
+        let policy = if has_shadow {
+            DWMNCRP_ENABLED
+        } else {
+            DWMNCRP_DISABLED
+        };
+        let nc_rendering_enabled: BOOL = has_shadow.into();
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_NCRENDERING_POLICY,
+                &policy as *const _ as *const _,
+                std::mem::size_of::<DWMNCRENDERINGPOLICY>() as u32,
+            );
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_NCRENDERING_ENABLED,
+                &nc_rendering_enabled as *const _ as *const _,
+                std::mem::size_of::<BOOL>() as u32,
+            );
+        }
+    }
+
     fn set_overlay_input_mode(&self, input_mode: OverlayInputMode) {
         let hwnd = self.0.hwnd;
         self.0
