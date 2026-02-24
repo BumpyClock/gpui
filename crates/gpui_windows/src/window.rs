@@ -878,23 +878,10 @@ impl PlatformWindow for WindowsWindow {
                 set_window_composition_attribute(hwnd, None, 0);
             }
             WindowBackgroundAppearance::Transparent => {
-                // Use ACCENT_ENABLE_TRANSPARENTGRADIENT (2) with a fully transparent
-                // color to tell DWM the window background is transparent. Without this,
-                // DWM composites a solid black backdrop behind the DirectComposition
-                // visual even though the swap chain uses premultiplied alpha.
-                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 2);
-
-                // Extend DWM frame into the entire client area so that the glass
-                // region covers everything (required for the gradient to apply).
-                unsafe {
-                    let margins = MARGINS {
-                        cxLeftWidth: -1,
-                        cxRightWidth: -1,
-                        cyTopHeight: -1,
-                        cyBottomHeight: -1,
-                    };
-                    let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-                }
+                // Avoid DWM tinting for overlays. Rely on DirectComposition alpha output.
+                set_window_composition_attribute(hwnd, None, 0);
+                // Ensure Windows 11 system backdrop is disabled for transparent overlays.
+                dwm_set_window_composition_attribute(hwnd, 1);
             }
             WindowBackgroundAppearance::Blurred => {
                 set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
