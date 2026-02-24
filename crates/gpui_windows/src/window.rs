@@ -878,8 +878,7 @@ impl PlatformWindow for WindowsWindow {
                 set_window_composition_attribute(hwnd, None, 0);
             }
             WindowBackgroundAppearance::Transparent => {
-                // Avoid DWM tinting for overlays. Rely on DirectComposition alpha output.
-                set_window_composition_attribute(hwnd, None, 0);
+                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 2);
                 // Ensure Windows 11 system backdrop is disabled for transparent overlays.
                 dwm_set_window_composition_attribute(hwnd, 1);
             }
