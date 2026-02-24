@@ -512,6 +512,16 @@ impl WindowsWindow {
                     &color_none as *const _ as *const _,
                     std::mem::size_of::<u32>() as u32,
                 );
+
+                // Suppress DWM show/hide animations for popup windows so
+                // overlays appear and disappear instantly.
+                let disable: BOOL = TRUE;
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_TRANSITIONS_FORCEDISABLED,
+                    &disable as *const _ as *const _,
+                    std::mem::size_of::<BOOL>() as u32,
+                );
             }
         }
 
@@ -868,10 +878,23 @@ impl PlatformWindow for WindowsWindow {
                 set_window_composition_attribute(hwnd, None, 0);
             }
             WindowBackgroundAppearance::Transparent => {
-                // ACCENT_ENABLE_TRANSPARENTGRADIENT (2) adds a tinted backdrop on some
-                // systems, which causes visible dark artifacts behind transparent popups.
-                // Keep accent disabled and rely on DirectComposition alpha rendering.
-                set_window_composition_attribute(hwnd, None, 0);
+                // Use ACCENT_ENABLE_TRANSPARENTGRADIENT (2) with a fully transparent
+                // color to tell DWM the window background is transparent. Without this,
+                // DWM composites a solid black backdrop behind the DirectComposition
+                // visual even though the swap chain uses premultiplied alpha.
+                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 2);
+
+                // Extend DWM frame into the entire client area so that the glass
+                // region covers everything (required for the gradient to apply).
+                unsafe {
+                    let margins = MARGINS {
+                        cxLeftWidth: -1,
+                        cxRightWidth: -1,
+                        cyTopHeight: -1,
+                        cyBottomHeight: -1,
+                    };
+                    let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+                }
             }
             WindowBackgroundAppearance::Blurred => {
                 set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
