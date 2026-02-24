@@ -26,8 +26,8 @@ use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, ExternalPaths, FileDropEvent,
     ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
+    OverlayInputMode, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+    PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams, point,
     px, size,
 };
@@ -1423,6 +1423,17 @@ impl PlatformWindow for MacWindow {
         let this = self.0.as_ref().lock();
         unsafe {
             let _: () = msg_send![this.native_window, setHasShadow: has_shadow as BOOL];
+        }
+    }
+
+    fn set_overlay_input_mode(&self, input_mode: OverlayInputMode) {
+        let this = self.0.as_ref().lock();
+        let ignores_mouse_events = match input_mode {
+            OverlayInputMode::Interactive => NO,
+            OverlayInputMode::ClickThrough => YES,
+        };
+        unsafe {
+            let _: () = msg_send![this.native_window, setIgnoresMouseEvents: ignores_mouse_events];
         }
     }
 

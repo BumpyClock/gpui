@@ -1036,6 +1036,20 @@ impl App {
         })
     }
 
+    /// Opens a new overlay surface with the given options and root view.
+    pub fn open_overlay_surface<V: 'static + Render>(
+        &mut self,
+        options: crate::OverlaySurfaceOptions,
+        build_root_view: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+    ) -> anyhow::Result<WindowHandle<V>> {
+        let input_mode = options.input_mode;
+        let handle = self.open_window(options.into_window_options(), build_root_view)?;
+        handle.update(self, |_, window, _| {
+            window.set_overlay_input_mode(input_mode);
+        })?;
+        Ok(handle)
+    }
+
     /// Instructs the platform to activate the application by bringing it to the foreground.
     pub fn activate(&self, ignoring_other_apps: bool) {
         self.platform.activate(ignoring_other_apps);

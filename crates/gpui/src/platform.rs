@@ -475,6 +475,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
     fn set_has_shadow(&self, _has_shadow: bool) {}
+    fn set_overlay_input_mode(&self, _input_mode: OverlayInputMode) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
@@ -555,6 +556,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
+}
+
+/// Controls whether an overlay surface receives pointer input.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum OverlayInputMode {
+    /// Overlay receives pointer input normally.
+    #[default]
+    Interactive,
+    /// Overlay becomes click-through.
+    ClickThrough,
 }
 
 /// Type alias for runnables with metadata.
@@ -1234,6 +1245,61 @@ pub struct WindowOptions {
     pub tabbing_identifier: Option<String>,
 }
 
+/// The variables that can be configured when creating an overlay surface.
+#[derive(Debug)]
+pub struct OverlaySurfaceOptions {
+    /// Specifies the state and bounds of the overlay in screen coordinates.
+    pub window_bounds: Option<WindowBounds>,
+    /// The display to create the overlay on.
+    pub display_id: Option<DisplayId>,
+    /// Whether the overlay should be shown when created.
+    pub show: bool,
+    /// Whether the overlay should be focused when created.
+    pub focus: bool,
+    /// The appearance of the overlay background.
+    pub window_background: WindowBackgroundAppearance,
+    /// Whether platform shadow should be enabled.
+    pub has_shadow: Option<bool>,
+    /// Application identifier of the overlay window.
+    pub app_id: Option<String>,
+    /// Overlay minimum size.
+    pub window_min_size: Option<Size<Pixels>>,
+    /// Overlay input behavior.
+    pub input_mode: OverlayInputMode,
+    /// Layer-shell options for Linux Wayland overlays.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    pub layer_shell: Option<layer_shell::LayerShellOptions>,
+}
+
+impl OverlaySurfaceOptions {
+    /// Convert overlay options into window options.
+    pub fn into_window_options(self) -> WindowOptions {
+        let mut kind = WindowKind::PopUp;
+        #[cfg(all(target_os = "linux", feature = "wayland"))]
+        if let Some(layer_shell) = self.layer_shell {
+            kind = WindowKind::LayerShell(layer_shell);
+        }
+
+        WindowOptions {
+            window_bounds: self.window_bounds,
+            titlebar: None,
+            focus: self.focus,
+            show: self.show,
+            kind,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            display_id: self.display_id,
+            window_background: self.window_background,
+            has_shadow: self.has_shadow,
+            app_id: self.app_id,
+            window_min_size: self.window_min_size,
+            window_decorations: None,
+            tabbing_identifier: None,
+        }
+    }
+}
+
 /// The variables that can be configured when creating a new window
 #[derive(Debug)]
 #[cfg_attr(
@@ -1341,6 +1407,24 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+        }
+    }
+}
+
+impl Default for OverlaySurfaceOptions {
+    fn default() -> Self {
+        Self {
+            window_bounds: None,
+            display_id: None,
+            show: false,
+            focus: false,
+            window_background: WindowBackgroundAppearance::Transparent,
+            has_shadow: None,
+            app_id: None,
+            window_min_size: None,
+            input_mode: OverlayInputMode::Interactive,
+            #[cfg(all(target_os = "linux", feature = "wayland"))]
+            layer_shell: None,
         }
     }
 }

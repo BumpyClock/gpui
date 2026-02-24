@@ -15,9 +15,9 @@ use crate::{
     ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
     SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
     TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    OverlayInputMode, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -2096,6 +2096,11 @@ impl Window {
     /// Sets whether the platform window shadow should be enabled.
     pub fn set_has_shadow(&self, has_shadow: bool) {
         self.platform_window.set_has_shadow(has_shadow);
+    }
+
+    /// Sets overlay input behavior for this window.
+    pub fn set_overlay_input_mode(&self, input_mode: OverlayInputMode) {
+        self.platform_window.set_overlay_input_mode(input_mode);
     }
 
     /// Mark the window as dirty at the platform level.

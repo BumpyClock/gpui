@@ -912,6 +912,40 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow_mut().update_transparency(!opaque);
     }
 
+    fn set_overlay_input_mode(&self, input_mode: OverlayInputMode) {
+        let hwnd = self.0.hwnd;
+        self.0
+            .executor
+            .spawn(async move {
+                unsafe {
+                    let current_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+                    let transparent_flag = WS_EX_TRANSPARENT.0 as u32;
+                    let updated_ex_style = match input_mode {
+                        OverlayInputMode::Interactive => current_ex_style & !transparent_flag,
+                        OverlayInputMode::ClickThrough => current_ex_style | transparent_flag,
+                    };
+
+                    if updated_ex_style != current_ex_style {
+                        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, updated_ex_style as isize);
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE
+                                | SWP_NOSIZE
+                                | SWP_NOZORDER
+                                | SWP_FRAMECHANGED
+                                | SWP_NOACTIVATE,
+                        );
+                    }
+                }
+            })
+            .detach();
+    }
+
     fn minimize(&self) {
         unsafe { ShowWindowAsync(self.0.hwnd, SW_MINIMIZE).ok().log_err() };
     }

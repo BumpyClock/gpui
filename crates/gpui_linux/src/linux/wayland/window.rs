@@ -27,12 +27,12 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
-    WindowDecorations, WindowKind, WindowParams, layer_shell::LayerShellNotSupportedError, px,
-    size,
+    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers,
+    OverlayInputMode, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene,
+    Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowControls, WindowDecorations, WindowKind, WindowParams,
+    layer_shell::LayerShellNotSupportedError, px, size,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -103,6 +103,7 @@ pub struct WaylandWindowState {
     input_handler: Option<PlatformInputHandler>,
     decorations: WindowDecorations,
     background_appearance: WindowBackgroundAppearance,
+    input_mode: OverlayInputMode,
     fullscreen: bool,
     maximized: bool,
     tiling: Tiling,
@@ -365,6 +366,7 @@ impl WaylandWindowState {
             input_handler: None,
             decorations: WindowDecorations::Client,
             background_appearance: WindowBackgroundAppearance::Opaque,
+            input_mode: OverlayInputMode::Interactive,
             fullscreen: false,
             maximized: false,
             tiling: Tiling::default(),
@@ -1237,6 +1239,14 @@ impl PlatformWindow for WaylandWindow {
         update_window(state);
     }
 
+    fn set_overlay_input_mode(&self, input_mode: OverlayInputMode) {
+        let mut state = self.borrow_mut();
+        if state.input_mode != input_mode {
+            state.input_mode = input_mode;
+            update_window(state);
+        }
+    }
+
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.borrow().background_appearance
     }
@@ -1424,11 +1434,11 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     let opaque_area = state.window_bounds.map(|v| f32::from(v) as i32);
     opaque_area.inset(f32::from(state.inset()) as i32);
 
-    let region = state
+    let opaque_region = state
         .globals
         .compositor
         .create_region(&state.globals.qh, ());
-    region.add(
+    opaque_region.add(
         opaque_area.origin.x,
         opaque_area.origin.y,
         opaque_area.size.width,
@@ -1443,10 +1453,24 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         // Promise the compositor that this region of the window surface
         // contains no transparent pixels. This allows the compositor to skip
         // updating whatever is behind the surface for better performance.
-        state.surface.set_opaque_region(Some(&region));
+        state.surface.set_opaque_region(Some(&opaque_region));
     } else {
         state.surface.set_opaque_region(None);
     }
+
+    let input_region = state
+        .globals
+        .compositor
+        .create_region(&state.globals.qh, ());
+    if matches!(state.input_mode, OverlayInputMode::Interactive) {
+        input_region.add(
+            opaque_area.origin.x,
+            opaque_area.origin.y,
+            opaque_area.size.width,
+            opaque_area.size.height,
+        );
+    }
+    state.surface.set_input_region(Some(&input_region));
 
     if let Some(ref blur_manager) = state.globals.blur_manager {
         if state.background_appearance == WindowBackgroundAppearance::Blurred {
@@ -1464,7 +1488,8 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         }
     }
 
-    region.destroy();
+    input_region.destroy();
+    opaque_region.destroy();
 }
 
 pub(crate) trait WindowDecorationsExt {
