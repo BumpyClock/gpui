@@ -870,6 +870,18 @@ impl PlatformWindow for WindowsWindow {
         self.state.background_appearance.set(background_appearance);
         let hwnd = self.0.hwnd;
         let opaque = matches!(background_appearance, WindowBackgroundAppearance::Opaque);
+        let corner_preference = match background_appearance {
+            WindowBackgroundAppearance::Transparent => DWMWCP_DONOTROUND,
+            _ => DWMWCP_DEFAULT,
+        };
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &corner_preference as *const _ as *const _,
+                std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+            );
+        }
 
         // using Dwm APIs for Mica and MicaAlt backdrops.
         // others follow the set_window_composition_attribute approach
