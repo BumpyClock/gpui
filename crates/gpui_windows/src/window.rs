@@ -868,7 +868,10 @@ impl PlatformWindow for WindowsWindow {
                 set_window_composition_attribute(hwnd, None, 0);
             }
             WindowBackgroundAppearance::Transparent => {
-                set_window_composition_attribute(hwnd, None, 2);
+                // ACCENT_ENABLE_TRANSPARENTGRADIENT (2) adds a tinted backdrop on some
+                // systems, which causes visible dark artifacts behind transparent popups.
+                // Keep accent disabled and rely on DirectComposition alpha rendering.
+                set_window_composition_attribute(hwnd, None, 0);
             }
             WindowBackgroundAppearance::Blurred => {
                 set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
