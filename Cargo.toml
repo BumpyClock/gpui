@@ -187,6 +187,7 @@ features = [
     "Win32_Graphics_Imaging",
     "Win32_Graphics_Hlsl",
     "Win32_Networking_WinSock",
+    "Win32_Media",
     "Win32_Security",
     "Win32_Security_Credentials",
     "Win32_Security_Cryptography",
