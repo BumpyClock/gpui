@@ -499,6 +499,22 @@ impl WindowsWindow {
         register_drag_drop(&this)?;
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
+
+        // Suppress the DWM-drawn border for popup windows on Windows 11+.
+        // Without this, DWM composites a visible 1px border even when
+        // the window has no classic border styles.
+        if params.kind == WindowKind::PopUp {
+            unsafe {
+                let color_none: u32 = 0xFFFFFFFE; // DWMWA_COLOR_NONE
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_BORDER_COLOR,
+                    &color_none as *const _ as *const _,
+                    std::mem::size_of::<u32>() as u32,
+                );
+            }
+        }
+
         this.state.border_offset.update(hwnd)?;
         let placement = retrieve_window_placement(
             hwnd,
