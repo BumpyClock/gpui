@@ -23,6 +23,10 @@ cargo test -p gpui --features test-support
 cargo build --example hello_world
 ```
 
+## Upstream Sync
+
+Last synced with [zed-industries/zed](https://github.com/zed-industries/zed) at commit [`dbd95ea742`](https://github.com/zed-industries/zed/commit/dbd95ea742) (2025-03-25).
+
 ## License
 
 GPL-3.0
