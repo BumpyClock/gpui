@@ -202,12 +202,6 @@ extern "C" fn trampoline(context: *mut c_void) {
         unsafe { Runnable::<RunnableMeta>::from_raw(NonNull::new_unchecked(context as *mut ())) };
 
     let metadata = runnable.metadata();
-
-    // Check if the executor that spawned this task was closed
-    if metadata.is_closed() {
-        return;
-    }
-
     let location = metadata.location;
 
     let start = Instant::now();

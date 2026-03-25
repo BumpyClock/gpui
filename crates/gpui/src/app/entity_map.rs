@@ -85,6 +85,7 @@ impl EntityMap {
     }
 
     #[doc(hidden)]
+    #[cfg(any(test, feature = "leak-detection"))]
     pub fn ref_counts_drop_handle(&self) -> Arc<RwLock<EntityRefCounts>> {
         self.ref_counts.clone()
     }

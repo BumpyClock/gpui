@@ -296,6 +296,7 @@ impl MacPlatform {
                     action,
                     os_action,
                     checked,
+                    disabled,
                 } => {
                     // Note that this is intentionally using earlier bindings, whereas typically
                     // later ones take display precedence. See the discussion on
@@ -393,13 +394,16 @@ impl MacPlatform {
                     if *checked {
                         item.setState_(NSVisualEffectState::Active);
                     }
+                    if *disabled {
+                        let _: () = msg_send![item, setEnabled: false];
+                    }
 
                     let tag = actions.len() as NSInteger;
                     let _: () = msg_send![item, setTag: tag];
                     actions.push(action.boxed_clone());
                     item
                 }
-                MenuItem::Submenu(Menu { name, items }) => {
+                MenuItem::Submenu(Menu { name, items, .. }) => {
                     let item = NSMenuItem::new(nil).autorelease();
                     let submenu = NSMenu::new(nil).autorelease();
                     submenu.setDelegate_(delegate);
