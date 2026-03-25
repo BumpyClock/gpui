@@ -1077,6 +1077,13 @@ impl PlatformInputHandler {
     }
 
     #[allow(dead_code)]
+    pub fn query_accepts_text_input(&mut self) -> bool {
+        self.cx
+            .update(|window, cx| self.handler.accepts_text_input(window, cx))
+            .unwrap_or(true)
+    }
+
+    #[allow(dead_code)]
     pub fn query_prefers_ime_for_printable_keys(&mut self) -> bool {
         self.cx
             .update(|window, cx| self.handler.prefers_ime_for_printable_keys(window, cx))

@@ -217,6 +217,7 @@ pub(crate) struct WaylandClientState {
     // Output to scale mapping
     outputs: HashMap<ObjectId, Output>,
     in_progress_outputs: HashMap<ObjectId, InProgressOutput>,
+    wl_outputs: HashMap<ObjectId, wl_output::WlOutput>,
     keyboard_layout: LinuxKeyboardLayout,
     keymap_state: Option<xkb::State>,
     compose_state: Option<xkb::compose::State>,
@@ -459,6 +460,8 @@ impl WaylandClient {
         let mut seat: Option<wl_seat::WlSeat> = None;
         #[allow(clippy::mutable_key_type)]
         let mut in_progress_outputs = HashMap::default();
+        #[allow(clippy::mutable_key_type)]
+        let mut wl_outputs: HashMap<ObjectId, wl_output::WlOutput> = HashMap::default();
         globals.contents().with_list(|list| {
             for global in list {
                 match &global.interface[..] {
@@ -478,6 +481,7 @@ impl WaylandClient {
                             (),
                         );
                         in_progress_outputs.insert(output.id(), InProgressOutput::default());
+                        wl_outputs.insert(output.id(), output);
                     }
                     _ => {}
                 }
@@ -584,6 +588,7 @@ impl WaylandClient {
             composing: false,
             outputs: HashMap::default(),
             in_progress_outputs,
+            wl_outputs,
             windows: HashMap::default(),
             common,
             keyboard_layout: LinuxKeyboardLayout::new(UNKNOWN_KEYBOARD_LAYOUT_NAME),
@@ -684,11 +689,6 @@ impl LinuxClient for WaylandClient {
     }
 
     #[cfg(feature = "screen-capture")]
-    fn is_screen_capture_supported(&self) -> bool {
-        false
-    }
-
-    #[cfg(feature = "screen-capture")]
     fn screen_capture_sources(
         &self,
     ) -> futures::channel::oneshot::Receiver<anyhow::Result<Vec<Rc<dyn gpui::ScreenCaptureSource>>>>
@@ -715,6 +715,15 @@ impl LinuxClient for WaylandClient {
 
         let parent = state.keyboard_focused_window.clone();
 
+        let target_output = params.display_id.and_then(|display_id| {
+            let target_protocol_id: u32 = display_id.into();
+            state
+                .wl_outputs
+                .iter()
+                .find(|(id, _)| id.protocol_id() == target_protocol_id)
+                .map(|(_, output)| output.clone())
+        });
+
         let (window, surface_id) = WaylandWindow::new(
             handle,
             state.globals.clone(),
@@ -723,6 +732,7 @@ impl LinuxClient for WaylandClient {
             params,
             state.common.appearance,
             parent,
+            target_output,
         )?;
         state.windows.insert(surface_id, window.0.clone());
 
@@ -948,6 +958,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                     state
                         .in_progress_outputs
                         .insert(output.id(), InProgressOutput::default());
+                    state.wl_outputs.insert(output.id(), output);
                 }
                 _ => {}
             },
