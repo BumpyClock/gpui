@@ -59,7 +59,8 @@ pub(crate) struct EntityMap {
     ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
-struct EntityRefCounts {
+#[doc(hidden)]
+pub(crate) struct EntityRefCounts {
     counts: SlotMap<EntityId, AtomicUsize>,
     dropped_entity_ids: Vec<EntityId>,
     #[cfg(any(test, feature = "leak-detection"))]
@@ -81,6 +82,11 @@ impl EntityMap {
                 },
             })),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn ref_counts_drop_handle(&self) -> Arc<RwLock<EntityRefCounts>> {
+        self.ref_counts.clone()
     }
 
     /// Reserve a slot for an entity, which you can subsequently use with `insert`.
