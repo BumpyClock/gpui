@@ -31,7 +31,7 @@ use x11rb::{
         AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent,
         ConnectionExt as _, EventMask, ModMask, Visibility,
     },
-    protocol::{Event, randr, render, xinput, xkb, xproto},
+    protocol::{Event, dri3, randr, render, xinput, xkb, xproto},
     resource_manager::Database,
     wrapper::ConnectionExt as _,
     xcb_ffi::XCBConnection,
@@ -65,7 +65,7 @@ use gpui::{
     PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
     TouchPhase, WindowParams, point, px,
 };
-use gpui_wgpu::WgpuContext;
+use gpui_wgpu::{CompositorGpuHint, WgpuContext};
 
 /// Value for DeviceId parameters which selects all devices.
 pub(crate) const XINPUT_ALL_DEVICES: xinput::DeviceId = 0;
@@ -421,7 +421,9 @@ impl X11Client {
             .to_string();
         let keyboard_layout = LinuxKeyboardLayout::new(layout_name.into());
 
-        let gpu_context = WgpuContext::new().notify_err("Unable to init GPU context");
+        let screen = &xcb_connection.setup().roots[x_root_index];
+        let compositor_gpu = detect_compositor_gpu(&xcb_connection, screen);
+        let gpu_context = WgpuContext::new(compositor_gpu).notify_err("Unable to init GPU context");
 
         let resource_database = x11rb::resource_manager::new_from_default(&xcb_connection)
             .context("Failed to create resource database")?;
@@ -1864,11 +1866,14 @@ impl X11ClientState {
                         if let Some(window) = state.windows.get_mut(&x_window) {
                             let expose_event_received = window.expose_event_received;
                             window.expose_event_received = false;
+                            let force_render = std::mem::take(
+                                &mut window.window.state.borrow_mut().force_render_after_recovery,
+                            );
                             let window = window.window.clone();
                             drop(state);
                             window.refresh(RequestFrameOptions {
                                 require_presentation: expose_event_received,
-                                force_render: false,
+                                force_render,
                             });
                         }
                         xcb_connection
@@ -1976,7 +1981,30 @@ fn fp3232_to_f32(value: xinput::Fp3232) -> f32 {
     value.integral as f32 + value.frac as f32 / u32::MAX as f32
 }
 
-fn check_compositor_present(xcb_connection: &XCBConnection, root: u32) -> bool {
+fn detect_compositor_gpu(
+    xcb_connection: &XCBConnection,
+    screen: &xproto::Screen,
+) -> Option<CompositorGpuHint> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    xcb_connection
+        .extension_information(dri3::X11_EXTENSION_NAME)
+        .ok()??;
+
+    let reply = dri3::open(xcb_connection, screen.root, 0)
+        .ok()?
+        .reply()
+        .ok()?;
+    let fd = reply.device_fd;
+
+    let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    let metadata = std::fs::metadata(&path).ok()?;
+
+    crate::linux::compositor_gpu_hint_from_dev_t(metadata.rdev())
+}
+
+fn check_compositor_present(xcb_connection: &XCBConnection, root: xproto::Window) -> bool {
     // Method 1: Check for _NET_WM_CM_S{root}
     let atom_name = format!("_NET_WM_CM_S{}", root);
     let atom1 = get_reply(

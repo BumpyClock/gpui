@@ -115,6 +115,7 @@ pub struct WaylandWindowState {
     handle: AnyWindowHandle,
     active: bool,
     hovered: bool,
+    pub(crate) force_render_after_recovery: bool,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -350,6 +351,12 @@ impl WaylandWindowState {
             if let Some(title) = options.titlebar.and_then(|titlebar| titlebar.title) {
                 xdg_state.toplevel.set_title(title.to_string());
             }
+            // Set max window size based on the GPU's maximum texture dimension.
+            // This prevents the window from being resized larger than what the GPU can render.
+            let max_texture_size = renderer.max_texture_size() as i32;
+            xdg_state
+                .toplevel
+                .set_max_size(max_texture_size, max_texture_size);
         }
 
         Ok(Self {
@@ -382,6 +389,7 @@ impl WaylandWindowState {
             handle,
             active: false,
             hovered: false,
+            force_render_after_recovery: false,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -561,11 +569,16 @@ impl WaylandWindowStatePtr {
         let mut state = self.state.borrow_mut();
         state.surface.frame(&state.globals.qh, state.surface.id());
         state.resize_throttle = false;
+        let force_render = state.force_render_after_recovery;
+        state.force_render_after_recovery = false;
         drop(state);
 
         let mut cb = self.callbacks.borrow_mut();
         if let Some(fun) = cb.request_frame.as_mut() {
-            fun(Default::default());
+            fun(RequestFrameOptions {
+                force_render,
+                ..Default::default()
+            });
         }
     }
 

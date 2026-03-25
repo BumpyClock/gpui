@@ -63,6 +63,9 @@ use wayland_protocols::{
     wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
 };
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
+};
 use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blur_manager};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
@@ -95,7 +98,7 @@ use gpui::{
     ScrollDelta, ScrollWheelEvent, SharedString, Size, TaskTiming, TouchPhase, WindowParams, point,
     profiler, px, size,
 };
-use gpui_wgpu::WgpuContext;
+use gpui_wgpu::{CompositorGpuHint, WgpuContext};
 
 /// Used to convert evdev scancode to xkb scancode
 const MIN_KEYCODE: u32 = 8;
@@ -519,8 +522,9 @@ impl WaylandClient {
             })
             .unwrap();
 
+        let compositor_gpu = detect_compositor_gpu();
         // This could be unified with the notification handling in zed/main:fail_to_open_window.
-        let gpu_context = WgpuContext::new().notify_err("Unable to init GPU context");
+        let gpu_context = WgpuContext::new(compositor_gpu).notify_err("Unable to init GPU context");
 
         let seat = seat.unwrap();
         let globals = Globals::new(
@@ -912,6 +916,70 @@ impl LinuxClient for WaylandClient {
         let active_window = client_state.keyboard_focused_window.as_ref();
         inner(active_window.map(|aw| aw.surface()))
     }
+}
+
+struct DmabufProbeState {
+    device: Option<u64>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for DmabufProbeState {
+    fn event(
+        _: &mut Self,
+        _: &wl_registry::WlRegistry,
+        _: wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for DmabufProbeState {
+    fn event(
+        _: &mut Self,
+        _: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        _: zwp_linux_dmabuf_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for DmabufProbeState {
+    fn event(
+        state: &mut Self,
+        _: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
+        event: zwp_linux_dmabuf_feedback_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_linux_dmabuf_feedback_v1::Event::MainDevice { device } = event {
+            if let Ok(bytes) = <[u8; 8]>::try_from(device.as_slice()) {
+                state.device = Some(u64::from_ne_bytes(bytes));
+            }
+        }
+    }
+}
+
+fn detect_compositor_gpu() -> Option<CompositorGpuHint> {
+    let connection = Connection::connect_to_env().ok()?;
+    let (globals, mut event_queue) = registry_queue_init::<DmabufProbeState>(&connection).ok()?;
+    let queue_handle = event_queue.handle();
+
+    let dmabuf: zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&queue_handle, 4..=4, ()).ok()?;
+    let feedback = dmabuf.get_default_feedback(&queue_handle, ());
+
+    let mut state = DmabufProbeState { device: None };
+
+    event_queue.roundtrip(&mut state).ok()?;
+
+    feedback.destroy();
+    dmabuf.destroy();
+
+    crate::linux::compositor_gpu_hint_from_dev_t(state.device?)
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStatePtr {

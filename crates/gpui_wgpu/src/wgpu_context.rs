@@ -1,5 +1,6 @@
 use anyhow::Context as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use util::ResultExt;
 
 pub struct WgpuContext {
@@ -8,10 +9,17 @@ pub struct WgpuContext {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     dual_source_blending: bool,
+    device_lost: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+pub struct CompositorGpuHint {
+    pub vendor_id: u32,
+    pub device_id: u32,
 }
 
 impl WgpuContext {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(compositor_gpu: Option<CompositorGpuHint>) -> anyhow::Result<Self> {
         let device_id_filter = match std::env::var("ZED_DEVICE_ID") {
             Ok(val) => parse_pci_id(&val)
                 .context("Failed to parse device ID from `ZED_DEVICE_ID` environment variable")
@@ -24,14 +32,19 @@ impl WgpuContext {
             }
         };
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
         });
 
-        let adapter = smol::block_on(Self::select_adapter(&instance, device_id_filter))?;
+        let adapter = smol::block_on(Self::select_adapter(
+            &instance,
+            device_id_filter,
+            compositor_gpu.as_ref(),
+        ))?;
 
         log::info!(
             "Selected GPU adapter: {:?} ({:?})",
@@ -56,12 +69,25 @@ impl WgpuContext {
         let (device, queue) = smol::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("gpui_device"),
             required_features,
-            required_limits: wgpu::Limits::default(),
+            required_limits: wgpu::Limits::default()
+                .using_resolution(adapter.limits())
+                .using_alignment(adapter.limits()),
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             trace: wgpu::Trace::Off,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         }))
         .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?;
+
+        let device_lost = Arc::new(AtomicBool::new(false));
+        device.set_device_lost_callback({
+            let device_lost = Arc::clone(&device_lost);
+            move |reason, message| {
+                log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        });
 
         Ok(Self {
             instance,
@@ -69,63 +95,110 @@ impl WgpuContext {
             device: Arc::new(device),
             queue: Arc::new(queue),
             dual_source_blending: dual_source_blending_available,
+            device_lost,
         })
     }
 
     async fn select_adapter(
         instance: &wgpu::Instance,
         device_id_filter: Option<u32>,
+        compositor_gpu: Option<&CompositorGpuHint>,
     ) -> anyhow::Result<wgpu::Adapter> {
-        if let Some(device_id) = device_id_filter {
-            let adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        let mut adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
 
-            if adapters.is_empty() {
-                anyhow::bail!("No GPU adapters found");
-            }
-
-            let mut non_matching_adapter_infos: Vec<wgpu::AdapterInfo> = Vec::new();
-
-            for adapter in adapters.into_iter() {
-                let info = adapter.get_info();
-                if info.device == device_id {
-                    log::info!(
-                        "Found GPU matching ZED_DEVICE_ID={:#06x}: {}",
-                        device_id,
-                        info.name
-                    );
-                    return Ok(adapter);
-                } else {
-                    non_matching_adapter_infos.push(info);
-                }
-            }
-
-            log::warn!(
-                "No GPU found matching ZED_DEVICE_ID={:#06x}. Available devices:",
-                device_id
-            );
-
-            for info in &non_matching_adapter_infos {
-                log::warn!(
-                    "  - {} (device_id={:#06x}, backend={})",
-                    info.name,
-                    info.device,
-                    info.backend
-                );
-            }
+        if adapters.is_empty() {
+            anyhow::bail!("No GPU adapters found");
         }
 
-        instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::None,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to request GPU adapter: {e}"))
+        if let Some(device_id) = device_id_filter {
+            log::info!("ZED_DEVICE_ID filter: {:#06x}", device_id);
+        }
+
+        // Sort adapters into a single priority order. Tiers (from highest to lowest):
+        //
+        // 1. ZED_DEVICE_ID match — explicit user override
+        // 2. Compositor GPU match — the GPU the display server is rendering on
+        // 3. Device type — WGPU HighPerformance order (Discrete > Integrated >
+        //    Other > Virtual > Cpu). "Other" ranks above "Virtual" because
+        //    backends like OpenGL may report real hardware as "Other".
+        // 4. Backend — prefer Vulkan/Metal/Dx12 over GL/etc.
+        adapters.sort_by_key(|adapter| {
+            let info = adapter.get_info();
+
+            // Backends like OpenGL report device=0 for all adapters, so
+            // device-based matching is only meaningful when non-zero.
+            let device_known = info.device != 0;
+
+            let user_override: u8 = match device_id_filter {
+                Some(id) if device_known && info.device == id => 0,
+                _ => 1,
+            };
+
+            let compositor_match: u8 = match compositor_gpu {
+                Some(hint)
+                    if device_known
+                        && info.vendor == hint.vendor_id
+                        && info.device == hint.device_id =>
+                {
+                    0
+                }
+                _ => 1,
+            };
+
+            let type_priority: u8 = match info.device_type {
+                wgpu::DeviceType::DiscreteGpu => 0,
+                wgpu::DeviceType::IntegratedGpu => 1,
+                wgpu::DeviceType::Other => 2,
+                wgpu::DeviceType::VirtualGpu => 3,
+                wgpu::DeviceType::Cpu => 4,
+            };
+
+            let backend_priority: u8 = match info.backend {
+                wgpu::Backend::Vulkan => 0,
+                wgpu::Backend::Metal => 0,
+                wgpu::Backend::Dx12 => 0,
+                _ => 1,
+            };
+
+            (
+                user_override,
+                compositor_match,
+                type_priority,
+                backend_priority,
+            )
+        });
+
+        // Log all available adapters (in sorted order)
+        log::info!("Found {} GPU adapter(s):", adapters.len());
+        for adapter in &adapters {
+            let info = adapter.get_info();
+            log::info!(
+                "  - {} (vendor={:#06x}, device={:#06x}, backend={:?}, type={:?})",
+                info.name,
+                info.vendor,
+                info.device,
+                info.backend,
+                info.device_type,
+            );
+        }
+
+        // Return the first (highest priority) adapter
+        Ok(adapters.into_iter().next().unwrap())
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {
         self.dual_source_blending
+    }
+
+    /// Returns true if the GPU device was lost (e.g., due to driver crash, suspend/resume).
+    /// When this returns true, the context should be recreated.
+    pub fn device_lost(&self) -> bool {
+        self.device_lost.load(Ordering::Relaxed)
+    }
+
+    /// Returns a clone of the device_lost flag for sharing with renderers.
+    pub(crate) fn device_lost_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.device_lost)
     }
 }
 
