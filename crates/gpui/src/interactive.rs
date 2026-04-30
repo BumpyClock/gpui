@@ -444,6 +444,30 @@ impl InputEvent for ScrollWheelEvent {
 }
 impl MouseEvent for ScrollWheelEvent {}
 
+/// A pinch gesture event from the platform.
+#[derive(Clone, Debug, Default)]
+pub struct PinchEvent {
+    /// The position of the pinch gesture on the window.
+    pub position: Point<Pixels>,
+
+    /// The change in pinch scale for this event.
+    pub delta: f32,
+
+    /// The modifiers that were held down during the pinch gesture.
+    pub modifiers: Modifiers,
+
+    /// The phase of the touch event.
+    pub phase: TouchPhase,
+}
+
+impl Sealed for PinchEvent {}
+impl InputEvent for PinchEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::Pinch(self)
+    }
+}
+impl MouseEvent for PinchEvent {}
+
 impl Deref for ScrollWheelEvent {
     type Target = Modifiers;
 
@@ -626,6 +650,8 @@ pub enum PlatformInput {
     MouseExited(MouseExitEvent),
     /// The scroll wheel was used.
     ScrollWheel(ScrollWheelEvent),
+    /// A pinch gesture occurred.
+    Pinch(PinchEvent),
     /// Files were dragged and dropped onto the window.
     FileDrop(FileDropEvent),
 }
@@ -642,6 +668,7 @@ impl PlatformInput {
             PlatformInput::MousePressure(event) => Some(event),
             PlatformInput::MouseExited(event) => Some(event),
             PlatformInput::ScrollWheel(event) => Some(event),
+            PlatformInput::Pinch(event) => Some(event),
             PlatformInput::FileDrop(event) => Some(event),
         }
     }
@@ -657,6 +684,7 @@ impl PlatformInput {
             PlatformInput::MousePressure(_) => None,
             PlatformInput::MouseExited(_) => None,
             PlatformInput::ScrollWheel(_) => None,
+            PlatformInput::Pinch(_) => None,
             PlatformInput::FileDrop(_) => None,
         }
     }
