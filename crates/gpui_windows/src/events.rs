@@ -112,6 +112,7 @@ impl WindowsWindowInner {
             WM_GPUI_CURSOR_STYLE_CHANGED => self.handle_cursor_changed(lparam),
             WM_GPUI_FORCE_UPDATE_WINDOW => self.draw_window(handle, true),
             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
             _ => None,
         };
         if let Some(n) = handled {
@@ -731,6 +732,19 @@ impl WindowsWindowInner {
                     func(activated);
                     this.state.callbacks.active_status_change.set(Some(func));
                 }
+
+                if activated {
+                    this.state.last_reported_modifiers.set(None);
+                    this.state.last_reported_capslock.set(None);
+
+                    if let Some(mut func) = this.state.callbacks.input.take() {
+                        func(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                            modifiers: current_modifiers(),
+                            capslock: current_capslock(),
+                        }));
+                        this.state.callbacks.input.set(Some(func));
+                    }
+                }
             })
             .detach();
 
@@ -758,6 +772,10 @@ impl WindowsWindowInner {
         let new_scale_factor = new_dpi / USER_DEFAULT_SCREEN_DPI as f32;
         self.state.scale_factor.set(new_scale_factor);
         self.state.border_offset.update(handle).log_err();
+
+        self.state
+            .direct_manipulation
+            .set_scale_factor(new_scale_factor);
 
         if is_maximized {
             // Get the monitor and its work area at the new DPI
@@ -1140,9 +1158,26 @@ impl WindowsWindowInner {
         Some(0)
     }
 
+    fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
+        self.state.direct_manipulation.on_pointer_hit_test(wparam);
+        None
+    }
+
     #[inline]
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
         let mut request_frame = self.state.callbacks.request_frame.take()?;
+
+        self.state.direct_manipulation.update();
+
+        let events = self.state.direct_manipulation.drain_events();
+        if !events.is_empty()
+            && let Some(mut func) = self.state.callbacks.input.take()
+        {
+            for event in events {
+                func(event);
+            }
+            self.state.callbacks.input.set(Some(func));
+        }
 
         // we are instructing gpui to force render a frame, this will
         // re-populate all the gpu textures for us so we can resume drawing in

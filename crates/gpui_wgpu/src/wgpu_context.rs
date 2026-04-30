@@ -1,7 +1,9 @@
+#[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
+#[cfg(not(target_family = "wasm"))]
+use gpui_util::ResultExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use util::ResultExt;
 
 pub struct WgpuContext {
     pub instance: wgpu::Instance,
@@ -19,6 +21,7 @@ pub struct CompositorGpuHint {
 }
 
 impl WgpuContext {
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(compositor_gpu: Option<CompositorGpuHint>) -> anyhow::Result<Self> {
         let device_id_filter = match std::env::var("ZED_DEVICE_ID") {
             Ok(val) => parse_pci_id(&val)
@@ -40,7 +43,7 @@ impl WgpuContext {
             display: None,
         });
 
-        let adapter = smol::block_on(Self::select_adapter(
+        let adapter = pollster::block_on(Self::select_adapter(
             &instance,
             device_id_filter,
             compositor_gpu.as_ref(),
@@ -66,16 +69,18 @@ impl WgpuContext {
             );
         }
 
-        let (device, queue) = smol::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("gpui_device"),
-            required_features,
-            required_limits: wgpu::Limits::default()
-                .using_resolution(adapter.limits())
-                .using_alignment(adapter.limits()),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            trace: wgpu::Trace::Off,
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        }))
+        let (device, queue) = pollster::block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("gpui_device"),
+                required_features,
+                required_limits: wgpu::Limits::default()
+                    .using_resolution(adapter.limits())
+                    .using_alignment(adapter.limits()),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            }),
+        )
         .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?;
 
         let device_lost = Arc::new(AtomicBool::new(false));
@@ -99,6 +104,81 @@ impl WgpuContext {
         })
     }
 
+    #[cfg(target_family = "wasm")]
+    pub async fn new_web() -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to request GPU adapter: {e}"))?;
+
+        log::info!(
+            "Selected GPU adapter: {:?} ({:?})",
+            adapter.get_info().name,
+            adapter.get_info().backend
+        );
+
+        let dual_source_blending_available = adapter
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+
+        let mut required_features = wgpu::Features::empty();
+        if dual_source_blending_available {
+            required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
+        } else {
+            log::warn!(
+                "Dual-source blending not available on this GPU. \
+                Subpixel text antialiasing will be disabled."
+            );
+        }
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("gpui_device"),
+                required_features,
+                required_limits: wgpu::Limits::downlevel_defaults()
+                    .using_resolution(adapter.limits())
+                    .using_alignment(adapter.limits()),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?;
+
+        let device_lost = Arc::new(AtomicBool::new(false));
+        device.set_device_lost_callback({
+            let device_lost = Arc::clone(&device_lost);
+            move |reason, message| {
+                log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+
+        Ok(Self {
+            instance,
+            adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            dual_source_blending: dual_source_blending_available,
+            device_lost,
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     async fn select_adapter(
         instance: &wgpu::Instance,
         device_id_filter: Option<u32>,
@@ -202,6 +282,7 @@ impl WgpuContext {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
     let mut id = id.trim();
 
@@ -218,7 +299,7 @@ fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
     u32::from_str_radix(id, 16).context("parsing PCI ID as hex")
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::parse_pci_id;
 

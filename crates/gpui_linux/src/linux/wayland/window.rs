@@ -32,8 +32,8 @@ use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers,
     OverlayInputMode, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene,
-    Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
+    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowControls, WindowDecorations, WindowKind, WindowParams,
     layer_shell::LayerShellNotSupportedError, px, size,
 };
@@ -343,6 +343,7 @@ impl WaylandWindowState {
                     height: DevicePixels(f32::from(options.bounds.size.height) as i32),
                 },
                 transparent: true,
+                preferred_present_mode: None,
             };
             WgpuRenderer::new(gpu_context, &raw_window, config)?
         };
@@ -401,6 +402,16 @@ impl WaylandWindowState {
             || self.background_appearance != WindowBackgroundAppearance::Opaque
     }
 
+    fn update_subpixel_layout(&mut self) {
+        use wayland_client::protocol::wl_output::Subpixel;
+        let is_bgr = self
+            .display
+            .as_ref()
+            .and_then(|(_, output)| output.subpixel)
+            .is_some_and(|subpixel| subpixel == Subpixel::HorizontalBgr);
+        self.renderer.set_subpixel_layout(is_bgr);
+    }
+
     pub fn primary_output_scale(&mut self) -> i32 {
         let mut scale = 1;
         let mut current_output = self.display.take();
@@ -415,6 +426,7 @@ impl WaylandWindowState {
             scale = scale.max(output.scale);
         }
         self.display = current_output;
+        self.update_subpixel_layout();
         scale
     }
 
@@ -1444,6 +1456,18 @@ impl PlatformWindow for WaylandWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.borrow().renderer.gpu_specs().into()
+    }
+
+    fn play_system_bell(&self) {
+        let state = self.borrow();
+        let surface = if state.surface_state.toplevel().is_some() {
+            Some(&state.surface)
+        } else {
+            None
+        };
+        if let Some(bell) = state.globals.system_bell.as_ref() {
+            bell.ring(surface);
+        }
     }
 }
 

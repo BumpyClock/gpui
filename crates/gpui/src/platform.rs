@@ -28,6 +28,7 @@ pub(crate) type PlatformScreenCaptureFrame = ();
 #[cfg(all(target_os = "macos", feature = "screen-capture"))]
 pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBuffer;
 
+use crate::util;
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
@@ -490,6 +491,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
+    fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
@@ -506,6 +508,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         false
     }
     fn set_edited(&mut self, _edited: bool) {}
+    fn set_document_path(&self, _path: Option<&std::path::Path>) {}
     fn show_character_palette(&self) {}
     fn titlebar_double_click(&self) {}
     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
@@ -543,6 +546,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
+
+    fn play_system_bell(&self) {}
 
     #[cfg(any(test, feature = "test-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
@@ -866,7 +871,7 @@ impl From<RenderImageParams> for AtlasKey {
 }
 
 #[expect(missing_docs)]
-pub trait PlatformAtlas: Send + Sync {
+pub trait PlatformAtlas {
     fn get_or_insert_with<'a>(
         &self,
         key: &AtlasKey,

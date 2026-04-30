@@ -35,11 +35,10 @@ mod platform;
 pub mod prelude;
 /// Profiling utilities for task timing and thread performance tracking.
 pub mod profiler;
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 #[expect(missing_docs)]
 pub mod queue;
 mod scene;
-mod shared_string;
 mod shared_uri;
 mod style;
 mod styled;
@@ -87,6 +86,8 @@ pub use executor::*;
 pub use geometry::*;
 pub use global::*;
 pub use gpui_macros::{AppContext, IntoElement, Render, VisualContext, register_action, test};
+pub use gpui_shared_string::*;
+pub use gpui_util::arc_cow::ArcCow;
 pub use http_client;
 pub use input::*;
 pub use inspector::*;
@@ -95,12 +96,12 @@ use key_dispatch::*;
 pub use keymap::*;
 pub use path_builder::*;
 pub use platform::*;
+pub use pollster::block_on;
 pub use profiler::*;
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 pub use scene::*;
-pub use shared_string::*;
 pub use shared_uri::*;
 use std::{any::Any, future::Future};
 pub use style::*;
@@ -113,7 +114,7 @@ pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;
-pub use util::{FutureExt, Timeout, arc_cow::ArcCow};
+pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use window::*;
 
@@ -163,6 +164,13 @@ pub trait AppContext {
     fn update_window<T, F>(&mut self, window: AnyWindowHandle, f: F) -> Result<T>
     where
         F: FnOnce(AnyView, &mut Window, &mut App) -> T;
+
+    /// Run `f` against the entity's current window.
+    fn with_window<R>(
+        &mut self,
+        entity_id: EntityId,
+        f: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> Option<R>;
 
     /// Read a window off of the application context.
     fn read_window<T, R>(

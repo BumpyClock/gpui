@@ -1,9 +1,9 @@
 use crate::{
     Action, AnyView, AnyWindowHandle, App, AppCell, AppContext, AsyncApp, AvailableSpace,
     BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DrawPhase, Drawable,
-    Element, Empty, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform,
+    Element, Empty, EntityId, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform,
     TestScreenCaptureSource, TestWindow, TextSystem, VisualContext, Window, WindowBounds,
     WindowHandle, WindowOptions, app::GpuiMode,
 };
@@ -82,6 +82,15 @@ impl AppContext for TestAppContext {
     {
         let mut lock = self.app.borrow_mut();
         lock.update_window(window, f)
+    }
+
+    fn with_window<R>(
+        &mut self,
+        entity_id: EntityId,
+        f: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> Option<R> {
+        let mut lock = self.app.borrow_mut();
+        lock.with_window(entity_id, f)
     }
 
     fn read_window<T, R>(
@@ -548,22 +557,25 @@ impl TestAppContext {
         let mut notifications = self.notifications(entity);
 
         use futures::FutureExt as _;
-        use smol::future::FutureExt as _;
+        use futures_concurrency::future::Race as _;
 
-        async {
-            loop {
-                if entity.update(self, &mut predicate) {
-                    return Ok(());
-                }
+        (
+            async {
+                loop {
+                    if entity.update(self, &mut predicate) {
+                        return Ok(());
+                    }
 
-                if notifications.next().await.is_none() {
-                    bail!("entity dropped")
+                    if notifications.next().await.is_none() {
+                        bail!("entity dropped")
+                    }
                 }
-            }
-        }
-        .race(timer.map(|_| Err(anyhow!("condition timed out"))))
-        .await
-        .unwrap();
+            },
+            timer.map(|_| Err(anyhow!("condition timed out"))),
+        )
+            .race()
+            .await
+            .unwrap();
     }
 
     /// Set a name for this App.
@@ -967,6 +979,14 @@ impl AppContext for VisualTestContext {
         F: FnOnce(AnyView, &mut Window, &mut App) -> T,
     {
         self.cx.update_window(window, f)
+    }
+
+    fn with_window<R>(
+        &mut self,
+        entity_id: EntityId,
+        f: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> Option<R> {
+        self.cx.with_window(entity_id, f)
     }
 
     fn read_window<T, R>(

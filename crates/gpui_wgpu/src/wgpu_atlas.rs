@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use collections::FxHashMap;
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
@@ -30,6 +30,7 @@ struct PendingUpload {
 struct WgpuAtlasState {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    max_texture_size: u32,
     storage: WgpuAtlasStorage,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     pending_uploads: Vec<PendingUpload>,
@@ -41,9 +42,11 @@ pub struct WgpuTextureInfo {
 
 impl WgpuAtlas {
     pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
+        let max_texture_size = device.limits().max_texture_dimension_2d;
         WgpuAtlas(Mutex::new(WgpuAtlasState {
             device,
             queue,
+            max_texture_size,
             storage: WgpuAtlasStorage::default(),
             tiles_by_key: Default::default(),
             pending_uploads: Vec::new(),
@@ -67,8 +70,10 @@ impl WgpuAtlas {
     /// The atlas will lazily recreate textures as needed on subsequent frames.
     pub fn handle_device_lost(&self, device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) {
         let mut lock = self.0.lock();
+        let max_texture_size = device.limits().max_texture_dimension_2d;
         lock.device = device;
         lock.queue = queue;
+        lock.max_texture_size = max_texture_size;
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
@@ -89,7 +94,9 @@ impl PlatformAtlas for WgpuAtlas {
             let Some((size, bytes)) = build()? else {
                 return Ok(None);
             };
-            let tile = lock.allocate(size, key.texture_kind());
+            let tile = lock
+                .allocate(size, key.texture_kind())
+                .context("failed to allocate atlas tile")?;
             lock.upload_texture(tile.texture_id, tile.bounds, &bytes);
             lock.tiles_by_key.insert(key.clone(), tile.clone());
             Ok(Some(tile))
@@ -110,6 +117,8 @@ impl PlatformAtlas for WgpuAtlas {
         if let Some(mut texture) = texture_slot.take() {
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
+                lock.pending_uploads
+                    .retain(|upload| upload.id != texture.id);
                 lock.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
@@ -121,7 +130,11 @@ impl PlatformAtlas for WgpuAtlas {
 }
 
 impl WgpuAtlasState {
-    fn allocate(&mut self, size: Size<DevicePixels>, texture_kind: AtlasTextureKind) -> AtlasTile {
+    fn allocate(
+        &mut self,
+        size: Size<DevicePixels>,
+        texture_kind: AtlasTextureKind,
+    ) -> Option<AtlasTile> {
         {
             let textures = &mut self.storage[texture_kind];
 
@@ -130,14 +143,12 @@ impl WgpuAtlasState {
                 .rev()
                 .find_map(|texture| texture.allocate(size))
             {
-                return tile;
+                return Some(tile);
             }
         }
 
         let texture = self.push_texture(size, texture_kind);
-        texture
-            .allocate(size)
-            .expect("Failed to allocate from newly created texture")
+        texture.allocate(size)
     }
 
     fn push_texture(
@@ -150,7 +161,12 @@ impl WgpuAtlasState {
             height: DevicePixels(1024),
         };
 
-        let size = min_size.max(&DEFAULT_ATLAS_SIZE);
+        let max_texture_size = self.max_texture_size as i32;
+        let max_atlas_size = Size {
+            width: DevicePixels(max_texture_size),
+            height: DevicePixels(max_texture_size),
+        };
+        let size = min_size.min(&max_atlas_size).max(&DEFAULT_ATLAS_SIZE);
         let format = match kind {
             AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
             AtlasTextureKind::Subpixel => wgpu::TextureFormat::Bgra8Unorm,
@@ -216,7 +232,9 @@ impl WgpuAtlasState {
 
     fn flush_uploads(&mut self) {
         for upload in self.pending_uploads.drain(..) {
-            let texture = &self.storage[upload.id];
+            let Some(texture) = self.storage.get(upload.id) else {
+                continue;
+            };
             let bytes_per_pixel = texture.bytes_per_pixel();
 
             self.queue.write_texture(
@@ -271,6 +289,15 @@ impl ops::IndexMut<AtlasTextureKind> for WgpuAtlasStorage {
             AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
             AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
         }
+    }
+}
+
+impl WgpuAtlasStorage {
+    fn get(&self, id: AtlasTextureId) -> Option<&WgpuAtlasTexture> {
+        self[id.kind]
+            .textures
+            .get(id.index as usize)
+            .and_then(|texture| texture.as_ref())
     }
 }
 

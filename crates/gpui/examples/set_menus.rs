@@ -89,6 +89,7 @@ fn set_app_menus(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Quit", Quit),
         ],
+        disabled: false,
     }]);
 }
 

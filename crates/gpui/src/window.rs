@@ -1,5 +1,7 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+use crate::util::post_inc;
+use crate::util::{ResultExt, measure};
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds, BoxShadow,
@@ -8,14 +10,14 @@ use crate::{
     FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
     KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
     LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    OverlayInputMode, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
+    MouseMoveEvent, MouseUpEvent, OverlayInputMode, Path, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority,
+    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
+    ThermalState, TransformationMatrix, Underline, UnderlineStyle, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
     WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
@@ -50,8 +52,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use util::post_inc;
-use util::{ResultExt, measure};
 use uuid::Uuid;
 
 mod prompts;
@@ -1001,6 +1001,7 @@ pub struct Window {
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
+    pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
@@ -1340,11 +1341,23 @@ impl Window {
                     .log_err();
             }
         }));
+        platform_window.on_button_layout_changed(Box::new({
+            let mut cx = cx.to_async();
+            move || {
+                handle
+                    .update(&mut cx, |_, window, cx| window.button_layout_changed(cx))
+                    .log_err();
+            }
+        }));
         platform_window.on_active_status_change(Box::new({
             let mut cx = cx.to_async();
             move |active| {
                 handle
                     .update(&mut cx, |_, window, cx| {
+                        if !active {
+                            cx.platform.set_cursor_style(CursorStyle::Arrow);
+                        }
+
                         window.active.set(active);
                         if active {
                             if let Some(focus_id) = window.focus_before_deactivation.take() {
@@ -1501,6 +1514,7 @@ impl Window {
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
+            button_layout_observers: SubscriberSet::new(),
             active,
             hovered,
             needs_present,
@@ -1584,6 +1598,22 @@ impl Window {
         mut callback: impl FnMut(&mut Window, &mut App) + 'static,
     ) -> Subscription {
         let (subscription, activate) = self.appearance_observers.insert(
+            (),
+            Box::new(move |window, cx| {
+                callback(window, cx);
+                true
+            }),
+        );
+        activate();
+        subscription
+    }
+
+    /// Registers a callback to be invoked when the window button layout changes.
+    pub fn observe_button_layout_changed(
+        &self,
+        mut callback: impl FnMut(&mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        let (subscription, activate) = self.button_layout_observers.insert(
             (),
             Box::new(move |window, cx| {
                 callback(window, cx);
@@ -2026,6 +2056,12 @@ impl Window {
             .retain(&(), |callback| callback(self, cx));
     }
 
+    pub(crate) fn button_layout_changed(&mut self, cx: &mut App) {
+        self.button_layout_observers
+            .clone()
+            .retain(&(), |callback| callback(self, cx));
+    }
+
     /// Returns the appearance of the current window.
     pub fn appearance(&self) -> WindowAppearance {
         self.appearance
@@ -2124,6 +2160,12 @@ impl Window {
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);
+    }
+
+    /// Set the path of the file this window represents.
+    /// On macOS, this sets the window's accessibility document property (AXDocument).
+    pub fn set_document_path(&self, path: Option<&std::path::Path>) {
+        self.platform_window.set_document_path(path);
     }
 
     /// Determine the display on which the window is visible.
@@ -5088,6 +5130,12 @@ impl Window {
     pub fn set_tabbing_identifier(&self, tabbing_identifier: Option<String>) {
         self.platform_window
             .set_tabbing_identifier(tabbing_identifier)
+    }
+
+    /// Request the OS to play an alert sound. On some platforms this is associated
+    /// with the window, for others it's just a simple global function call.
+    pub fn play_system_bell(&self) {
+        self.platform_window.play_system_bell()
     }
 
     /// Toggles the inspector mode on this window.

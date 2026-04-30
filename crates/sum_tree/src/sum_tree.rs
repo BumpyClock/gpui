@@ -252,7 +252,8 @@ impl<T: Item> SumTree<T> {
 
         let mut iter = iter.into_iter().fuse().peekable();
         while iter.peek().is_some() {
-            let items: ArrayVec<T, { 2 * TREE_BASE }, u8> = iter.by_ref().take(2 * TREE_BASE).collect();
+            let items: ArrayVec<T, { 2 * TREE_BASE }, u8> =
+                iter.by_ref().take(2 * TREE_BASE).collect();
             let item_summaries: ArrayVec<T::Summary, { 2 * TREE_BASE }, u8> =
                 items.iter().map(|item| item.summary(cx)).collect();
 

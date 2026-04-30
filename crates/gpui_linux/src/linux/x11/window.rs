@@ -68,6 +68,7 @@ x11rb::atom_manager! {
         _NET_WM_STATE_FOCUSED,
         _NET_WM_STATE_ABOVE,
         _NET_ACTIVE_WINDOW,
+        _NET_WM_ICON,
         _NET_WM_SYNC_REQUEST,
         _NET_WM_SYNC_REQUEST_COUNTER,
         _NET_WM_BYPASS_COMPOSITOR,
@@ -419,6 +420,8 @@ impl X11WindowState {
         scale_factor: f32,
         appearance: WindowAppearance,
         parent_window: Option<X11WindowStatePtr>,
+        supports_xinput_gestures: bool,
+        is_bgr: bool,
     ) -> anyhow::Result<Self> {
         let x_screen_index = params
             .display_id
@@ -666,19 +669,27 @@ impl X11WindowState {
                 ),
             )?;
 
+            let mut xi_event_mask = xinput::XIEventMask::MOTION
+                | xinput::XIEventMask::BUTTON_PRESS
+                | xinput::XIEventMask::BUTTON_RELEASE
+                | xinput::XIEventMask::ENTER
+                | xinput::XIEventMask::LEAVE;
+            if supports_xinput_gestures {
+                // x11rb 0.13 doesn't define XIEventMask constants for gesture
+                // events, so construct them from event opcodes.
+                xi_event_mask |=
+                    xinput::XIEventMask::from(1u32 << xinput::GESTURE_PINCH_BEGIN_EVENT)
+                        | xinput::XIEventMask::from(1u32 << xinput::GESTURE_PINCH_UPDATE_EVENT)
+                        | xinput::XIEventMask::from(1u32 << xinput::GESTURE_PINCH_END_EVENT);
+            }
+
             check_reply(
                 || "X11 XiSelectEvents failed.",
                 xcb.xinput_xi_select_events(
                     x_window,
                     &[xinput::EventMask {
                         deviceid: XINPUT_ALL_DEVICE_GROUPS,
-                        mask: vec![
-                            xinput::XIEventMask::MOTION
-                                | xinput::XIEventMask::BUTTON_PRESS
-                                | xinput::XIEventMask::BUTTON_RELEASE
-                                | xinput::XIEventMask::ENTER
-                                | xinput::XIEventMask::LEAVE,
-                        ],
+                        mask: vec![xi_event_mask],
                     }],
                 ),
             )?;
@@ -698,7 +709,7 @@ impl X11WindowState {
 
             xcb_flush(xcb);
 
-            let renderer = {
+            let mut renderer = {
                 let raw_window = RawWindow {
                     connection: as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(
                         xcb,
@@ -716,9 +727,11 @@ impl X11WindowState {
                     // If the window appearance changes, then the renderer will get updated
                     // too
                     transparent: false,
+                    preferred_present_mode: None,
                 };
                 WgpuRenderer::new(gpu_context, &raw_window, config)?
             };
+            renderer.set_subpixel_layout(is_bgr);
 
             // Set max window size hints based on the GPU's maximum texture dimension.
             // This prevents the window from being resized larger than what the GPU can render.
@@ -738,6 +751,29 @@ impl X11WindowState {
                 },
                 size_hints.set_normal_hints(xcb, x_window),
             )?;
+
+            if let Some(image) = params.icon {
+                // https://specifications.freedesktop.org/wm-spec/1.4/ar01s05.html#id-1.6.13
+                let property_size = 2 + (image.width() * image.height()) as usize;
+                let mut property_data = Vec::with_capacity(property_size);
+                property_data.push(image.width());
+                property_data.push(image.height());
+                property_data.extend(image.pixels().map(|px| {
+                    let [r, g, b, a]: [u8; 4] = px.0;
+                    u32::from_le_bytes([b, g, r, a])
+                }));
+
+                check_reply(
+                    || "X11 ChangeProperty32 for _NET_WM_ICON failed.",
+                    xcb.change_property32(
+                        xproto::PropMode::REPLACE,
+                        x_window,
+                        atoms._NET_WM_ICON,
+                        xproto::AtomEnum::CARDINAL,
+                        &property_data,
+                    ),
+                )?;
+            }
 
             let display = Rc::new(X11Display::new(xcb, scale_factor, x_screen_index)?);
 
@@ -851,6 +887,8 @@ impl X11Window {
         scale_factor: f32,
         appearance: WindowAppearance,
         parent_window: Option<X11WindowStatePtr>,
+        supports_xinput_gestures: bool,
+        is_bgr: bool,
     ) -> anyhow::Result<Self> {
         let ptr = X11WindowStatePtr {
             state: Rc::new(RefCell::new(X11WindowState::new(
@@ -867,6 +905,8 @@ impl X11Window {
                 scale_factor,
                 appearance,
                 parent_window,
+                supports_xinput_gestures,
+                is_bgr,
             )?)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
             xcb: xcb.clone(),
@@ -1831,5 +1871,10 @@ impl PlatformWindow for X11Window {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.0.state.borrow().renderer.gpu_specs().into()
+    }
+
+    fn play_system_bell(&self) {
+        // Volume 0% means don't increase or decrease from system volume.
+        let _ = self.0.xcb.bell(0);
     }
 }

@@ -468,9 +468,13 @@ impl DirectXRenderer {
 
         unsafe { devices.device_context.OMSetRenderTargets(None, None) };
 
-        let swap_chain =
-            create_swap_chain_for_composition(&devices.dxgi_factory, &devices.device, width, height)
-                .context("Failed to create composition swap chain")?;
+        let swap_chain = create_swap_chain_for_composition(
+            &devices.dxgi_factory,
+            &devices.device,
+            width,
+            height,
+        )
+        .context("Failed to create composition swap chain")?;
         let direct_composition =
             DirectComposition::new(dxgi_device, self.hwnd).context("Creating DirectComposition")?;
         direct_composition

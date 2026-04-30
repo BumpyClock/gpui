@@ -2,12 +2,12 @@ use crate::{
     AnyView, AnyWindowHandle, App, AppCell, AppContext, BackgroundExecutor, BorrowAppContext,
     Entity, EventEmitter, Focusable, ForegroundExecutor, Global, GpuiBorrow, PromptButton,
     PromptLevel, Render, Reservation, Result, Subscription, Task, VisualContext, Window,
-    WindowHandle,
+    WindowHandle, util,
 };
 use anyhow::Context as _;
 use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
-use smol::future::FutureExt;
+use futures::future::FutureExt;
 use std::{future::Future, rc::Weak};
 
 use super::{Context, WeakEntity};
@@ -89,6 +89,19 @@ impl AppContext for AsyncApp {
         let app = self.app.upgrade().context("app was released")?;
         let mut lock = app.try_borrow_mut()?;
         lock.update_window(window, f)
+    }
+
+    fn with_window<R>(
+        &mut self,
+        entity_id: crate::EntityId,
+        f: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> Option<R> {
+        let app = self.app.upgrade()?;
+        let mut lock = app.try_borrow_mut().ok()?;
+        if lock.quitting {
+            return None;
+        }
+        lock.with_window(entity_id, f)
     }
 
     fn read_window<T, R>(
@@ -395,6 +408,14 @@ impl AppContext for AsyncWindowContext {
         F: FnOnce(AnyView, &mut Window, &mut App) -> T,
     {
         self.app.update_window(window, update)
+    }
+
+    fn with_window<R>(
+        &mut self,
+        entity_id: crate::EntityId,
+        f: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> Option<R> {
+        self.app.with_window(entity_id, f)
     }
 
     fn read_window<T, R>(

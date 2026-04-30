@@ -77,8 +77,13 @@ impl RenderImage {
 
     /// Get the size of this image, in pixels.
     pub fn size(&self, frame_index: usize) -> Size<DevicePixels> {
-        let (width, height) = self.data[frame_index].buffer().dimensions();
-        size(width.into(), height.into())
+        self.data
+            .get(frame_index)
+            .map(|frame| {
+                let (width, height) = frame.buffer().dimensions();
+                size(width.into(), height.into())
+            })
+            .unwrap_or_default()
     }
 
     /// Get the size of this image, in pixels for display, adjusted for the scale factor.
@@ -89,7 +94,10 @@ impl RenderImage {
 
     /// Get the delay of this frame from the previous
     pub fn delay(&self, frame_index: usize) -> Delay {
-        self.data[frame_index].delay()
+        self.data
+            .get(frame_index)
+            .map(|frame| frame.delay())
+            .unwrap_or(Delay::from_numer_denom_ms(100, 1))
     }
 
     /// Get the number of frames for this image.
@@ -102,7 +110,10 @@ impl fmt::Debug for RenderImage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ImageData")
             .field("id", &self.id)
-            .field("size", &self.size(0))
+            .field(
+                "size",
+                &self.data.first().map(|frame| frame.buffer().dimensions()),
+            )
             .finish()
     }
 }

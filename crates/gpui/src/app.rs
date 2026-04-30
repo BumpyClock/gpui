@@ -21,6 +21,7 @@ use itertools::Itertools;
 use parking_lot::RwLock;
 use slotmap::SlotMap;
 
+use crate::util::{ResultExt, debug_panic};
 pub use async_context::*;
 use collections::{FxHashMap, FxHashSet, HashMap, VecDeque};
 pub use context::*;
@@ -29,7 +30,6 @@ use http_client::{HttpClient, Url};
 use smallvec::SmallVec;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_context::*;
-use util::{ResultExt, debug_panic};
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test_context::*;
 
@@ -628,6 +628,7 @@ pub struct App {
     pub(crate) window_invalidators_by_entity:
         FxHashMap<EntityId, FxHashMap<WindowId, WindowInvalidator>>,
     pub(crate) tracked_entities: FxHashMap<WindowId, FxHashSet<EntityId>>,
+    pub(crate) current_window_by_entity: FxHashMap<EntityId, WindowId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_renderer: Option<crate::InspectorRenderer>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -705,6 +706,7 @@ impl App {
                 observers: SubscriberSet::new(),
                 tracked_entities: FxHashMap::default(),
                 window_invalidators_by_entity: FxHashMap::default(),
+                current_window_by_entity: FxHashMap::default(),
                 event_listeners: SubscriberSet::new(),
                 release_listeners: SubscriberSet::new(),
                 keystroke_observers: SubscriberSet::new(),
@@ -911,6 +913,8 @@ impl App {
                 .entry(*entity)
                 .or_default()
                 .insert(window_handle.id, invalidator.clone());
+            self.current_window_by_entity
+                .insert(*entity, window_handle.id);
         }
         tracked_entities.clear();
         tracked_entities.extend(entities.iter().copied());
@@ -1426,6 +1430,8 @@ impl App {
             for (entity_id, mut entity) in dropped {
                 self.observers.remove(&entity_id);
                 self.event_listeners.remove(&entity_id);
+                self.window_invalidators_by_entity.remove(&entity_id);
+                self.current_window_by_entity.remove(&entity_id);
                 for release_callback in self.release_listeners.remove(&entity_id) {
                     release_callback(entity.as_mut(), self);
                 }
@@ -1502,6 +1508,12 @@ impl App {
         tid: TypeId,
         window: Option<WindowId>,
     ) {
+        // Seed current window from creation context so `with_window` works
+        // before the entity is rendered.
+        if let Some(id) = window {
+            self.current_window_by_entity.insert(entity.entity_id(), id);
+        }
+
         self.new_entity_observers.clone().retain(&tid, |observer| {
             if let Some(id) = window {
                 self.update_window_id(id, {
@@ -1516,7 +1528,26 @@ impl App {
         });
     }
 
-    fn update_window_id<T, F>(&mut self, id: WindowId, update: F) -> Result<T>
+    /// Run `f` against the entity's current window: the most recently rendered
+    /// window that referenced the entity, or its creation window if it has not
+    /// rendered yet.
+    pub fn with_window<R>(
+        &mut self,
+        entity_id: EntityId,
+        f: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> Option<R> {
+        let window_id = *self.current_window_by_entity.get(&entity_id)?;
+        self.update_window_id(window_id, |_, window, cx| f(window, cx))
+            .ok()
+    }
+
+    fn ensure_window(&mut self, entity_id: EntityId, window: WindowId) {
+        self.current_window_by_entity
+            .entry(entity_id)
+            .or_insert(window);
+    }
+
+    pub(crate) fn update_window_id<T, F>(&mut self, id: WindowId, update: F) -> Result<T>
     where
         F: FnOnce(AnyView, &mut Window, &mut App) -> T,
     {
@@ -1533,6 +1564,18 @@ impl App {
                 if window.removed {
                     cx.window_handles.remove(&id);
                     cx.windows.remove(id);
+                    if let Some(tracked) = cx.tracked_entities.remove(&id) {
+                        for entity_id in tracked {
+                            if let Some(windows) =
+                                cx.window_invalidators_by_entity.get_mut(&entity_id)
+                            {
+                                windows.remove(&id);
+                            }
+                            if cx.current_window_by_entity.get(&entity_id) == Some(&id) {
+                                cx.current_window_by_entity.remove(&entity_id);
+                            }
+                        }
+                    }
 
                     cx.window_closed_observers.clone().retain(&(), |callback| {
                         callback(cx);
@@ -2388,6 +2431,14 @@ impl AppContext for App {
         F: FnOnce(AnyView, &mut Window, &mut App) -> T,
     {
         self.update_window_id(handle.id, update)
+    }
+
+    fn with_window<R>(
+        &mut self,
+        entity_id: EntityId,
+        f: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> Option<R> {
+        App::with_window(self, entity_id, f)
     }
 
     fn read_window<T, R>(

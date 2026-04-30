@@ -1,4 +1,5 @@
 use crate::{BackgroundExecutor, Task};
+pub use gpui_util::*;
 use std::{
     future::Future,
     pin::Pin,
@@ -6,8 +7,6 @@ use std::{
     task,
     time::Duration,
 };
-
-pub use util::*;
 
 /// A helper trait for building complex objects with imperative conditionals in a fluent style.
 pub trait FluentBuilder {

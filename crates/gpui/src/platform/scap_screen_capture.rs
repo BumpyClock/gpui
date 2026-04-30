@@ -1,4 +1,5 @@
 //! Screen capture for Linux and Windows
+use crate::util;
 use crate::{
     DevicePixels, ForegroundExecutor, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
     Size, SourceMetadata, size,

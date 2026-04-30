@@ -15,6 +15,7 @@
 //! and Tailwind-like styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
+use crate::util::ResultExt;
 use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
     DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
@@ -33,14 +34,12 @@ use std::{
     any::{Any, TypeId},
     cell::RefCell,
     cmp::Ordering,
-    fmt::Debug,
     marker::PhantomData,
     mem,
     rc::Rc,
     sync::Arc,
     time::Duration,
 };
-use util::ResultExt;
 
 use super::ImageCacheProvider;
 
@@ -706,7 +705,7 @@ pub trait InteractiveElement: Sized {
     fn key_context<C, E>(mut self, key_context: C) -> Self
     where
         C: TryInto<KeyContext, Error = E>,
-        E: Debug,
+        E: std::fmt::Display,
     {
         if let Some(key_context) = key_context.try_into().log_err() {
             self.interactivity().key_context = Some(key_context);
