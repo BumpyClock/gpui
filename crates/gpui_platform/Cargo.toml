@@ -26,8 +26,17 @@ gpui.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_macos.workspace = true
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+gpui_macos = { workspace = true, features = ["test-support"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_windows.workspace = true
+gpui = { workspace = true, features = ["windows-manifest"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 gpui_linux.workspace = true
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+gpui_web.workspace = true
+console_error_panic_hook = "0.1.7"

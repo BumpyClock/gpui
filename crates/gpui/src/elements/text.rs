@@ -1,3 +1,4 @@
+use crate::util::ResultExt;
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
@@ -16,7 +17,6 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use util::ResultExt;
 
 impl Element for &'static str {
     type RequestLayoutState = TextLayout;
@@ -244,7 +244,7 @@ impl StyledText {
 
     /// Set the text runs for this piece of text.
     pub fn with_runs(mut self, runs: Vec<TextRun>) -> Self {
-        let mut text = &**self.text;
+        let mut text = &*self.text;
         for run in &runs {
             text = text.get(run.len..).expect("invalid text run");
         }

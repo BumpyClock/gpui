@@ -6,6 +6,7 @@ use gpui::{
     SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
+#[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
@@ -47,7 +48,8 @@ struct GammaParams {
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
-    _pad: [f32; 2],
+    is_bgr: u32,
+    _pad: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +93,9 @@ struct WgpuBindGroupLayouts {
     surfaces: wgpu::BindGroupLayout,
 }
 
+/// Shared GPU context reference, kept for API compatibility with upstream GPUI.
+pub type GpuContext = std::rc::Rc<std::cell::RefCell<Option<WgpuContext>>>;
+
 pub struct WgpuRenderer {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -126,11 +131,16 @@ pub struct WgpuRenderer {
 }
 
 impl WgpuRenderer {
+    pub fn supports_dual_source_blending(&self) -> bool {
+        self.dual_source_blending
+    }
+
     /// Creates a new WgpuRenderer from raw window handles.
     ///
     /// # Safety
     /// The caller must ensure that the window handle remains valid for the lifetime
     /// of the returned renderer.
+    #[cfg(not(target_family = "wasm"))]
     pub fn new<W: HasWindowHandle + HasDisplayHandle>(
         context: &WgpuContext,
         window: &W,
@@ -158,10 +168,29 @@ impl WgpuRenderer {
                 .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?
         };
 
+        Self::from_surface(context, surface, config)
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub fn new_from_canvas(
+        context: &WgpuContext,
+        canvas: &web_sys::HtmlCanvasElement,
+        config: WgpuSurfaceConfig,
+    ) -> anyhow::Result<Self> {
+        let surface = context
+            .instance
+            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+            .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?;
+
+        Self::from_surface(context, surface, config)
+    }
+
+    fn from_surface(
+        context: &WgpuContext,
+        surface: wgpu::Surface<'static>,
+        config: WgpuSurfaceConfig,
+    ) -> anyhow::Result<Self> {
         let surface_caps = surface.get_capabilities(&context.adapter);
-        // Prefer standard 8-bit non-sRGB formats that don't require special features.
-        // Other formats like Rgba16Unorm require TEXTURE_FORMAT_16BIT_NORM which may
-        // not be available on all devices.
         let preferred_formats = [
             wgpu::TextureFormat::Bgra8Unorm,
             wgpu::TextureFormat::Rgba8Unorm,
@@ -198,6 +227,26 @@ impl WgpuRenderer {
             opaque_alpha_mode
         };
 
+        Self::new_with_surface(
+            context,
+            surface,
+            surface_format,
+            alpha_mode,
+            transparent_alpha_mode,
+            opaque_alpha_mode,
+            config,
+        )
+    }
+
+    fn new_with_surface(
+        context: &WgpuContext,
+        surface: wgpu::Surface<'static>,
+        surface_format: wgpu::TextureFormat,
+        alpha_mode: wgpu::CompositeAlphaMode,
+        transparent_alpha_mode: wgpu::CompositeAlphaMode,
+        opaque_alpha_mode: wgpu::CompositeAlphaMode,
+        config: WgpuSurfaceConfig,
+    ) -> anyhow::Result<Self> {
         let device = Arc::clone(&context.device);
         let max_texture_size = device.limits().max_texture_dimension_2d;
 
@@ -272,8 +321,8 @@ impl WgpuRenderer {
         let (backdrop_texture, backdrop_view) = Self::create_backdrop_texture(
             &device,
             surface_format,
-            config.size.width.0 as u32,
-            config.size.height.0 as u32,
+            surface_config.width,
+            surface_config.height,
         );
 
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -348,8 +397,6 @@ impl WgpuRenderer {
             instance_buffer,
             instance_buffer_capacity: initial_instance_buffer_capacity,
             storage_buffer_alignment,
-            // Defer intermediate texture creation to first draw call via ensure_intermediate_textures().
-            // This avoids panics when the device/surface is in an invalid state during initialization.
             path_intermediate_texture: None,
             path_intermediate_view: None,
             path_msaa_texture: None,
@@ -919,6 +966,10 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
+        self.rendering_params.is_bgr = is_bgr;
+    }
+
     #[allow(dead_code)]
     pub fn viewport_size(&self) -> Size<DevicePixels> {
         Size {
@@ -990,7 +1041,8 @@ impl WgpuRenderer {
             gamma_ratios: self.rendering_params.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
             subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
-            _pad: [0.0; 2],
+            is_bgr: self.rendering_params.is_bgr as u32,
+            _pad: 0,
         };
 
         let globals = GlobalParams {
@@ -1578,6 +1630,7 @@ struct RenderingParameters {
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
+    is_bgr: bool,
 }
 
 impl RenderingParameters {
@@ -1614,6 +1667,7 @@ impl RenderingParameters {
             gamma_ratios,
             grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
+            is_bgr: false,
         }
     }
 }

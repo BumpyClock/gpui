@@ -25,7 +25,7 @@ cargo build --example hello_world
 
 ## Upstream Sync
 
-Last synced with [zed-industries/zed](https://github.com/zed-industries/zed) at commit [`dbd95ea742`](https://github.com/zed-industries/zed/commit/dbd95ea742) (2025-03-25).
+Last targeted sync with [zed-industries/zed](https://github.com/zed-industries/zed) at commit [`24f62484e9`](https://github.com/zed-industries/zed/commit/24f62484e936aa355c72f2009313bbe2898a9fd5) (2026-04-29).
 
 ## License
 

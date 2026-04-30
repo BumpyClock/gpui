@@ -21,16 +21,16 @@ use cocoa::{
         NSUserDefaults,
     },
 };
+use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, ExternalPaths, FileDropEvent,
     ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas, PlatformDisplay,
-    OverlayInputMode, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, OverlayInputMode, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
     PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams, point,
     px, size,
 };
-use dispatch2::DispatchQueue;
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
@@ -62,6 +62,11 @@ use std::{
     time::Duration,
 };
 use util::ResultExt;
+
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {
+    fn NSBeep();
+}
 
 const WINDOW_STATE_IVAR: &str = "windowState";
 
@@ -1481,6 +1486,14 @@ impl PlatformWindow for MacWindow {
         self.0.lock().move_traffic_light();
     }
 
+    fn set_document_path(&self, path: Option<&std::path::Path>) {
+        unsafe {
+            let window = self.0.lock().native_window;
+            let filename = path.map_or(ns_string(""), |p| ns_string(&p.to_string_lossy()));
+            let _: () = msg_send![window, setRepresentedFilename: filename];
+        }
+    }
+
     fn show_character_palette(&self) {
         let this = self.0.lock();
         let window = this.native_window;
@@ -1720,7 +1733,11 @@ impl PlatformWindow for MacWindow {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    fn play_system_bell(&self) {
+        unsafe { NSBeep() }
+    }
+
+    #[cfg(feature = "test-support")]
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
         this.renderer.render_to_image(scene)

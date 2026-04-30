@@ -97,6 +97,7 @@ impl TestPlatform {
         )
     }
 
+    #[allow(dead_code)]
     pub fn with_text_system(
         executor: BackgroundExecutor,
         foreground_executor: ForegroundExecutor,

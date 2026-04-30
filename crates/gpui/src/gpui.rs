@@ -35,11 +35,10 @@ mod platform;
 pub mod prelude;
 /// Profiling utilities for task timing and thread performance tracking.
 pub mod profiler;
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 #[expect(missing_docs)]
 pub mod queue;
 mod scene;
-mod shared_string;
 mod shared_uri;
 mod style;
 mod styled;
@@ -87,6 +86,8 @@ pub use executor::*;
 pub use geometry::*;
 pub use global::*;
 pub use gpui_macros::{AppContext, IntoElement, Render, VisualContext, register_action, test};
+pub use gpui_shared_string::*;
+pub use gpui_util::arc_cow::ArcCow;
 pub use http_client;
 pub use input::*;
 pub use inspector::*;
@@ -95,12 +96,12 @@ use key_dispatch::*;
 pub use keymap::*;
 pub use path_builder::*;
 pub use platform::*;
+pub use pollster::block_on;
 pub use profiler::*;
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 pub use scene::*;
-pub use shared_string::*;
 pub use shared_uri::*;
 use std::{any::Any, future::Future};
 pub use style::*;
@@ -113,7 +114,7 @@ pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;
-pub use util::{FutureExt, Timeout, arc_cow::ArcCow};
+pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use window::*;
 
@@ -163,6 +164,18 @@ pub trait AppContext {
     fn update_window<T, F>(&mut self, window: AnyWindowHandle, f: F) -> Result<T>
     where
         F: FnOnce(AnyView, &mut Window, &mut App) -> T;
+
+    /// Run `f` against the entity's current window.
+    ///
+    /// The default implementation is a no-op for context types that do not
+    /// track entity-window ownership.
+    fn with_window<R>(
+        &mut self,
+        _entity_id: EntityId,
+        _f: impl FnOnce(&mut Window, &mut App) -> R,
+    ) -> Option<R> {
+        None
+    }
 
     /// Read a window off of the application context.
     fn read_window<T, R>(
@@ -275,6 +288,103 @@ where
     {
         self.borrow_mut().default_global::<G>();
         self.update_global(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+
+    use crate::{
+        AnyView, AnyWindowHandle, App, AppContext, Context, Entity, EntityId, Global, GpuiBorrow,
+        Reservation, Result, Task, Window, WindowHandle,
+    };
+
+    struct MinimalAppContext;
+
+    impl AppContext for MinimalAppContext {
+        fn new<T: 'static>(
+            &mut self,
+            _build_entity: impl FnOnce(&mut Context<T>) -> T,
+        ) -> Entity<T> {
+            unimplemented!()
+        }
+
+        fn reserve_entity<T: 'static>(&mut self) -> Reservation<T> {
+            unimplemented!()
+        }
+
+        fn insert_entity<T: 'static>(
+            &mut self,
+            _reservation: Reservation<T>,
+            _build_entity: impl FnOnce(&mut Context<T>) -> T,
+        ) -> Entity<T> {
+            unimplemented!()
+        }
+
+        fn update_entity<T, R>(
+            &mut self,
+            _handle: &Entity<T>,
+            _update: impl FnOnce(&mut T, &mut Context<T>) -> R,
+        ) -> R
+        where
+            T: 'static,
+        {
+            unimplemented!()
+        }
+
+        fn as_mut<'a, T>(&'a mut self, _handle: &Entity<T>) -> GpuiBorrow<'a, T>
+        where
+            T: 'static,
+        {
+            unimplemented!()
+        }
+
+        fn read_entity<T, R>(&self, _handle: &Entity<T>, _read: impl FnOnce(&T, &App) -> R) -> R
+        where
+            T: 'static,
+        {
+            unimplemented!()
+        }
+
+        fn update_window<T, F>(&mut self, _window: AnyWindowHandle, _f: F) -> Result<T>
+        where
+            F: FnOnce(AnyView, &mut Window, &mut App) -> T,
+        {
+            unimplemented!()
+        }
+
+        fn read_window<T, R>(
+            &self,
+            _window: &WindowHandle<T>,
+            _read: impl FnOnce(Entity<T>, &App) -> R,
+        ) -> Result<R>
+        where
+            T: 'static,
+        {
+            unimplemented!()
+        }
+
+        fn background_spawn<R>(&self, _future: impl Future<Output = R> + Send + 'static) -> Task<R>
+        where
+            R: Send + 'static,
+        {
+            unimplemented!()
+        }
+
+        fn read_global<G, R>(&self, _callback: impl FnOnce(&G, &App) -> R) -> R
+        where
+            G: Global,
+        {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn app_context_with_window_defaults_to_none() {
+        let mut cx = MinimalAppContext;
+
+        assert!(cx.with_window(EntityId::from(1), |_, _| ()).is_none());
     }
 }
 

@@ -29,7 +29,7 @@ use x11rb::{
     protocol::xkb::ConnectionExt as _,
     protocol::xproto::{
         AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent,
-        ConnectionExt as _, EventMask, ModMask, Visibility,
+        ConnectionExt as _, EventMask, Visibility,
     },
     protocol::{Event, dri3, randr, render, xinput, xkb, xproto},
     resource_manager::Database,
@@ -187,7 +187,7 @@ pub struct X11ClientState {
     xkb_device_id: i32,
     client_side_decorations_supported: bool,
     pub(crate) x_root_index: usize,
-    pub(crate) _resource_database: Database,
+    pub(crate) resource_database: Database,
     pub(crate) atoms: XcbAtoms,
     pub(crate) windows: HashMap<xproto::Window, WindowRef>,
     pub(crate) mouse_focused_window: Option<xproto::Window>,
@@ -212,6 +212,8 @@ pub struct X11ClientState {
     pub(crate) cursor_cache: HashMap<CursorStyle, Option<xproto::Cursor>>,
 
     pointer_device_states: BTreeMap<xinput::DeviceId, PointerDeviceState>,
+    pub(crate) pinch_scale: f32,
+    pub(crate) supports_xinput_gestures: bool,
 
     pub(crate) common: LinuxCommon,
     pub(crate) clipboard: Clipboard,
@@ -342,12 +344,21 @@ impl X11Client {
         xcb_connection.prefetch_extension_information(render::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(xinput::X11_EXTENSION_NAME)?;
 
-        // Announce to X server that XInput up to 2.1 is supported. To increase this to 2.2 and
-        // beyond, support for touch events would need to be added.
+        // Announce to X server that XInput up to 2.4 is supported.
+        // Version 2.4 is needed for gesture events (GesturePinchBegin/Update/End).
+        // The server responds with the highest version it supports.
         let xinput_version = get_reply(
             || "XInput XiQueryVersion failed",
-            xcb_connection.xinput_xi_query_version(2, 1),
+            xcb_connection.xinput_xi_query_version(2, 4),
         )?;
+        let supports_xinput_gestures = xinput_version.major_version > 2
+            || (xinput_version.major_version == 2 && xinput_version.minor_version >= 4);
+        log::info!(
+            "XInput version: {}.{}, gesture support: {}",
+            xinput_version.major_version,
+            xinput_version.minor_version,
+            supports_xinput_gestures,
+        );
         assert!(
             xinput_version.major_version >= 2,
             "XInput version >= 2 required."
@@ -502,7 +513,7 @@ impl X11Client {
             xkb_device_id,
             client_side_decorations_supported,
             x_root_index,
-            _resource_database: resource_database,
+            resource_database,
             atoms,
             windows: HashMap::default(),
             mouse_focused_window: None,
@@ -522,6 +533,8 @@ impl X11Client {
             cursor_cache: HashMap::default(),
 
             pointer_device_states,
+            pinch_scale: 1.0,
+            supports_xinput_gestures,
 
             clipboard,
             clipboard_item: None,
@@ -883,7 +896,7 @@ impl X11Client {
                     let paths: SmallVec<[_; 2]> = file_list
                         .lines()
                         .filter_map(|path| Url::parse(path).log_err())
-                        .filter_map(|url| url.to_file_path().log_err())
+                        .filter_map(|url| url.to_file_path().ok())
                         .collect();
                     let input = PlatformInput::FileDrop(FileDropEvent::Entered {
                         position: state.xdnd_state.position,
@@ -963,6 +976,67 @@ impl X11Client {
                 drop(state);
                 self.handle_keyboard_layout_change();
             }
+            Event::XinputGesturePinchBegin(event) => {
+                let window = self.get_window(event.event)?;
+                let mut state = self.0.borrow_mut();
+                state.pinch_scale = 1.0;
+                let modifiers = modifiers_from_xinput_info(event.mods);
+                state.modifiers = modifiers;
+                let position = point(
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
+                );
+                drop(state);
+                window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
+                    position,
+                    delta: 0.0,
+                    modifiers,
+                    phase: gpui::TouchPhase::Started,
+                }));
+            }
+            Event::XinputGesturePinchUpdate(event) => {
+                let window = self.get_window(event.event)?;
+                let mut state = self.0.borrow_mut();
+                let modifiers = modifiers_from_xinput_info(event.mods);
+                state.modifiers = modifiers;
+                let position = point(
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
+                );
+                let new_absolute_scale = event.scale as f32 / 65536.0;
+                let previous_scale = state.pinch_scale;
+                let zoom_delta = if previous_scale == 0.0 {
+                    0.0
+                } else {
+                    new_absolute_scale / previous_scale - 1.0
+                };
+                state.pinch_scale = new_absolute_scale;
+                drop(state);
+                window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
+                    position,
+                    delta: zoom_delta,
+                    modifiers,
+                    phase: gpui::TouchPhase::Moved,
+                }));
+            }
+            Event::XinputGesturePinchEnd(event) => {
+                let window = self.get_window(event.event)?;
+                let mut state = self.0.borrow_mut();
+                state.pinch_scale = 1.0;
+                let modifiers = modifiers_from_xinput_info(event.mods);
+                state.modifiers = modifiers;
+                let position = point(
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
+                );
+                drop(state);
+                window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
+                    position,
+                    delta: 0.0,
+                    modifiers,
+                    phase: gpui::TouchPhase::Ended,
+                }));
+            }
             Event::XkbStateNotify(event) => {
                 let mut state = self.0.borrow_mut();
                 let old_layout = state.xkb.serialize_layout(STATE_LAYOUT_EFFECTIVE);
@@ -1010,22 +1084,16 @@ impl X11Client {
                 state.modifiers = modifiers;
                 state.pre_key_char_down.take();
 
-                // Macros containing modifiers might result in
-                // the modifiers missing from the event.
-                // We therefore update the mask from the global state.
-                update_xkb_mask_from_event_state(&mut state.xkb, event.state);
+                let key_event_state = xkb_state_for_key_event(&state.xkb, event.state);
 
                 let keystroke = {
                     let code = event.detail.into();
-                    let mut keystroke = keystroke_from_xkb(&state.xkb, modifiers, code);
-                    let keysym = state.xkb.key_get_one_sym(code);
+                    let mut keystroke = keystroke_from_xkb(&key_event_state, modifiers, code);
+                    let keysym = key_event_state.key_get_one_sym(code);
 
                     if keysym.is_modifier_key() {
                         return Some(());
                     }
-
-                    // should be called after key_get_one_sym
-                    state.xkb.update_key(code, xkbc::KeyDirection::Down);
 
                     if let Some(mut compose_state) = state.compose_state.take() {
                         compose_state.feed(keysym);
@@ -1080,22 +1148,16 @@ impl X11Client {
                 let modifiers = modifiers_from_state(event.state);
                 state.modifiers = modifiers;
 
-                // Macros containing modifiers might result in
-                // the modifiers missing from the event.
-                // We therefore update the mask from the global state.
-                update_xkb_mask_from_event_state(&mut state.xkb, event.state);
+                let key_event_state = xkb_state_for_key_event(&state.xkb, event.state);
 
                 let keystroke = {
                     let code = event.detail.into();
-                    let keystroke = keystroke_from_xkb(&state.xkb, modifiers, code);
-                    let keysym = state.xkb.key_get_one_sym(code);
+                    let keystroke = keystroke_from_xkb(&key_event_state, modifiers, code);
+                    let keysym = key_event_state.key_get_one_sym(code);
 
                     if keysym.is_modifier_key() {
                         return Some(());
                     }
-
-                    // should be called after key_get_one_sym
-                    state.xkb.update_key(code, xkbc::KeyDirection::Up);
 
                     keystroke
                 };
@@ -1110,8 +1172,8 @@ impl X11Client {
                 state.modifiers = modifiers;
 
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
                 );
 
                 if state.composing && state.ximc.is_some() {
@@ -1186,8 +1248,8 @@ impl X11Client {
                 state.modifiers = modifiers;
 
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
                 );
                 match button_or_scroll_from_event_detail(event.detail) {
                     Some(ButtonOrScroll::Button(button)) => {
@@ -1236,8 +1298,8 @@ impl X11Client {
                 }
                 let pressed_button = pressed_button_from_mask(event.button_mask[0]);
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
                 );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -1278,8 +1340,8 @@ impl X11Client {
                 state.mouse_focused_window = None;
                 let pressed_button = pressed_button_from_mask(event.buttons[0]);
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
                 );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -1511,6 +1573,11 @@ impl LinuxClient for X11Client {
             .keyboard_focused_window
             .and_then(|focused_window| state.windows.get(&focused_window))
             .map(|w| w.window.clone());
+        let is_bgr = state
+            .resource_database
+            .get_string("Xft.rgba", "Xft.Rgba")
+            .is_some_and(|value| value.eq_ignore_ascii_case("bgr"));
+        let supports_xinput_gestures = state.supports_xinput_gestures;
         let x_window = state
             .xcb_connection
             .generate_id()
@@ -1530,6 +1597,8 @@ impl LinuxClient for X11Client {
             state.scale_factor,
             state.common.appearance,
             parent_window,
+            supports_xinput_gestures,
+            is_bgr,
         )?;
         check_reply(
             || "Failed to set XdndAware property",
@@ -1979,6 +2048,10 @@ pub fn mode_refresh_rate(mode: &randr::ModeInfo) -> Duration {
 
 fn fp3232_to_f32(value: xinput::Fp3232) -> f32 {
     value.integral as f32 + value.frac as f32 / u32::MAX as f32
+}
+
+fn fp1616_to_f32(value: xinput::Fp1616) -> f32 {
+    value as f32 / 65536.0
 }
 
 fn detect_compositor_gpu(
@@ -2591,18 +2664,34 @@ fn valid_scale_factor(scale_factor: f32) -> bool {
     scale_factor.is_sign_positive() && scale_factor.is_normal()
 }
 
-#[inline]
-fn update_xkb_mask_from_event_state(xkb: &mut xkbc::State, event_state: xproto::KeyButMask) {
-    let depressed_mods = event_state.remove((ModMask::LOCK | ModMask::M2).bits());
-    let latched_mods = xkb.serialize_mods(xkbc::STATE_MODS_LATCHED);
-    let locked_mods = xkb.serialize_mods(xkbc::STATE_MODS_LOCKED);
-    let locked_layout = xkb.serialize_layout(xkbc::STATE_LAYOUT_LOCKED);
-    xkb.update_mask(
-        depressed_mods.into(),
-        latched_mods,
-        locked_mods,
-        0,
-        0,
-        locked_layout,
+fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -> xkbc::State {
+    let keymap = xkb.get_keymap();
+    let mut key_event_state = xkbc::State::new(&keymap);
+
+    let latched_modifiers = xkb.serialize_mods(xkbc::STATE_MODS_LATCHED);
+    let locked_modifiers = xkb.serialize_mods(xkbc::STATE_MODS_LOCKED);
+    let active_modifier_mask: xkbc::ModMask = u16::from(
+        event_state
+            & (xproto::KeyButMask::SHIFT
+                | xproto::KeyButMask::LOCK
+                | xproto::KeyButMask::CONTROL
+                | xproto::KeyButMask::MOD1
+                | xproto::KeyButMask::MOD2
+                | xproto::KeyButMask::MOD3
+                | xproto::KeyButMask::MOD4
+                | xproto::KeyButMask::MOD5),
+    )
+    .into();
+    let depressed_modifiers = active_modifier_mask & !(latched_modifiers | locked_modifiers);
+
+    key_event_state.update_mask(
+        depressed_modifiers,
+        latched_modifiers,
+        locked_modifiers,
+        xkb.serialize_layout(xkbc::STATE_LAYOUT_DEPRESSED),
+        xkb.serialize_layout(xkbc::STATE_LAYOUT_LATCHED),
+        xkb.serialize_layout(xkbc::STATE_LAYOUT_LOCKED),
     );
+
+    key_event_state
 }

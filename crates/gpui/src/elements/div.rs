@@ -33,14 +33,12 @@ use std::{
     any::{Any, TypeId},
     cell::RefCell,
     cmp::Ordering,
-    fmt::Debug,
     marker::PhantomData,
     mem,
     rc::Rc,
     sync::Arc,
     time::Duration,
 };
-use util::ResultExt;
 
 use super::ImageCacheProvider;
 
@@ -702,13 +700,12 @@ pub trait InteractiveElement: Sized {
     }
 
     /// Set the keymap context for this element. This will be used to determine
-    /// which action to dispatch from the keymap.
+    /// which action to dispatch from the keymap. Conversion failure is a no-op.
     fn key_context<C, E>(mut self, key_context: C) -> Self
     where
         C: TryInto<KeyContext, Error = E>,
-        E: Debug,
     {
-        if let Some(key_context) = key_context.try_into().log_err() {
+        if let Ok(key_context) = key_context.try_into() {
             self.interactivity().key_context = Some(key_context);
         }
         self
@@ -3520,6 +3517,24 @@ impl ScrollHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_context_accepts_try_into_errors_without_display() {
+        struct KeyContextSource;
+        struct ErrorWithoutDisplay;
+
+        impl TryFrom<KeyContextSource> for KeyContext {
+            type Error = ErrorWithoutDisplay;
+
+            fn try_from(_: KeyContextSource) -> Result<Self, Self::Error> {
+                Ok(KeyContext::default())
+            }
+        }
+
+        let element = div().key_context(KeyContextSource);
+
+        assert!(element.interactivity.key_context.is_some());
+    }
 
     #[test]
     fn scroll_handle_aligns_wide_children_to_left_edge() {

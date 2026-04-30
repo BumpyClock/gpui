@@ -1,9 +1,9 @@
 use crate::{App, PlatformDispatcher, PlatformScheduler};
 use futures::channel::mpsc;
+use futures::prelude::*;
+use gpui_util::TryFutureExt;
 use scheduler::Scheduler;
-use smol::prelude::*;
 use std::{
-    fmt::Debug,
     future::Future,
     marker::PhantomData,
     mem,
@@ -12,7 +12,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use util::TryFutureExt;
 
 pub use scheduler::{FallibleTask, ForegroundExecutor as SchedulerForegroundExecutor, Priority};
 
@@ -89,7 +88,7 @@ impl<T> Task<T> {
 impl<T, E> Task<Result<T, E>>
 where
     T: 'static,
-    E: 'static + Debug,
+    E: 'static + std::fmt::Display,
 {
     /// Run the task to completion in the background and log any errors that occur.
     #[track_caller]
@@ -595,5 +594,4 @@ mod test {
             "Task should run normally when app is alive"
         );
     }
-
 }

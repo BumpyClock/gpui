@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result};
 
+use crate::util::ResultExt;
 use futures::{AsyncReadExt, Future};
 use image::{
     AnimationDecoder, DynamicImage, Frame, ImageError, ImageFormat, Rgba,
@@ -22,7 +23,6 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use util::ResultExt;
 
 use super::{Stateful, StatefulInteractiveElement};
 
@@ -293,7 +293,7 @@ impl Element for Img {
                 })
             });
 
-            let frame_index = state.as_ref().map(|state| state.frame_index).unwrap_or(0);
+            let mut frame_index = state.as_ref().map(|state| state.frame_index).unwrap_or(0);
 
             let layout_id = self.interactivity.request_layout(
                 global_id,
@@ -311,26 +311,36 @@ impl Element for Img {
                         cx,
                     ) {
                         Some(Ok(data)) => {
-                            if let Some(state) = &mut state {
-                                let frame_count = data.frame_count();
-                                if frame_count > 1 {
-                                    let current_time = Instant::now();
-                                    if let Some(last_frame_time) = state.last_frame_time {
-                                        let elapsed = current_time - last_frame_time;
-                                        let frame_duration =
-                                            Duration::from(data.delay(state.frame_index));
+                            let frame_count = data.frame_count();
+                            let max_frame_index = frame_count.saturating_sub(1);
 
-                                        if elapsed >= frame_duration {
-                                            state.frame_index =
-                                                (state.frame_index + 1) % frame_count;
-                                            state.last_frame_time =
-                                                Some(current_time - (elapsed - frame_duration));
+                            if let Some(state) = &mut state {
+                                state.frame_index = state.frame_index.min(max_frame_index);
+                                if frame_count > 1 {
+                                    if window.is_window_active() {
+                                        let current_time = Instant::now();
+                                        if let Some(last_frame_time) = state.last_frame_time {
+                                            let elapsed = current_time - last_frame_time;
+                                            let frame_duration =
+                                                Duration::from(data.delay(state.frame_index));
+
+                                            if elapsed >= frame_duration {
+                                                state.frame_index =
+                                                    (state.frame_index + 1) % frame_count;
+                                                state.last_frame_time =
+                                                    Some(current_time - (elapsed - frame_duration));
+                                            }
+                                        } else {
+                                            state.last_frame_time = Some(current_time);
                                         }
                                     } else {
-                                        state.last_frame_time = Some(current_time);
+                                        state.last_frame_time = None;
                                     }
+                                } else {
+                                    state.last_frame_time = None;
                                 }
                                 state.started_loading = None;
+                                frame_index = state.frame_index;
                             }
 
                             let image_size = data.render_size(frame_index);
@@ -364,7 +374,10 @@ impl Element for Img {
                                 };
                             }
 
-                            if global_id.is_some() && data.frame_count() > 1 {
+                            if global_id.is_some()
+                                && data.frame_count() > 1
+                                && window.is_window_active()
+                            {
                                 window.request_animation_frame();
                             }
                         }
@@ -465,6 +478,9 @@ impl Element for Img {
                     window,
                     cx,
                 ) {
+                    if data.frame_count() == 0 {
+                        return;
+                    }
                     let new_bounds = self
                         .style
                         .object_fit
@@ -639,12 +655,26 @@ impl Asset for ImageAssetLoader {
                         let mut frames = SmallVec::new();
 
                         for frame in decoder.into_frames() {
-                            let mut frame = frame?;
-                            // Convert from RGBA to BGRA.
-                            for pixel in frame.buffer_mut().chunks_exact_mut(4) {
-                                pixel.swap(0, 2);
+                            match frame {
+                                Ok(mut frame) => {
+                                    // Convert from RGBA to BGRA.
+                                    for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+                                        pixel.swap(0, 2);
+                                    }
+                                    frames.push(frame);
+                                }
+                                Err(err) => {
+                                    log::debug!(
+                                        "Skipping GIF frame in {source:?} due to decode error: {err}"
+                                    );
+                                }
                             }
-                            frames.push(frame);
+                        }
+
+                        if frames.is_empty() {
+                            return Err(ImageCacheError::Other(Arc::new(anyhow::anyhow!(
+                                "GIF could not be decoded: all frames failed ({source:?})"
+                            ))));
                         }
 
                         frames
@@ -657,12 +687,26 @@ impl Asset for ImageAssetLoader {
                             let mut frames = SmallVec::new();
 
                             for frame in decoder.into_frames() {
-                                let mut frame = frame?;
-                                // Convert from RGBA to BGRA.
-                                for pixel in frame.buffer_mut().chunks_exact_mut(4) {
-                                    pixel.swap(0, 2);
+                                match frame {
+                                    Ok(mut frame) => {
+                                        // Convert from RGBA to BGRA.
+                                        for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+                                            pixel.swap(0, 2);
+                                        }
+                                        frames.push(frame);
+                                    }
+                                    Err(err) => {
+                                        log::debug!(
+                                            "Skipping WebP frame in {source:?} due to decode error: {err}"
+                                        );
+                                    }
                                 }
-                                frames.push(frame);
+                            }
+
+                            if frames.is_empty() {
+                                return Err(ImageCacheError::Other(Arc::new(anyhow::anyhow!(
+                                    "WebP could not be decoded: all frames failed ({source:?})"
+                                ))));
                             }
 
                             frames

@@ -610,15 +610,7 @@ impl LineLayoutCache {
                 .layout_line(&text, font_size, runs);
 
             if let Some(force_width) = force_width {
-                let mut glyph_pos = 0;
-                for run in layout.runs.iter_mut() {
-                    for glyph in run.glyphs.iter_mut() {
-                        if (glyph.position.x - glyph_pos * force_width).abs() > px(1.) {
-                            glyph.position.x = glyph_pos * force_width;
-                        }
-                        glyph_pos += 1;
-                    }
-                }
+                apply_force_width_to_layout(&mut layout, force_width);
             }
 
             let key = Arc::new(CacheKey {
@@ -766,15 +758,7 @@ impl LineLayoutCache {
             .layout_line(&text, font_size, runs);
 
         if let Some(force_width) = force_width {
-            let mut glyph_pos = 0;
-            for run in layout.runs.iter_mut() {
-                for glyph in run.glyphs.iter_mut() {
-                    if (glyph.position.x - glyph_pos * force_width).abs() > px(1.) {
-                        glyph.position.x = glyph_pos * force_width;
-                    }
-                    glyph_pos += 1;
-                }
-            }
+            apply_force_width_to_layout(&mut layout, force_width);
         }
 
         let key = Arc::new(HashedCacheKey {
@@ -791,6 +775,99 @@ impl LineLayoutCache {
             .insert(key.clone(), layout.clone());
         current_frame.used_lines_by_hash.push(key);
         layout
+    }
+}
+
+// Combining marks are shaped at same x position as base glyph. Force-width must not advance
+// terminal cell counter for those zero-advance glyphs.
+fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
+    let mut glyph_pos: usize = 0;
+    let mut last_base_shaped_x = px(f32::NEG_INFINITY);
+    let mut last_base_actual_x = px(0.);
+
+    for run in layout.runs.iter_mut() {
+        for glyph in run.glyphs.iter_mut() {
+            let shaped_x = glyph.position.x;
+
+            if shaped_x - last_base_shaped_x > px(1.) {
+                let forced_x = glyph_pos * force_width;
+                if (shaped_x - forced_x).abs() > px(1.) {
+                    glyph.position.x = forced_x;
+                }
+                last_base_shaped_x = shaped_x;
+                last_base_actual_x = glyph.position.x;
+                glyph_pos += 1;
+            } else {
+                glyph.position.x = last_base_actual_x + (shaped_x - last_base_shaped_x);
+            }
+        }
+    }
+    layout.width = glyph_pos * force_width;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_width_does_not_treat_narrow_glyphs_as_combining_marks() {
+        let mut layout = LineLayout {
+            font_size: px(16.0),
+            width: px(12.0),
+            ascent: px(12.0),
+            descent: px(4.0),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![
+                    shaped_glyph(0, 0.0),
+                    shaped_glyph(1, 4.0),
+                    shaped_glyph(2, 8.0),
+                ],
+            }],
+            len: 3,
+        };
+
+        apply_force_width_to_layout(&mut layout, px(10.0));
+
+        let glyphs = &layout.runs[0].glyphs;
+        assert_eq!(glyphs[0].position.x, px(0.0));
+        assert_eq!(glyphs[1].position.x, px(10.0));
+        assert_eq!(glyphs[2].position.x, px(20.0));
+    }
+
+    #[test]
+    fn force_width_keeps_zero_advance_glyphs_with_base_glyph() {
+        let mut layout = LineLayout {
+            font_size: px(16.0),
+            width: px(6.0),
+            ascent: px(12.0),
+            descent: px(4.0),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![
+                    shaped_glyph(0, 0.0),
+                    shaped_glyph(1, 0.0),
+                    shaped_glyph(2, 6.0),
+                ],
+            }],
+            len: 3,
+        };
+
+        apply_force_width_to_layout(&mut layout, px(10.0));
+
+        let glyphs = &layout.runs[0].glyphs;
+        assert_eq!(glyphs[0].position.x, px(0.0));
+        assert_eq!(glyphs[1].position.x, px(0.0));
+        assert_eq!(glyphs[2].position.x, px(10.0));
+    }
+
+    fn shaped_glyph(index: usize, x: f32) -> ShapedGlyph {
+        ShapedGlyph {
+            id: GlyphId(index as u32),
+            position: point(px(x), px(0.0)),
+            index,
+            is_emoji: false,
+        }
     }
 }
 

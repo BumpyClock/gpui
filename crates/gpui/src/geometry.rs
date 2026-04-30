@@ -883,6 +883,48 @@ where
 
 impl<T> Bounds<T>
 where
+    T: Sub<Output = T> + Half + Clone + Debug + Default + PartialEq,
+{
+    /// Constructs a `Bounds` from an anchor point and size. The specified anchor will be placed at
+    /// the specified origin.
+    pub fn from_anchor_and_size(anchor: Anchor, origin: Point<T>, size: Size<T>) -> Bounds<T> {
+        let origin = match anchor {
+            Anchor::TopLeft => origin,
+            Anchor::TopRight => Point {
+                x: origin.x - size.width.clone(),
+                y: origin.y,
+            },
+            Anchor::BottomLeft => Point {
+                x: origin.x,
+                y: origin.y - size.height.clone(),
+            },
+            Anchor::BottomRight => Point {
+                x: origin.x - size.width.clone(),
+                y: origin.y - size.height.clone(),
+            },
+            Anchor::TopCenter => Point {
+                x: origin.x - size.width.half(),
+                y: origin.y,
+            },
+            Anchor::BottomCenter => Point {
+                x: origin.x - size.width.half(),
+                y: origin.y - size.height.clone(),
+            },
+            Anchor::LeftCenter => Point {
+                x: origin.x,
+                y: origin.y - size.height.half(),
+            },
+            Anchor::RightCenter => Point {
+                x: origin.x - size.width.clone(),
+                y: origin.y - size.height.half(),
+            },
+        };
+        Bounds { origin, size }
+    }
+}
+
+impl<T> Bounds<T>
+where
     T: Sub<T, Output = T> + Half + Clone + Debug + Default + PartialEq,
 {
     /// Creates a new bounds centered at the given point.
@@ -2126,6 +2168,91 @@ pub enum Corner {
     BottomLeft,
     /// The bottom right corner
     BottomRight,
+}
+
+/// Identifies a reference point on a 2D box, used to anchor positioned elements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchor {
+    /// The top left corner
+    TopLeft,
+    /// The top right corner
+    TopRight,
+    /// The bottom left corner
+    BottomLeft,
+    /// The bottom right corner
+    BottomRight,
+    /// The top center position
+    TopCenter,
+    /// The bottom center position
+    BottomCenter,
+    /// The left center position
+    LeftCenter,
+    /// The right center position
+    RightCenter,
+}
+
+impl From<Corner> for Anchor {
+    fn from(corner: Corner) -> Self {
+        match corner {
+            Corner::TopLeft => Anchor::TopLeft,
+            Corner::TopRight => Anchor::TopRight,
+            Corner::BottomLeft => Anchor::BottomLeft,
+            Corner::BottomRight => Anchor::BottomRight,
+        }
+    }
+}
+
+impl Anchor {
+    /// Returns the directly opposite anchor.
+    #[must_use]
+    pub fn opposite(self) -> Self {
+        match self {
+            Anchor::TopLeft => Anchor::BottomRight,
+            Anchor::TopRight => Anchor::BottomLeft,
+            Anchor::BottomLeft => Anchor::TopRight,
+            Anchor::BottomRight => Anchor::TopLeft,
+            Anchor::TopCenter => Anchor::BottomCenter,
+            Anchor::BottomCenter => Anchor::TopCenter,
+            Anchor::LeftCenter => Anchor::RightCenter,
+            Anchor::RightCenter => Anchor::LeftCenter,
+        }
+    }
+
+    /// Returns the anchor across from this anchor, moving along the specified axis.
+    #[must_use]
+    pub fn other_side_along(self, axis: Axis) -> Self {
+        match axis {
+            Axis::Vertical => match self {
+                Anchor::TopLeft => Anchor::BottomLeft,
+                Anchor::TopRight => Anchor::BottomRight,
+                Anchor::BottomLeft => Anchor::TopLeft,
+                Anchor::BottomRight => Anchor::TopRight,
+                Anchor::TopCenter => Anchor::BottomCenter,
+                Anchor::BottomCenter => Anchor::TopCenter,
+                Anchor::LeftCenter => Anchor::LeftCenter,
+                Anchor::RightCenter => Anchor::RightCenter,
+            },
+            Axis::Horizontal => match self {
+                Anchor::TopLeft => Anchor::TopRight,
+                Anchor::TopRight => Anchor::TopLeft,
+                Anchor::BottomLeft => Anchor::BottomRight,
+                Anchor::BottomRight => Anchor::BottomLeft,
+                Anchor::TopCenter => Anchor::TopCenter,
+                Anchor::BottomCenter => Anchor::BottomCenter,
+                Anchor::LeftCenter => Anchor::RightCenter,
+                Anchor::RightCenter => Anchor::LeftCenter,
+            },
+        }
+    }
+
+    /// Returns true for center-edge anchors.
+    #[inline]
+    pub fn is_center(&self) -> bool {
+        matches!(
+            self,
+            Self::TopCenter | Self::BottomCenter | Self::LeftCenter | Self::RightCenter
+        )
+    }
 }
 
 impl Corner {
@@ -3898,6 +4025,80 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_anchor_and_size_covers_all_anchors() {
+        let origin = point(10, 20);
+        let size = size(5, 7);
+        let cases = [
+            (Anchor::TopLeft, point(10, 20)),
+            (Anchor::TopRight, point(5, 20)),
+            (Anchor::BottomLeft, point(10, 13)),
+            (Anchor::BottomRight, point(5, 13)),
+            (Anchor::TopCenter, point(8, 20)),
+            (Anchor::BottomCenter, point(8, 13)),
+            (Anchor::LeftCenter, point(10, 17)),
+            (Anchor::RightCenter, point(5, 17)),
+        ];
+
+        for (anchor, expected_origin) in cases {
+            assert_eq!(
+                Bounds::from_anchor_and_size(anchor, origin, size),
+                Bounds::new(expected_origin, size)
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_opposite_covers_all_anchors() {
+        let cases = [
+            (Anchor::TopLeft, Anchor::BottomRight),
+            (Anchor::TopRight, Anchor::BottomLeft),
+            (Anchor::BottomLeft, Anchor::TopRight),
+            (Anchor::BottomRight, Anchor::TopLeft),
+            (Anchor::TopCenter, Anchor::BottomCenter),
+            (Anchor::BottomCenter, Anchor::TopCenter),
+            (Anchor::LeftCenter, Anchor::RightCenter),
+            (Anchor::RightCenter, Anchor::LeftCenter),
+        ];
+
+        for (anchor, expected) in cases {
+            assert_eq!(anchor.opposite(), expected);
+        }
+    }
+
+    #[test]
+    fn anchor_other_side_along_covers_all_anchors() {
+        let vertical = [
+            (Anchor::TopLeft, Anchor::BottomLeft),
+            (Anchor::TopRight, Anchor::BottomRight),
+            (Anchor::BottomLeft, Anchor::TopLeft),
+            (Anchor::BottomRight, Anchor::TopRight),
+            (Anchor::TopCenter, Anchor::BottomCenter),
+            (Anchor::BottomCenter, Anchor::TopCenter),
+            (Anchor::LeftCenter, Anchor::LeftCenter),
+            (Anchor::RightCenter, Anchor::RightCenter),
+        ];
+
+        for (anchor, expected) in vertical {
+            assert_eq!(anchor.other_side_along(Axis::Vertical), expected);
+        }
+
+        let horizontal = [
+            (Anchor::TopLeft, Anchor::TopRight),
+            (Anchor::TopRight, Anchor::TopLeft),
+            (Anchor::BottomLeft, Anchor::BottomRight),
+            (Anchor::BottomRight, Anchor::BottomLeft),
+            (Anchor::TopCenter, Anchor::TopCenter),
+            (Anchor::BottomCenter, Anchor::BottomCenter),
+            (Anchor::LeftCenter, Anchor::RightCenter),
+            (Anchor::RightCenter, Anchor::LeftCenter),
+        ];
+
+        for (anchor, expected) in horizontal {
+            assert_eq!(anchor.other_side_along(Axis::Horizontal), expected);
+        }
+    }
 
     #[test]
     fn test_bounds_intersects() {
