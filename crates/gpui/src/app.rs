@@ -1571,10 +1571,19 @@ impl App {
                             {
                                 windows.remove(&id);
                             }
+                            if cx.current_window_by_entity.get(&entity_id) == Some(&id) {
+                                if let Some(fallback_id) = cx
+                                    .window_invalidators_by_entity
+                                    .get(&entity_id)
+                                    .and_then(|windows| windows.keys().next().copied())
+                                {
+                                    cx.current_window_by_entity.insert(entity_id, fallback_id);
+                                } else {
+                                    cx.current_window_by_entity.remove(&entity_id);
+                                }
+                            }
                         }
                     }
-                    cx.current_window_by_entity
-                        .retain(|_, window_id| *window_id != id);
 
                     cx.window_closed_observers.clone().retain(&(), |callback| {
                         callback(cx);

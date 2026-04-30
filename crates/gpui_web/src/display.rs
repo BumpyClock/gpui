@@ -1,28 +1,20 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay, Point, Size, px};
 
 #[derive(Debug)]
 pub struct WebDisplay {
     id: DisplayId,
-    uuid: uuid::Uuid,
-    browser_window: web_sys::Window,
 }
 
-// Safety: WASM is single-threaded — there is no concurrent access to `web_sys::Window`.
-unsafe impl Send for WebDisplay {}
-unsafe impl Sync for WebDisplay {}
-
 impl WebDisplay {
-    pub fn new(browser_window: web_sys::Window) -> Self {
+    pub fn new() -> Self {
         WebDisplay {
             id: DisplayId::new(1),
-            uuid: uuid::Uuid::new_v4(),
-            browser_window,
         }
     }
 
     fn screen_size(&self) -> Size<Pixels> {
-        let Some(screen) = self.browser_window.screen().ok() else {
+        let Some(screen) = web_sys::window().and_then(|window| window.screen().ok()) else {
             return Size {
                 width: px(1920.),
                 height: px(1080.),
@@ -39,14 +31,19 @@ impl WebDisplay {
     }
 
     fn viewport_size(&self) -> Size<Pixels> {
-        let width = self
-            .browser_window
+        let Some(browser_window) = web_sys::window() else {
+            return Size {
+                width: px(1920.),
+                height: px(1080.),
+            };
+        };
+
+        let width = browser_window
             .inner_width()
             .ok()
             .and_then(|v| v.as_f64())
             .unwrap_or(1920.0) as f32;
-        let height = self
-            .browser_window
+        let height = browser_window
             .inner_height()
             .ok()
             .and_then(|v| v.as_f64())
@@ -65,7 +62,7 @@ impl PlatformDisplay for WebDisplay {
     }
 
     fn uuid(&self) -> Result<uuid::Uuid> {
-        Ok(self.uuid)
+        Err(anyhow!("web displays do not expose a stable uuid"))
     }
 
     fn bounds(&self) -> Bounds<Pixels> {

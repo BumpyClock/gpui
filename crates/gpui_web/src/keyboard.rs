@@ -10,10 +10,10 @@ impl WebKeyboardLayout {
 
 impl PlatformKeyboardLayout for WebKeyboardLayout {
     fn id(&self) -> &str {
-        "us"
+        "unknown"
     }
 
     fn name(&self) -> &str {
-        "US"
+        "Unknown"
     }
 }

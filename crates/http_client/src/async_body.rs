@@ -92,13 +92,11 @@ impl From<&'static str> for AsyncBody {
 /// Newtype wrapper that serializes a value as JSON into an `AsyncBody`.
 pub struct Json<T: Serialize>(pub T);
 
-impl<T: Serialize> From<Json<T>> for AsyncBody {
-    fn from(json: Json<T>) -> Self {
-        Self::from_bytes(
-            serde_json::to_vec(&json.0)
-                .expect("failed to serialize JSON")
-                .into(),
-        )
+impl<T: Serialize> TryFrom<Json<T>> for AsyncBody {
+    type Error = serde_json::Error;
+
+    fn try_from(json: Json<T>) -> Result<Self, Self::Error> {
+        Ok(Self::from_bytes(serde_json::to_vec(&json.0)?.into()))
     }
 }
 

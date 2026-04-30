@@ -1,4 +1,5 @@
 use collections::HashMap;
+use core_foundation::base::{CFRelease, CFTypeRef};
 use std::ffi::{CStr, c_void};
 
 use objc::{msg_send, runtime::Object, sel, sel_impl};
@@ -69,7 +70,7 @@ impl MacKeyboardLayout {
             let name: *const std::os::raw::c_char = msg_send![name, UTF8String];
             let name = CStr::from_ptr(name).to_str().unwrap().to_string();
 
-            let _: () = msg_send![current_keyboard, release];
+            CFRelease(current_keyboard as CFTypeRef);
 
             Self { id, name }
         }

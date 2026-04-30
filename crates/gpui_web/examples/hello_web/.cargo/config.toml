@@ -11,4 +11,4 @@ rustflags = [
 ]
 
 [unstable]
-build-std = ["std,panic_abort"]
+build-std = ["std", "panic_abort"]

@@ -127,7 +127,7 @@ impl HttpClient for FetchHttpClient {
                     .to_str()
                     .map_err(|_| anyhow!("non-ASCII header value for {name}"))?;
                 request_headers
-                    .set(name.as_str(), value_str)
+                    .append(name.as_str(), value_str)
                     .map_err(|error| anyhow!("failed to set header {name}: {error:?}"))?;
             }
 

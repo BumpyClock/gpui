@@ -1005,7 +1005,11 @@ impl X11Client {
                 );
                 let new_absolute_scale = event.scale as f32 / 65536.0;
                 let previous_scale = state.pinch_scale;
-                let zoom_delta = new_absolute_scale - previous_scale;
+                let zoom_delta = if previous_scale == 0.0 {
+                    0.0
+                } else {
+                    new_absolute_scale / previous_scale - 1.0
+                };
                 state.pinch_scale = new_absolute_scale;
                 drop(state);
                 window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {

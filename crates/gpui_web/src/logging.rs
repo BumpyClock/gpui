@@ -32,6 +32,7 @@ impl Log for ConsoleLogger {
 }
 
 pub fn init_logging() {
-    log::set_logger(&ConsoleLogger).ok();
-    log::set_max_level(log::LevelFilter::Info);
+    if log::set_logger(&ConsoleLogger).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
 }

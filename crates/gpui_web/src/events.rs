@@ -114,10 +114,12 @@ impl WebWindowInner {
         let mut closures = vec![
             self.register_pointer_down(),
             self.register_pointer_up(),
+            self.register_pointer_cancel(),
             self.register_pointer_move(),
             self.register_pointer_leave(),
             self.register_wheel(),
             self.register_context_menu(),
+            self.register_dragenter(),
             self.register_dragover(),
             self.register_drop(),
             self.register_dragleave(),
@@ -133,6 +135,9 @@ impl WebWindowInner {
         ];
         closures.extend(self.register_visibility_change());
         closures.extend(self.register_appearance_change());
+        if let Some(listener) = self.register_fullscreen_change() {
+            closures.push(listener);
+        }
 
         WebEventListeners {
             listeners: closures,
@@ -179,6 +184,7 @@ impl WebWindowInner {
         self.listen("pointerdown", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
+            this.canvas.set_pointer_capture(event.pointer_id()).ok();
             this.input_element.focus().ok();
 
             let button = dom_mouse_button_to_gpui(event.button());
@@ -210,6 +216,7 @@ impl WebWindowInner {
         self.listen("pointerup", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
+            this.canvas.release_pointer_capture(event.pointer_id()).ok();
 
             let button = dom_mouse_button_to_gpui(event.button());
             let position = pointer_position_in_element(&event);
@@ -230,6 +237,15 @@ impl WebWindowInner {
                 modifiers,
                 click_count,
             }));
+        })
+    }
+
+    fn register_pointer_cancel(self: &Rc<Self>) -> WebEventListener {
+        let this = Rc::clone(self);
+        self.listen("pointercancel", move |event: JsValue| {
+            let event: web_sys::PointerEvent = event.unchecked_into();
+            this.canvas.release_pointer_capture(event.pointer_id()).ok();
+            this.pressed_button.set(None);
         })
     }
 
@@ -321,6 +337,27 @@ impl WebWindowInner {
         })
     }
 
+    fn register_dragenter(self: &Rc<Self>) -> WebEventListener {
+        let this = Rc::clone(self);
+        self.listen("dragenter", move |event: JsValue| {
+            let event: web_sys::DragEvent = event.unchecked_into();
+            event.prevent_default();
+
+            let mouse_event: &web_sys::MouseEvent = event.as_ref();
+            let position = mouse_position_in_element(mouse_event);
+
+            {
+                let mut current_state = this.state.borrow_mut();
+                current_state.mouse_position = position;
+            }
+
+            this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Entered {
+                position,
+                paths: ExternalPaths(smallvec![]),
+            }));
+        })
+    }
+
     fn register_dragover(self: &Rc<Self>) -> WebEventListener {
         let this = Rc::clone(self);
         self.listen("dragover", move |event: JsValue| {
@@ -353,13 +390,6 @@ impl WebWindowInner {
                 current_state.mouse_position = position;
             }
 
-            let paths = extract_file_paths_from_drag(&event);
-
-            this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Entered {
-                position,
-                paths: ExternalPaths(paths),
-            }));
-
             this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Submit { position }));
         })
     }
@@ -369,6 +399,23 @@ impl WebWindowInner {
         self.listen("dragleave", move |_event: JsValue| {
             this.dispatch_input(PlatformInput::FileDrop(FileDropEvent::Exited));
         })
+    }
+
+    fn register_fullscreen_change(self: &Rc<Self>) -> Option<WebEventListener> {
+        let this = Rc::clone(self);
+        let document = self.browser_window.document()?;
+        Some(WebEventListener::new(
+            document.unchecked_into(),
+            "fullscreenchange",
+            move |_event: JsValue| {
+                let is_fullscreen = this
+                    .browser_window
+                    .document()
+                    .and_then(|document| document.fullscreen_element())
+                    .is_some();
+                this.state.borrow_mut().is_fullscreen = is_fullscreen;
+            },
+        ))
     }
 
     fn register_key_down(self: &Rc<Self>) -> WebEventListener {
@@ -596,8 +643,9 @@ fn dom_mouse_button_to_gpui(button: i16) -> MouseButton {
 }
 
 fn modifiers_from_keyboard_event(event: &web_sys::KeyboardEvent, _is_mac: bool) -> Modifiers {
+    let alt_graph = event.get_modifier_state("AltGraph");
     Modifiers {
-        control: event.ctrl_key(),
+        control: event.ctrl_key() && !alt_graph,
         alt: event.alt_key(),
         shift: event.shift_key(),
         platform: event.meta_key(),
@@ -691,23 +739,4 @@ fn pointer_position_in_element(event: &web_sys::PointerEvent) -> Point<Pixels> {
 fn mouse_position_in_element(event: &web_sys::MouseEvent) -> Point<Pixels> {
     // offset_x/offset_y give position relative to the target element's padding edge
     point(px(event.offset_x() as f32), px(event.offset_y() as f32))
-}
-
-fn extract_file_paths_from_drag(
-    event: &web_sys::DragEvent,
-) -> smallvec::SmallVec<[std::path::PathBuf; 2]> {
-    let mut paths = smallvec![];
-    let Some(data_transfer) = event.data_transfer() else {
-        return paths;
-    };
-    let file_list = data_transfer.files();
-    let Some(files) = file_list else {
-        return paths;
-    };
-    for index in 0..files.length() {
-        if let Some(file) = files.get(index) {
-            paths.push(std::path::PathBuf::from(file.name()));
-        }
-    }
-    paths
 }

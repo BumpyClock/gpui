@@ -459,10 +459,13 @@ impl ListState {
     pub fn scroll_to_end(&self) {
         let state = &mut *self.0.borrow_mut();
         let item_count = state.items.summary().count;
-        state.logical_scroll_top = Some(ListOffset {
-            item_ix: item_count,
-            offset_in_item: px(0.),
-        });
+        state.logical_scroll_top = match state.alignment {
+            ListAlignment::Top => Some(ListOffset {
+                item_ix: item_count,
+                offset_in_item: px(0.),
+            }),
+            ListAlignment::Bottom => None,
+        };
     }
 
     /// Set whether the list should auto-follow the tail.
@@ -474,10 +477,13 @@ impl ListState {
             FollowMode::Tail => {
                 state.follow_state = FollowState::Tail { is_following: true };
                 let item_count = state.items.summary().count;
-                state.logical_scroll_top = Some(ListOffset {
-                    item_ix: item_count,
-                    offset_in_item: px(0.),
-                });
+                state.logical_scroll_top = match state.alignment {
+                    ListAlignment::Top => Some(ListOffset {
+                        item_ix: item_count,
+                        offset_in_item: px(0.),
+                    }),
+                    ListAlignment::Bottom => None,
+                };
             }
         }
     }
@@ -506,6 +512,7 @@ impl ListState {
     /// Scroll the list to the given item, such that the item is fully visible.
     pub fn scroll_to_reveal_item(&self, ix: usize) {
         let state = &mut *self.0.borrow_mut();
+        state.follow_state.stop_following();
 
         let mut scroll_top = state.logical_scroll_top();
         let height = state

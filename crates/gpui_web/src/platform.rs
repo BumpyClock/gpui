@@ -74,8 +74,7 @@ impl WebPlatform {
             log::error!("failed to load bundled fonts: {error:#}");
         }
         let text_system: Arc<dyn PlatformTextSystem> = text_system;
-        let active_display: Rc<dyn PlatformDisplay> =
-            Rc::new(WebDisplay::new(browser_window.clone()));
+        let active_display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new());
 
         Self {
             browser_window,

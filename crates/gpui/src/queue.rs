@@ -9,6 +9,8 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use crate::Priority;
 
+const SPIN_LOCK_ATTEMPTS: usize = 64;
+
 struct PriorityQueues<T> {
     high_priority: VecDeque<T>,
     medium_priority: VecDeque<T>,
@@ -55,15 +57,28 @@ impl<T> PriorityQueueState<T> {
             return Err(SendError(item));
         }
 
-        let mut queues = loop {
-            if let Some(guard) = self.queues.try_lock() {
-                break guard;
-            }
-            std::hint::spin_loop();
-        };
+        let mut queues = self
+            .try_spin_lock_queues()
+            .unwrap_or_else(|| self.queues.lock());
         Self::push(&mut queues, priority, item);
         self.condvar.notify_one();
         Ok(())
+    }
+
+    fn try_spin_lock_queues<'a>(
+        &'a self,
+    ) -> Option<parking_lot::MutexGuard<'a, PriorityQueues<T>>> {
+        for attempt in 0..SPIN_LOCK_ATTEMPTS {
+            if let Some(guard) = self.queues.try_lock() {
+                return Some(guard);
+            }
+            if attempt % 8 == 7 {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        None
     }
 
     fn push(queues: &mut PriorityQueues<T>, priority: Priority, item: T) {
@@ -112,11 +127,8 @@ impl<T> PriorityQueueState<T> {
     fn spin_try_recv<'a>(
         &'a self,
     ) -> Result<Option<parking_lot::MutexGuard<'a, PriorityQueues<T>>>, RecvError> {
-        let queues = loop {
-            if let Some(guard) = self.queues.try_lock() {
-                break guard;
-            }
-            std::hint::spin_loop();
+        let Some(queues) = self.try_spin_lock_queues() else {
+            return Ok(None);
         };
 
         let sender_count = self.sender_count.load(std::sync::atomic::Ordering::Relaxed);

@@ -2053,6 +2053,7 @@ impl Window {
     }
 
     pub(crate) fn button_layout_changed(&mut self, cx: &mut App) {
+        self.refresh();
         self.button_layout_observers
             .clone()
             .retain(&(), |callback| callback(self, cx));

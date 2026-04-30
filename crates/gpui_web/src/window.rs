@@ -148,7 +148,7 @@ impl WebWindow {
 
         let renderer = WgpuRenderer::new_from_canvas(context, &canvas, renderer_config)?;
 
-        let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
+        let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new());
 
         let initial_bounds = Bounds {
             origin: Point::default(),
@@ -163,7 +163,7 @@ impl WebWindow {
             title: String::new(),
             input_handler: None,
             is_fullscreen: false,
-            is_active: true,
+            is_active: false,
             is_hovered: false,
             mouse_position: Point::default(),
             modifiers: Modifiers::default(),
@@ -205,6 +205,7 @@ impl WebWindow {
         }
 
         let event_listeners = inner.register_event_listeners();
+        inner.set_active(true);
 
         Ok(Self {
             inner,
@@ -616,7 +617,7 @@ impl PlatformWindow for WebWindow {
     }
 
     fn activate(&self) {
-        self.inner.state.borrow_mut().is_active = true;
+        self.inner.set_active(true);
     }
 
     fn is_active(&self) -> bool {
@@ -649,20 +650,23 @@ impl PlatformWindow for WebWindow {
     }
 
     fn toggle_fullscreen(&self) {
-        let mut state = self.inner.state.borrow_mut();
-        state.is_fullscreen = !state.is_fullscreen;
-
-        if state.is_fullscreen {
-            let canvas: &web_sys::Element = self.inner.canvas.as_ref();
-            canvas.request_fullscreen().ok();
-        } else {
-            if let Some(document) = self.inner.browser_window.document() {
+        if let Some(document) = self.inner.browser_window.document() {
+            if document.fullscreen_element().is_some() {
                 document.exit_fullscreen();
+                self.inner.state.borrow_mut().is_fullscreen = false;
+            } else {
+                let canvas: &web_sys::Element = self.inner.canvas.as_ref();
+                if canvas.request_fullscreen().is_ok() {
+                    self.inner.state.borrow_mut().is_fullscreen = true;
+                }
             }
         }
     }
 
     fn is_fullscreen(&self) -> bool {
+        if let Some(document) = self.inner.browser_window.document() {
+            return document.fullscreen_element().is_some();
+        }
         self.inner.state.borrow().is_fullscreen
     }
 
@@ -707,6 +711,12 @@ impl PlatformWindow for WebWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        let state = self.inner.state.borrow();
+        if state.bounds.size.width == px(0.) || state.bounds.size.height == px(0.) {
+            return;
+        }
+        drop(state);
+
         if let Some((width, height)) = self.inner.pending_physical_size.take() {
             if self.inner.canvas.width() != width || self.inner.canvas.height() != height {
                 self.inner.canvas.set_width(width);

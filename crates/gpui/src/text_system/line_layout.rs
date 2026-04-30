@@ -789,7 +789,7 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
         for glyph in run.glyphs.iter_mut() {
             let shaped_x = glyph.position.x;
 
-            if shaped_x > last_base_shaped_x {
+            if shaped_x - last_base_shaped_x > px(1.) {
                 let forced_x = glyph_pos * force_width;
                 if (shaped_x - forced_x).abs() > px(1.) {
                     glyph.position.x = forced_x;
