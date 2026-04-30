@@ -631,7 +631,7 @@ pub trait PlatformTextSystem: Send + Sync {
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
     /// Get metrics for a font.
     fn font_metrics(&self, font_id: FontId) -> FontMetrics;
-    /// Get typographic bounds for a glyph.
+    /// Get typographic bounds for a glyph, including glyph outline bearings when available.
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>>;
     /// Get the advance width for a glyph.
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>>;

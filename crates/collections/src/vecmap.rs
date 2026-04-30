@@ -93,12 +93,8 @@ impl<'a, K, V> Entry<'a, K, V> {
         match self {
             Entry::Occupied(entry) => entry.value,
             Entry::Vacant(entry) => {
-                entry.map.values.push(default(&entry.key));
-                entry.map.keys.push(entry.key);
-                match entry.map.values.last_mut() {
-                    Some(value) => value,
-                    None => unreachable!("vec empty after pushing to it"),
-                }
+                let value = default(&entry.key);
+                insert_vacant_entry(entry.map, entry.key, value)
             }
         }
     }
@@ -157,12 +153,8 @@ where
         match self {
             EntryRef::Occupied(entry) => entry.value,
             EntryRef::Vacant(entry) => {
-                entry.map.values.push(default(entry.key));
-                entry.map.keys.push(entry.key.clone());
-                match entry.map.values.last_mut() {
-                    Some(value) => value,
-                    None => unreachable!("vec empty after pushing to it"),
-                }
+                let value = default(entry.key);
+                insert_vacant_entry(entry.map, entry.key.clone(), value)
             }
         }
     }
@@ -189,4 +181,35 @@ where
 pub struct VacantEntryRef<'key, 'map, K, V> {
     map: &'map mut VecMap<K, V>,
     key: &'key K,
+}
+
+fn insert_vacant_entry<K, V>(map: &mut VecMap<K, V>, key: K, value: V) -> &mut V {
+    map.keys.push(key);
+
+    struct KeyGuard<'a, K> {
+        keys: &'a mut Vec<K>,
+        committed: bool,
+    }
+
+    impl<K> Drop for KeyGuard<'_, K> {
+        fn drop(&mut self) {
+            if !self.committed {
+                self.keys.pop();
+            }
+        }
+    }
+
+    let mut guard = KeyGuard {
+        keys: &mut map.keys,
+        committed: false,
+    };
+
+    map.values.push(value);
+    guard.committed = true;
+    drop(guard);
+
+    match map.values.last_mut() {
+        Some(value) => value,
+        None => unreachable!("vec empty after pushing to it"),
+    }
 }

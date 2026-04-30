@@ -1,5 +1,5 @@
 use crate::display::WebDisplay;
-use crate::events::{ClickState, WebEventListeners, is_mac_platform};
+use crate::events::{ClickState, WebEventListener, WebEventListeners, is_mac_platform};
 use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
@@ -43,6 +43,8 @@ pub(crate) struct WebWindowMutableState {
 }
 
 pub(crate) struct WebWindowInner {
+    pub(crate) handle: AnyWindowHandle,
+    pub(crate) active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
     pub(crate) browser_window: web_sys::Window,
     pub(crate) canvas: web_sys::HtmlCanvasElement,
     pub(crate) input_element: web_sys::HtmlInputElement,
@@ -55,6 +57,7 @@ pub(crate) struct WebWindowInner {
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
+    raf_handle: Cell<Option<i32>>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
 }
@@ -65,7 +68,7 @@ pub struct WebWindow {
     #[allow(dead_code)]
     handle: AnyWindowHandle,
     _raf_closure: Closure<dyn FnMut()>,
-    _resize_observer: Option<web_sys::ResizeObserver>,
+    resize_observer: Option<web_sys::ResizeObserver>,
     _resize_observer_closure: Closure<dyn FnMut(js_sys::Array)>,
     _event_listeners: WebEventListeners,
 }
@@ -76,6 +79,7 @@ impl WebWindow {
         _params: WindowParams,
         context: &WgpuContext,
         browser_window: web_sys::Window,
+        active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
     ) -> anyhow::Result<Self> {
         let document = browser_window
             .document()
@@ -169,6 +173,8 @@ impl WebWindow {
         let is_mac = is_mac_platform(&browser_window);
 
         let inner = Rc::new(WebWindowInner {
+            handle,
+            active_window,
             browser_window,
             canvas,
             input_element,
@@ -181,6 +187,7 @@ impl WebWindow {
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
+            raf_handle: Cell::new(None),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
         });
@@ -204,7 +211,7 @@ impl WebWindow {
             display,
             handle,
             _raf_closure: raf_closure,
-            _resize_observer: resize_observer,
+            resize_observer,
             _resize_observer_closure: resize_observer_closure,
             _event_listeners: event_listeners,
         })
@@ -299,12 +306,35 @@ impl WebWindow {
 }
 
 impl WebWindowInner {
+    pub(crate) fn set_active(&self, active: bool) {
+        self.state.borrow_mut().is_active = active;
+
+        if active {
+            *self.active_window.borrow_mut() = Some(self.handle);
+        } else {
+            self.clear_active_window();
+        }
+
+        let mut callbacks = self.callbacks.borrow_mut();
+        if let Some(ref mut callback) = callbacks.active_status_change {
+            callback(active);
+        }
+    }
+
+    fn clear_active_window(&self) {
+        let mut active_window = self.active_window.borrow_mut();
+        if *active_window == Some(self.handle) {
+            *active_window = None;
+        }
+    }
+
     fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut()> {
         let raf_handle: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
         let raf_handle_inner = Rc::clone(&raf_handle);
 
         let this = Rc::clone(self);
         let closure = Closure::new(move || {
+            this.raf_handle.set(None);
             {
                 let mut callbacks = this.callbacks.borrow_mut();
                 if let Some(ref mut callback) = callbacks.request_frame {
@@ -317,7 +347,9 @@ impl WebWindowInner {
 
             // Re-schedule for the next frame
             if let Some(ref func) = *raf_handle_inner.borrow() {
-                this.browser_window.request_animation_frame(func).ok();
+                if let Ok(handle) = this.browser_window.request_animation_frame(func) {
+                    this.raf_handle.set(Some(handle));
+                }
             }
         });
 
@@ -329,9 +361,12 @@ impl WebWindowInner {
     }
 
     fn schedule_raf(&self, closure: &Closure<dyn FnMut()>) {
-        self.browser_window
+        if let Ok(handle) = self
+            .browser_window
             .request_animation_frame(closure.as_ref().unchecked_ref())
-            .ok();
+        {
+            self.raf_handle.set(Some(handle));
+        }
     }
 
     fn observe_canvas(&self, observer: &web_sys::ResizeObserver) {
@@ -371,40 +406,30 @@ impl WebWindowInner {
         });
     }
 
-    pub(crate) fn register_visibility_change(
-        self: &Rc<Self>,
-    ) -> Option<Closure<dyn FnMut(JsValue)>> {
+    pub(crate) fn register_visibility_change(self: &Rc<Self>) -> Option<WebEventListener> {
         let document = self.browser_window.document()?;
         let this = Rc::clone(self);
 
-        let closure = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| {
-            let is_visible = this
-                .browser_window
-                .document()
-                .map(|doc| {
-                    let state_str: String = js_sys::Reflect::get(&doc, &"visibilityState".into())
-                        .ok()
-                        .and_then(|v| v.as_string())
-                        .unwrap_or_default();
-                    state_str == "visible"
-                })
-                .unwrap_or(true);
+        Some(WebEventListener::new(
+            document.unchecked_into(),
+            "visibilitychange",
+            move |_event: JsValue| {
+                let is_visible = this
+                    .browser_window
+                    .document()
+                    .map(|doc| {
+                        let state_str: String =
+                            js_sys::Reflect::get(&doc, &"visibilityState".into())
+                                .ok()
+                                .and_then(|v| v.as_string())
+                                .unwrap_or_default();
+                        state_str == "visible"
+                    })
+                    .unwrap_or(true);
 
-            {
-                let mut state = this.state.borrow_mut();
-                state.is_active = is_visible;
-            }
-            let mut callbacks = this.callbacks.borrow_mut();
-            if let Some(ref mut callback) = callbacks.active_status_change {
-                callback(is_visible);
-            }
-        });
-
-        document
-            .add_event_listener_with_callback("visibilitychange", closure.as_ref().unchecked_ref())
-            .ok();
-
-        Some(closure)
+                this.set_active(is_visible);
+            },
+        ))
     }
 
     pub(crate) fn with_input_handler<R>(
@@ -417,26 +442,44 @@ impl WebWindowInner {
         Some(result)
     }
 
-    pub(crate) fn register_appearance_change(
-        self: &Rc<Self>,
-    ) -> Option<Closure<dyn FnMut(JsValue)>> {
+    pub(crate) fn register_appearance_change(self: &Rc<Self>) -> Option<WebEventListener> {
         let mql = self
             .browser_window
             .match_media("(prefers-color-scheme: dark)")
             .ok()??;
 
         let this = Rc::clone(self);
-        let closure = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| {
-            let mut callbacks = this.callbacks.borrow_mut();
-            if let Some(ref mut callback) = callbacks.appearance_changed {
-                callback();
-            }
-        });
+        Some(WebEventListener::new(
+            mql.unchecked_into(),
+            "change",
+            move |_event: JsValue| {
+                let mut callbacks = this.callbacks.borrow_mut();
+                if let Some(ref mut callback) = callbacks.appearance_changed {
+                    callback();
+                }
+            },
+        ))
+    }
+}
 
-        mql.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())
-            .ok();
+impl Drop for WebWindow {
+    fn drop(&mut self) {
+        if let Some(handle) = self.inner.raf_handle.take() {
+            self.inner
+                .browser_window
+                .cancel_animation_frame(handle)
+                .ok();
+        }
 
-        Some(closure)
+        if let Some(observer) = &self.resize_observer {
+            observer.disconnect();
+        }
+
+        self.inner.clear_active_window();
+        let canvas: &web_sys::Element = self.inner.canvas.as_ref();
+        canvas.remove();
+        let input_element: &web_sys::Element = self.inner.input_element.as_ref();
+        input_element.remove();
     }
 }
 

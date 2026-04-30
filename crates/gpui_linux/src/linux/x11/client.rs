@@ -983,8 +983,8 @@ impl X11Client {
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
                 );
                 drop(state);
                 window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
@@ -1000,8 +1000,8 @@ impl X11Client {
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
                 );
                 let new_absolute_scale = event.scale as f32 / 65536.0;
                 let previous_scale = state.pinch_scale;
@@ -1022,8 +1022,8 @@ impl X11Client {
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
                 );
                 drop(state);
                 window.handle_input(PlatformInput::Pinch(gpui::PinchEvent {
@@ -1168,8 +1168,8 @@ impl X11Client {
                 state.modifiers = modifiers;
 
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
                 );
 
                 if state.composing && state.ximc.is_some() {
@@ -1244,8 +1244,8 @@ impl X11Client {
                 state.modifiers = modifiers;
 
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
                 );
                 match button_or_scroll_from_event_detail(event.detail) {
                     Some(ButtonOrScroll::Button(button)) => {
@@ -1294,8 +1294,8 @@ impl X11Client {
                 }
                 let pressed_button = pressed_button_from_mask(event.button_mask[0]);
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
                 );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -1336,8 +1336,8 @@ impl X11Client {
                 state.mouse_focused_window = None;
                 let pressed_button = pressed_button_from_mask(event.buttons[0]);
                 let position = point(
-                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
-                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(fp1616_to_f32(event.event_x) / state.scale_factor),
+                    px(fp1616_to_f32(event.event_y) / state.scale_factor),
                 );
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
@@ -2044,6 +2044,10 @@ pub fn mode_refresh_rate(mode: &randr::ModeInfo) -> Duration {
 
 fn fp3232_to_f32(value: xinput::Fp3232) -> f32 {
     value.integral as f32 + value.frac as f32 / u32::MAX as f32
+}
+
+fn fp1616_to_f32(value: xinput::Fp1616) -> f32 {
+    value as f32 / 65536.0
 }
 
 fn detect_compositor_gpu(

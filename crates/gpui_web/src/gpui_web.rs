@@ -1,4 +1,9 @@
 #![cfg(target_family = "wasm")]
+//! Web GPUI platform.
+//!
+//! The default feature set enables multithreaded WebAssembly. Build default
+//! `gpui_web` with nightly Rust, atomics/shared-memory flags, and COOP/COEP
+//! headers. Use `--no-default-features` for single-threaded stable wasm builds.
 
 mod dispatcher;
 mod display;

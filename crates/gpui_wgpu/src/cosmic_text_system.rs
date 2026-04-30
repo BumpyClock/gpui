@@ -143,9 +143,22 @@ impl PlatformTextSystem for CosmicTextSystem {
     }
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
-        let lock = self.0.read();
-        let glyph_metrics = lock.loaded_font(font_id).font.as_swash().glyph_metrics(&[]);
+        let state = self.0.read();
+        let font = state.loaded_font(font_id).font.as_swash();
+        let glyph_metrics = font.glyph_metrics(&[]);
         let glyph_id = glyph_id.0 as u16;
+        let mut scale_context = ScaleContext::new();
+        let mut scaler = scale_context.builder(font).build();
+        if let Some(outline) = scaler.scale_outline(glyph_id) {
+            let outline_bounds = outline.bounds();
+            if !outline_bounds.is_empty() {
+                return Ok(Bounds {
+                    origin: point(outline_bounds.min.x, outline_bounds.min.y),
+                    size: size(outline_bounds.width(), outline_bounds.height()),
+                });
+            }
+        }
+
         Ok(Bounds {
             origin: point(0.0, 0.0),
             size: size(
@@ -650,4 +663,33 @@ fn face_info_into_properties(
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     // TODO: Include other common emoji fonts
     postscript_name == "NotoColorEmoji"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::font;
+
+    #[test]
+    fn typographic_bounds_use_glyph_outline_bounds() {
+        let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
+        text_system
+            .add_fonts(vec![Cow::Borrowed(include_bytes!(
+                "../../gpui_web/assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"
+            ))])
+            .unwrap();
+
+        let font_id = text_system
+            .font_id(&font("IBM Plex Sans").italic())
+            .unwrap();
+        let glyph_id = text_system.glyph_for_char(font_id, 'f').unwrap();
+        let bounds = text_system.typographic_bounds(font_id, glyph_id).unwrap();
+        let advance = text_system.advance(font_id, glyph_id).unwrap();
+
+        assert!(bounds.size.height > 0.0);
+        assert!(
+            bounds.origin.x != 0.0 || bounds.size.width != advance.width,
+            "bounds should include glyph bearings or outline width"
+        );
+    }
 }

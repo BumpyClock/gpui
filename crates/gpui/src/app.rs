@@ -1571,11 +1571,10 @@ impl App {
                             {
                                 windows.remove(&id);
                             }
-                            if cx.current_window_by_entity.get(&entity_id) == Some(&id) {
-                                cx.current_window_by_entity.remove(&entity_id);
-                            }
                         }
                     }
+                    cx.current_window_by_entity
+                        .retain(|_, window_id| *window_id != id);
 
                     cx.window_closed_observers.clone().retain(&(), |callback| {
                         callback(cx);
@@ -2675,7 +2674,7 @@ impl<'a, T> Drop for GpuiBorrow<'a, T> {
 mod test {
     use std::{cell::RefCell, rc::Rc};
 
-    use crate::{AppContext, TestAppContext};
+    use crate::{AppContext, Context, Empty, Entity, Render, TestAppContext, Window};
 
     #[test]
     fn test_gpui_borrow() {
@@ -2706,5 +2705,51 @@ mod test {
         });
 
         assert_eq!(*observation_count.borrow(), 2);
+    }
+
+    struct WindowWithUnrenderedEntity {
+        child: Entity<()>,
+    }
+
+    impl Render for WindowWithUnrenderedEntity {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl crate::IntoElement {
+            Empty
+        }
+    }
+
+    #[gpui::test]
+    fn closing_window_clears_current_window_for_unrendered_entities(cx: &mut TestAppContext) {
+        let (window, child) = cx.update(|cx| {
+            let window = cx
+                .open_window(Default::default(), |_, cx| {
+                    let child = cx.new(|_| ());
+                    cx.new(|_| WindowWithUnrenderedEntity {
+                        child: child.clone(),
+                    })
+                })
+                .unwrap();
+            let child = window.read_with(cx, |view, _| view.child.clone()).unwrap();
+            (window, child)
+        });
+        let child_id = child.entity_id();
+
+        cx.read(|cx| {
+            assert_eq!(
+                cx.current_window_by_entity.get(&child_id),
+                Some(&window.window_id())
+            );
+        });
+
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+
+        cx.read(|cx| {
+            assert_eq!(cx.current_window_by_entity.get(&child_id), None);
+        });
     }
 }

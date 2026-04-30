@@ -98,6 +98,7 @@ fn test_multiple_entries_independent() {
 // entry_ref tests
 
 use std::cell::Cell;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 #[derive(PartialEq, Eq)]
@@ -115,6 +116,31 @@ impl Clone for CountedKey {
         }
     }
 }
+
+struct PanicCloneKey {
+    value: &'static str,
+    panic_on_clone: Rc<Cell<bool>>,
+}
+
+impl Clone for PanicCloneKey {
+    fn clone(&self) -> Self {
+        if self.panic_on_clone.get() {
+            panic!("clone panic");
+        }
+        Self {
+            value: self.value,
+            panic_on_clone: self.panic_on_clone.clone(),
+        }
+    }
+}
+
+impl PartialEq for PanicCloneKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Eq for PanicCloneKey {}
 
 #[test]
 fn test_entry_ref_vacant_or_insert() {
@@ -172,6 +198,35 @@ fn test_entry_ref_or_insert_with_key() {
     assert_eq!(
         map.iter().collect::<Vec<_>>(),
         vec![(&"hello".to_string(), &"HELLO".to_string())]
+    );
+}
+
+#[test]
+fn test_entry_ref_or_insert_with_key_clone_panic_preserves_invariant() {
+    let mut map: VecMap<PanicCloneKey, i32> = VecMap::new();
+    let panic_on_clone = Rc::new(Cell::new(true));
+    let key = PanicCloneKey {
+        value: "panic",
+        panic_on_clone: panic_on_clone.clone(),
+    };
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        map.entry_ref(&key).or_insert_with_key(|_| 1);
+    }));
+    assert!(result.is_err());
+
+    panic_on_clone.set(false);
+    let next_key = PanicCloneKey {
+        value: "next",
+        panic_on_clone,
+    };
+    map.entry_ref(&next_key).or_insert(7);
+
+    assert_eq!(
+        map.iter()
+            .map(|(key, value)| (key.value, *value))
+            .collect::<Vec<_>>(),
+        vec![("next", 7)]
     );
 }
 

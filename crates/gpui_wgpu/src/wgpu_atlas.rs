@@ -19,6 +19,21 @@ fn etagere_point_to_device(point: etagere::Point) -> Point<DevicePixels> {
     }
 }
 
+fn atlas_texture_size(min_size: Size<DevicePixels>, max_texture_size: u32) -> Size<DevicePixels> {
+    const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
+        width: DevicePixels(1024),
+        height: DevicePixels(1024),
+    };
+
+    let max_texture_size = max_texture_size as i32;
+    let max_atlas_size = Size {
+        width: DevicePixels(max_texture_size),
+        height: DevicePixels(max_texture_size),
+    };
+
+    min_size.max(&DEFAULT_ATLAS_SIZE).min(&max_atlas_size)
+}
+
 pub struct WgpuAtlas(Mutex<WgpuAtlasState>);
 
 struct PendingUpload {
@@ -156,17 +171,7 @@ impl WgpuAtlasState {
         min_size: Size<DevicePixels>,
         kind: AtlasTextureKind,
     ) -> &mut WgpuAtlasTexture {
-        const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(1024),
-            height: DevicePixels(1024),
-        };
-
-        let max_texture_size = self.max_texture_size as i32;
-        let max_atlas_size = Size {
-            width: DevicePixels(max_texture_size),
-            height: DevicePixels(max_texture_size),
-        };
-        let size = min_size.min(&max_atlas_size).max(&DEFAULT_ATLAS_SIZE);
+        let size = atlas_texture_size(min_size, self.max_texture_size);
         let format = match kind {
             AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
             AtlasTextureKind::Subpixel => wgpu::TextureFormat::Bgra8Unorm,
@@ -354,5 +359,27 @@ impl WgpuAtlasTexture {
 
     fn is_unreferenced(&self) -> bool {
         self.live_atlas_keys == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::size;
+
+    #[test]
+    fn atlas_texture_size_never_exceeds_max_texture_size() {
+        let size = atlas_texture_size(size(DevicePixels(16), DevicePixels(32)), 512);
+
+        assert_eq!(size.width, DevicePixels(512));
+        assert_eq!(size.height, DevicePixels(512));
+    }
+
+    #[test]
+    fn atlas_texture_size_clamps_oversized_requests() {
+        let size = atlas_texture_size(size(DevicePixels(2048), DevicePixels(64)), 1024);
+
+        assert_eq!(size.width, DevicePixels(1024));
+        assert_eq!(size.height, DevicePixels(1024));
     }
 }

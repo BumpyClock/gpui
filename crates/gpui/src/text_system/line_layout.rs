@@ -789,7 +789,7 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
         for glyph in run.glyphs.iter_mut() {
             let shaped_x = glyph.position.x;
 
-            if shaped_x > last_base_shaped_x + force_width * 0.5 {
+            if shaped_x > last_base_shaped_x {
                 let forced_x = glyph_pos * force_width;
                 if (shaped_x - forced_x).abs() > px(1.) {
                     glyph.position.x = forced_x;
@@ -800,6 +800,72 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
             } else {
                 glyph.position.x = last_base_actual_x + (shaped_x - last_base_shaped_x);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_width_does_not_treat_narrow_glyphs_as_combining_marks() {
+        let mut layout = LineLayout {
+            font_size: px(16.0),
+            width: px(12.0),
+            ascent: px(12.0),
+            descent: px(4.0),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![
+                    shaped_glyph(0, 0.0),
+                    shaped_glyph(1, 4.0),
+                    shaped_glyph(2, 8.0),
+                ],
+            }],
+            len: 3,
+        };
+
+        apply_force_width_to_layout(&mut layout, px(10.0));
+
+        let glyphs = &layout.runs[0].glyphs;
+        assert_eq!(glyphs[0].position.x, px(0.0));
+        assert_eq!(glyphs[1].position.x, px(10.0));
+        assert_eq!(glyphs[2].position.x, px(20.0));
+    }
+
+    #[test]
+    fn force_width_keeps_zero_advance_glyphs_with_base_glyph() {
+        let mut layout = LineLayout {
+            font_size: px(16.0),
+            width: px(6.0),
+            ascent: px(12.0),
+            descent: px(4.0),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs: vec![
+                    shaped_glyph(0, 0.0),
+                    shaped_glyph(1, 0.0),
+                    shaped_glyph(2, 6.0),
+                ],
+            }],
+            len: 3,
+        };
+
+        apply_force_width_to_layout(&mut layout, px(10.0));
+
+        let glyphs = &layout.runs[0].glyphs;
+        assert_eq!(glyphs[0].position.x, px(0.0));
+        assert_eq!(glyphs[1].position.x, px(0.0));
+        assert_eq!(glyphs[2].position.x, px(10.0));
+    }
+
+    fn shaped_glyph(index: usize, x: f32) -> ShapedGlyph {
+        ShapedGlyph {
+            id: GlyphId(index as u32),
+            position: point(px(x), px(0.0)),
+            index,
+            is_emoji: false,
         }
     }
 }

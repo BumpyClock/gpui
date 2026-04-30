@@ -224,9 +224,9 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
 
             // Reset the content transform so the viewport is ready for the next gesture.
             // ZoomToRect triggers a second RUNNING -> READY cycle, so prevent an infinite loop here.
-            if self.last_scale.get() != 1.0
-                || self.last_x_offset.get() != 0.0
-                || self.last_y_offset.get() != 0.0
+            if !float_equals(self.last_scale.get(), 1.0)
+                || !float_equals(self.last_x_offset.get(), 0.0)
+                || !float_equals(self.last_y_offset.get(), 0.0)
             {
                 if let Some(viewport) = viewport.as_ref() {
                     unsafe {

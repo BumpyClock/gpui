@@ -35,7 +35,7 @@ pub struct WebPlatform {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
-    active_window: RefCell<Option<AnyWindowHandle>>,
+    active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
     active_display: Rc<dyn PlatformDisplay>,
     callbacks: RefCell<WebPlatformCallbacks>,
     wgpu_context: Rc<RefCell<Option<WgpuContext>>>,
@@ -82,7 +82,7 @@ impl WebPlatform {
             background_executor,
             foreground_executor,
             text_system,
-            active_window: RefCell::new(None),
+            active_window: Rc::new(RefCell::new(None)),
             active_display,
             callbacks: RefCell::new(WebPlatformCallbacks::default()),
             wgpu_context: Rc::new(RefCell::new(None)),
@@ -156,7 +156,13 @@ impl Platform for WebPlatform {
             anyhow::anyhow!("WebGPU context not initialized. Was Platform::run() called?")
         })?;
 
-        let window = WebWindow::new(handle, params, context, self.browser_window.clone())?;
+        let window = WebWindow::new(
+            handle,
+            params,
+            context,
+            self.browser_window.clone(),
+            self.active_window.clone(),
+        )?;
         *self.active_window.borrow_mut() = Some(handle);
         Ok(Box::new(window))
     }

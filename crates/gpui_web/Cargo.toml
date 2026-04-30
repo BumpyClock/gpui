@@ -10,7 +10,7 @@ autoexamples = false
 workspace = true
 
 [features]
-default = []
+default = ["multithreaded"]
 multithreaded = ["dep:wasm_thread"]
 
 [lib]

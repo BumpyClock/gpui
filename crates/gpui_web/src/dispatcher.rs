@@ -95,6 +95,7 @@ impl MainThreadMailbox {
             let view = mailbox.signal_view();
             loop {
                 js_sys::Atomics::store(&view, 0, 0).expect("Atomics.store failed");
+                mailbox.drain(&window);
 
                 let result = match js_sys::Atomics::wait_async(&view, 0, 0) {
                     Ok(result) => result,
@@ -110,8 +111,8 @@ impl MainThreadMailbox {
                     .unwrap_or(false);
 
                 if !is_async {
-                    log::error!("Atomics.waitAsync returned synchronously; waker loop exiting");
-                    break;
+                    mailbox.drain(&window);
+                    continue;
                 }
 
                 let promise: js_sys::Promise =

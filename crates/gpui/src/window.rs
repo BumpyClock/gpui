@@ -1354,10 +1354,6 @@ impl Window {
             move |active| {
                 handle
                     .update(&mut cx, |_, window, cx| {
-                        if !active {
-                            cx.platform.set_cursor_style(CursorStyle::Arrow);
-                        }
-
                         window.active.set(active);
                         if active {
                             if let Some(focus_id) = window.focus_before_deactivation.take() {
