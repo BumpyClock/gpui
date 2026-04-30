@@ -1571,19 +1571,24 @@ impl App {
                             {
                                 windows.remove(&id);
                             }
-                            if cx.current_window_by_entity.get(&entity_id) == Some(&id) {
-                                if let Some(fallback_id) = cx
-                                    .window_invalidators_by_entity
-                                    .get(&entity_id)
-                                    .and_then(|windows| windows.keys().next().copied())
-                                {
-                                    cx.current_window_by_entity.insert(entity_id, fallback_id);
-                                } else {
-                                    cx.current_window_by_entity.remove(&entity_id);
-                                }
-                            }
                         }
                     }
+                    let mut fallback_current_windows = Vec::new();
+                    cx.current_window_by_entity.retain(|entity_id, window_id| {
+                        if *window_id != id {
+                            return true;
+                        }
+
+                        if let Some(fallback_id) = cx
+                            .window_invalidators_by_entity
+                            .get(entity_id)
+                            .and_then(|windows| windows.keys().next().copied())
+                        {
+                            fallback_current_windows.push((*entity_id, fallback_id));
+                        }
+                        false
+                    });
+                    cx.current_window_by_entity.extend(fallback_current_windows);
 
                     cx.window_closed_observers.clone().retain(&(), |callback| {
                         callback(cx);
