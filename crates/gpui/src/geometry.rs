@@ -4027,6 +4027,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_anchor_and_size_covers_all_anchors() {
+        let origin = point(10, 20);
+        let size = size(5, 7);
+        let cases = [
+            (Anchor::TopLeft, point(10, 20)),
+            (Anchor::TopRight, point(5, 20)),
+            (Anchor::BottomLeft, point(10, 13)),
+            (Anchor::BottomRight, point(5, 13)),
+            (Anchor::TopCenter, point(8, 20)),
+            (Anchor::BottomCenter, point(8, 13)),
+            (Anchor::LeftCenter, point(10, 17)),
+            (Anchor::RightCenter, point(5, 17)),
+        ];
+
+        for (anchor, expected_origin) in cases {
+            assert_eq!(
+                Bounds::from_anchor_and_size(anchor, origin, size),
+                Bounds::new(expected_origin, size)
+            );
+        }
+    }
+
+    #[test]
+    fn anchor_opposite_covers_all_anchors() {
+        let cases = [
+            (Anchor::TopLeft, Anchor::BottomRight),
+            (Anchor::TopRight, Anchor::BottomLeft),
+            (Anchor::BottomLeft, Anchor::TopRight),
+            (Anchor::BottomRight, Anchor::TopLeft),
+            (Anchor::TopCenter, Anchor::BottomCenter),
+            (Anchor::BottomCenter, Anchor::TopCenter),
+            (Anchor::LeftCenter, Anchor::RightCenter),
+            (Anchor::RightCenter, Anchor::LeftCenter),
+        ];
+
+        for (anchor, expected) in cases {
+            assert_eq!(anchor.opposite(), expected);
+        }
+    }
+
+    #[test]
+    fn anchor_other_side_along_covers_all_anchors() {
+        let vertical = [
+            (Anchor::TopLeft, Anchor::BottomLeft),
+            (Anchor::TopRight, Anchor::BottomRight),
+            (Anchor::BottomLeft, Anchor::TopLeft),
+            (Anchor::BottomRight, Anchor::TopRight),
+            (Anchor::TopCenter, Anchor::BottomCenter),
+            (Anchor::BottomCenter, Anchor::TopCenter),
+            (Anchor::LeftCenter, Anchor::LeftCenter),
+            (Anchor::RightCenter, Anchor::RightCenter),
+        ];
+
+        for (anchor, expected) in vertical {
+            assert_eq!(anchor.other_side_along(Axis::Vertical), expected);
+        }
+
+        let horizontal = [
+            (Anchor::TopLeft, Anchor::TopRight),
+            (Anchor::TopRight, Anchor::TopLeft),
+            (Anchor::BottomLeft, Anchor::BottomRight),
+            (Anchor::BottomRight, Anchor::BottomLeft),
+            (Anchor::TopCenter, Anchor::TopCenter),
+            (Anchor::BottomCenter, Anchor::BottomCenter),
+            (Anchor::LeftCenter, Anchor::RightCenter),
+            (Anchor::RightCenter, Anchor::LeftCenter),
+        ];
+
+        for (anchor, expected) in horizontal {
+            assert_eq!(anchor.other_side_along(Axis::Horizontal), expected);
+        }
+    }
+
+    #[test]
     fn test_bounds_intersects() {
         let bounds1 = Bounds {
             origin: Point { x: 0.0, y: 0.0 },

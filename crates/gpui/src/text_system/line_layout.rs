@@ -802,6 +802,7 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
             }
         }
     }
+    layout.width = glyph_pos * force_width;
 }
 
 #[cfg(test)]

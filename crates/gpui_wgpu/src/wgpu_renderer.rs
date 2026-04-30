@@ -321,8 +321,8 @@ impl WgpuRenderer {
         let (backdrop_texture, backdrop_view) = Self::create_backdrop_texture(
             &device,
             surface_format,
-            config.size.width.0 as u32,
-            config.size.height.0 as u32,
+            surface_config.width,
+            surface_config.height,
         );
 
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

@@ -120,7 +120,9 @@ impl Platform for WebPlatform {
     }
 
     fn quit(&self) {
-        log::warn!("WebPlatform::quit called, but quitting is not supported in the browser .");
+        if let Some(callback) = self.callbacks.borrow_mut().quit.as_mut() {
+            callback();
+        }
     }
 
     fn restart(&self, _binary_path: Option<PathBuf>) {}

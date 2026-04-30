@@ -1160,7 +1160,7 @@ impl WindowsWindowInner {
 
     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
         self.state.direct_manipulation.on_pointer_hit_test(wparam);
-        None
+        Some(0)
     }
 
     #[inline]

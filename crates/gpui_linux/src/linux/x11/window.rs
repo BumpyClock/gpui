@@ -1851,6 +1851,7 @@ impl PlatformWindow for X11Window {
 
     fn play_system_bell(&self) {
         // Volume 0% means don't increase or decrease from system volume.
-        let _ = self.0.xcb.bell(0);
+        check_reply(|| "X11 Bell failed.", self.0.xcb.bell(0)).log_err();
+        xcb_flush(&self.0.xcb);
     }
 }

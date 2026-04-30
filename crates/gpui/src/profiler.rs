@@ -303,6 +303,7 @@ impl ThreadTimings {
     /// Add timing or update in-progress timing for same task.
     pub fn add_task_timing(&mut self, timing: TaskTiming) {
         if let Some(last_timing) = self.timings.back_mut()
+            && last_timing.end.is_none()
             && last_timing.location == timing.location
             && last_timing.start == timing.start
         {

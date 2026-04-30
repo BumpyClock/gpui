@@ -54,7 +54,7 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
 
     #[cfg(target_family = "wasm")]
     {
-        let _ = headless;
+        assert!(!headless, "headless web platform is not supported");
         Rc::new(gpui_web::WebPlatform::new(true))
     }
 }

@@ -29,6 +29,7 @@ impl<K, V> VecMap<K, V> {
     }
 
     pub fn iter(&self) -> Iter<'_, K, V> {
+        debug_assert_eq!(self.keys.len(), self.values.len());
         Iter {
             iter: self.keys.iter().zip(self.values.iter()),
         }
@@ -123,9 +124,45 @@ pub struct OccupiedEntry<'a, K, V> {
     value: &'a mut V,
 }
 
+impl<'a, K, V> OccupiedEntry<'a, K, V> {
+    pub fn key(&self) -> &'a K {
+        self.key
+    }
+
+    pub fn get(&self) -> &V {
+        self.value
+    }
+
+    pub fn get_mut(&mut self) -> &mut V {
+        self.value
+    }
+
+    pub fn into_mut(self) -> &'a mut V {
+        self.value
+    }
+
+    pub fn insert(&mut self, value: V) -> V {
+        std::mem::replace(self.value, value)
+    }
+}
+
 pub struct VacantEntry<'a, K, V> {
     map: &'a mut VecMap<K, V>,
     key: K,
+}
+
+impl<'a, K, V> VacantEntry<'a, K, V> {
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    pub fn insert(self, value: V) -> &'a mut V {
+        insert_vacant_entry(self.map, self.key, value)
+    }
 }
 
 pub enum EntryRef<'key, 'map, K, V> {
@@ -181,6 +218,21 @@ where
 pub struct VacantEntryRef<'key, 'map, K, V> {
     map: &'map mut VecMap<K, V>,
     key: &'key K,
+}
+
+impl<'key, 'map, K, V> VacantEntryRef<'key, 'map, K, V> {
+    pub fn key(&self) -> &'key K {
+        self.key
+    }
+}
+
+impl<'key, 'map, K, V> VacantEntryRef<'key, 'map, K, V>
+where
+    K: Clone,
+{
+    pub fn insert(self, value: V) -> &'map mut V {
+        insert_vacant_entry(self.map, self.key.clone(), value)
+    }
 }
 
 fn insert_vacant_entry<K, V>(map: &mut VecMap<K, V>, key: K, value: V) -> &mut V {
