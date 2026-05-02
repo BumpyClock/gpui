@@ -1,14 +1,18 @@
 use crate::{WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, BackdropBlur, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    SubpixelSprite, Underline, get_gamma_correction_ratios,
+    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, GlobalElementId,
+    GpuSpecs, MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, RetainedLayer,
+    RetainedLayerContentRevision, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
+    TransformationMatrix, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 const BACKDROP_BLUR_RADIUS_PER_LEVEL: f32 = 6.0;
@@ -45,6 +49,16 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+}
+
+#[derive(Clone, Debug)]
+#[repr(C)]
+struct RetainedLayerSprite {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
+    transformation: TransformationMatrix,
+    opacity: f32,
+    pad: [f32; 3],
 }
 
 #[repr(C)]
@@ -103,6 +117,7 @@ struct WgpuPipelines {
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
+    retained_layers: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
 }
@@ -112,6 +127,35 @@ struct WgpuBindGroupLayouts {
     instances: wgpu::BindGroupLayout,
     instances_with_texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+}
+
+struct WgpuRetainedLayer {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    content_revision: RetainedLayerContentRevision,
+    texture_size: Size<DevicePixels>,
+    valid: bool,
+}
+
+struct PreparedRetainedLayer {
+    layer: RetainedLayer,
+    scene: Scene,
+    draw_order: u32,
+    cache_valid: bool,
+    needs_render: bool,
+}
+
+enum DrawCommand {
+    Batch {
+        batch: PrimitiveBatch,
+        order: u32,
+        kind: u8,
+    },
+    RetainedLayer {
+        layer_index: usize,
+        order: u32,
+        kind: u8,
+    },
 }
 
 /// Shared GPU context reference, kept for API compatibility with upstream GPUI.
@@ -143,6 +187,7 @@ pub struct WgpuRenderer {
     backdrop_texture: Option<wgpu::Texture>,
     backdrop_view: Option<wgpu::TextureView>,
     backdrop_size: Option<Size<DevicePixels>>,
+    retained_layers: HashMap<GlobalElementId, WgpuRetainedLayer>,
     rendering_params: RenderingParameters,
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
@@ -432,6 +477,7 @@ impl WgpuRenderer {
             backdrop_texture: None,
             backdrop_view: None,
             backdrop_size: None,
+            retained_layers: HashMap::default(),
             rendering_params,
             dual_source_blending,
             adapter_info,
@@ -784,6 +830,17 @@ impl WgpuRenderer {
             1,
         );
 
+        let retained_layers = create_pipeline(
+            "retained_layers",
+            "vs_retained_layer",
+            "fs_retained_layer",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+        );
+
         let surfaces = create_pipeline(
             "surfaces",
             "vs_surface",
@@ -805,6 +862,7 @@ impl WgpuRenderer {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            retained_layers,
             surfaces,
         }
     }
@@ -1150,6 +1208,323 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        let mut prepared_retained_layers = self.prepare_retained_layers(scene);
+        let retained_instance_bytes =
+            prepared_retained_layers.len() * std::mem::size_of::<RetainedLayerSprite>();
+        let required_capacity = self.required_instance_buffer_size(scene)
+            + prepared_retained_layers
+                .iter()
+                .filter(|layer| layer.cache_valid)
+                .map(|layer| self.required_instance_buffer_size(&layer.scene))
+                .sum::<u64>()
+            + retained_instance_bytes as u64;
+        self.ensure_instance_buffer_capacity(required_capacity);
+
+        {
+            let mut overflow = false;
+
+            for prepared_layer in &mut prepared_retained_layers {
+                if !prepared_layer.cache_valid || !prepared_layer.needs_render {
+                    continue;
+                }
+                let Some(mut cache) = self.retained_layers.remove(&prepared_layer.layer.id) else {
+                    prepared_layer.cache_valid = false;
+                    continue;
+                };
+
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("retained_layer_encoder"),
+                        });
+                let mut instance_offset: u64 = 0;
+
+                self.write_globals(cache.texture_size);
+                let rendered = self.draw_scene_batches(
+                    &prepared_layer.scene,
+                    &mut encoder,
+                    &cache.texture,
+                    &cache.view,
+                    cache.texture_size,
+                    true,
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    &mut instance_offset,
+                );
+                if rendered {
+                    cache.valid = true;
+                    cache.content_revision = prepared_layer.layer.content_revision;
+                    self.queue.submit(std::iter::once(encoder.finish()));
+                }
+                self.retained_layers
+                    .insert(prepared_layer.layer.id.clone(), cache);
+                if !rendered {
+                    prepared_layer.cache_valid = false;
+                    overflow = true;
+                    break;
+                }
+            }
+
+            if !overflow {
+                self.write_globals(self.viewport_size());
+                let excluded_ranges: Vec<_> = prepared_retained_layers
+                    .iter()
+                    .filter(|layer| layer.cache_valid)
+                    .map(|layer| layer.layer.paint_range.clone())
+                    .collect();
+                let main_scene_storage;
+                let main_scene = if excluded_ranges.is_empty() {
+                    scene
+                } else {
+                    main_scene_storage = scene.clone_excluding_paint_ranges(&excluded_ranges);
+                    &main_scene_storage
+                };
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("main_encoder"),
+                        });
+                let mut instance_offset: u64 = 0;
+
+                overflow = !self.draw_main_scene(
+                    main_scene,
+                    &prepared_retained_layers,
+                    &mut encoder,
+                    &frame.texture,
+                    &frame_view,
+                    self.viewport_size(),
+                    self.surface_supports_copy_src,
+                    &mut instance_offset,
+                );
+
+                if !overflow {
+                    self.queue.submit(std::iter::once(encoder.finish()));
+                }
+            }
+
+            if overflow {
+                log::error!(
+                    "precomputed instance buffer size was too small: {}",
+                    self.instance_buffer_capacity
+                );
+                frame.present();
+                return;
+            }
+
+            frame.present();
+        }
+    }
+
+    fn prepare_retained_layers(&mut self, scene: &Scene) -> Vec<PreparedRetainedLayer> {
+        let prepared = Self::top_level_retained_layer_indices(&scene.retained_layers)
+            .iter()
+            .filter_map(|&index| {
+                let layer = scene.retained_layers[index].clone();
+                let texture_size = Self::retained_layer_texture_size(&layer)?;
+                if texture_size.width.0 as u32 > self.max_texture_size
+                    || texture_size.height.0 as u32 > self.max_texture_size
+                {
+                    warn!(
+                        "retained layer {} exceeds maximum texture dimension {}; drawing content normally",
+                        layer.id, self.max_texture_size
+                    );
+                    return None;
+                }
+
+                let layer_scene = scene.clone_paint_range(layer.paint_range.clone());
+                if !layer_scene.backdrop_blurs.is_empty() {
+                    return None;
+                }
+
+                let mut layer_scene = layer_scene;
+                let draw_order = Self::first_draw_order(&layer_scene).unwrap_or(u32::MAX);
+                Self::localize_scene(&mut layer_scene, layer.bounds.origin);
+                let needs_render = self.ensure_retained_layer_texture(&layer, texture_size);
+
+                Some(PreparedRetainedLayer {
+                    layer,
+                    scene: layer_scene,
+                    draw_order,
+                    cache_valid: true,
+                    needs_render,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let active_ids = prepared
+            .iter()
+            .map(|layer| layer.layer.id.clone())
+            .collect::<HashSet<_>>();
+        self.retained_layers.retain(|id, _| active_ids.contains(id));
+
+        prepared
+    }
+
+    fn top_level_retained_layer_indices(layers: &[RetainedLayer]) -> Vec<usize> {
+        let mut indices = (0..layers.len()).collect::<Vec<_>>();
+        indices.sort_by_key(|&index| {
+            let range = &layers[index].paint_range;
+            (range.start, Reverse(range.end), index)
+        });
+
+        let mut accepted: Vec<usize> = Vec::new();
+        for index in indices {
+            let range = &layers[index].paint_range;
+            if accepted
+                .iter()
+                .any(|&accepted| Self::paint_ranges_overlap(range, &layers[accepted].paint_range))
+            {
+                continue;
+            }
+            accepted.push(index);
+        }
+        accepted.sort_unstable();
+        accepted
+    }
+
+    fn paint_ranges_overlap(a: &Range<usize>, b: &Range<usize>) -> bool {
+        a.start < b.end && b.start < a.end
+    }
+
+    fn retained_layer_texture_size(layer: &RetainedLayer) -> Option<Size<DevicePixels>> {
+        if layer.bounds.is_empty() {
+            return None;
+        }
+        Some(Size {
+            width: DevicePixels::from(layer.bounds.size.width).max(DevicePixels(1)),
+            height: DevicePixels::from(layer.bounds.size.height).max(DevicePixels(1)),
+        })
+    }
+
+    fn ensure_retained_layer_texture(
+        &mut self,
+        layer: &RetainedLayer,
+        texture_size: Size<DevicePixels>,
+    ) -> bool {
+        let needs_render = match self.retained_layers.get(&layer.id) {
+            Some(cache) => {
+                !cache.valid
+                    || layer.content_dirty
+                    || cache.content_revision != layer.content_revision
+                    || cache.texture_size != texture_size
+            }
+            None => true,
+        };
+
+        let needs_texture = self
+            .retained_layers
+            .get(&layer.id)
+            .is_none_or(|cache| cache.texture_size != texture_size);
+
+        if needs_texture {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("retained_layer_texture"),
+                size: wgpu::Extent3d {
+                    width: texture_size.width.0.max(1) as u32,
+                    height: texture_size.height.0.max(1) as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.surface_config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            if let Some(old) = self.retained_layers.insert(
+                layer.id.clone(),
+                WgpuRetainedLayer {
+                    texture,
+                    view,
+                    content_revision: layer.content_revision,
+                    texture_size,
+                    valid: false,
+                },
+            ) {
+                old.texture.destroy();
+            }
+        } else if needs_render && let Some(cache) = self.retained_layers.get_mut(&layer.id) {
+            cache.valid = false;
+        }
+
+        needs_render
+    }
+
+    fn localize_scene(scene: &mut Scene, origin: Point<ScaledPixels>) {
+        for quad in &mut scene.quads {
+            quad.bounds = quad.bounds - origin;
+            quad.content_mask.bounds = quad.content_mask.bounds - origin;
+        }
+        for shadow in &mut scene.shadows {
+            shadow.bounds = shadow.bounds - origin;
+            shadow.content_mask.bounds = shadow.content_mask.bounds - origin;
+        }
+        for blur in &mut scene.backdrop_blurs {
+            blur.bounds = blur.bounds - origin;
+            blur.content_mask.bounds = blur.content_mask.bounds - origin;
+        }
+        for path in &mut scene.paths {
+            path.bounds = path.bounds - origin;
+            path.content_mask.bounds = path.content_mask.bounds - origin;
+            for vertex in &mut path.vertices {
+                vertex.xy_position -= origin;
+                vertex.content_mask.bounds = vertex.content_mask.bounds - origin;
+            }
+        }
+        for underline in &mut scene.underlines {
+            underline.bounds = underline.bounds - origin;
+            underline.content_mask.bounds = underline.content_mask.bounds - origin;
+        }
+        for sprite in &mut scene.monochrome_sprites {
+            sprite.bounds = sprite.bounds - origin;
+            sprite.content_mask.bounds = sprite.content_mask.bounds - origin;
+            sprite.transformation = Self::localize_transform(sprite.transformation, origin);
+        }
+        for sprite in &mut scene.subpixel_sprites {
+            sprite.bounds = sprite.bounds - origin;
+            sprite.content_mask.bounds = sprite.content_mask.bounds - origin;
+            sprite.transformation = Self::localize_transform(sprite.transformation, origin);
+        }
+        for sprite in &mut scene.polychrome_sprites {
+            sprite.bounds = sprite.bounds - origin;
+            sprite.content_mask.bounds = sprite.content_mask.bounds - origin;
+        }
+        for surface in &mut scene.surfaces {
+            surface.bounds = surface.bounds - origin;
+            surface.content_mask.bounds = surface.content_mask.bounds - origin;
+        }
+    }
+
+    fn localize_transform(
+        transform: TransformationMatrix,
+        origin: Point<ScaledPixels>,
+    ) -> TransformationMatrix {
+        let origin = [origin.x.0, origin.y.0];
+        TransformationMatrix {
+            rotation_scale: transform.rotation_scale,
+            translation: [
+                transform.rotation_scale[0][0] * origin[0]
+                    + transform.rotation_scale[0][1] * origin[1]
+                    + transform.translation[0]
+                    - origin[0],
+                transform.rotation_scale[1][0] * origin[0]
+                    + transform.rotation_scale[1][1] * origin[1]
+                    + transform.translation[1]
+                    - origin[1],
+            ],
+        }
+    }
+
+    fn first_draw_order(scene: &Scene) -> Option<u32> {
+        scene
+            .batches()
+            .next()
+            .map(|batch| Self::batch_key(scene, &batch).0)
+    }
+
+    fn write_globals(&self, viewport_size: Size<DevicePixels>) {
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
@@ -1157,12 +1532,8 @@ impl WgpuRenderer {
             is_bgr: self.rendering_params.is_bgr as u32,
             _pad: 0,
         };
-
         let globals = GlobalParams {
-            viewport_size: [
-                self.surface_config.width as f32,
-                self.surface_config.height as f32,
-            ],
+            viewport_size: [viewport_size.width.0 as f32, viewport_size.height.0 as f32],
             premultiplied_alpha: if self.surface_config.alpha_mode
                 == wgpu::CompositeAlphaMode::PreMultiplied
             {
@@ -1172,7 +1543,6 @@ impl WgpuRenderer {
             },
             pad: 0,
         };
-
         let path_globals = GlobalParams {
             premultiplied_alpha: 0,
             ..globals
@@ -1190,184 +1560,226 @@ impl WgpuRenderer {
             self.gamma_offset,
             bytemuck::bytes_of(&gamma_params),
         );
+    }
 
-        self.ensure_instance_buffer_capacity(self.required_instance_buffer_size(scene));
+    fn draw_main_scene(
+        &mut self,
+        scene: &Scene,
+        retained_layers: &[PreparedRetainedLayer],
+        encoder: &mut wgpu::CommandEncoder,
+        target_texture: &wgpu::Texture,
+        target_view: &wgpu::TextureView,
+        target_size: Size<DevicePixels>,
+        target_supports_copy_src: bool,
+        instance_offset: &mut u64,
+    ) -> bool {
+        let mut commands = scene
+            .batches()
+            .map(|batch| {
+                let (order, kind) = Self::batch_key(scene, &batch);
+                DrawCommand::Batch { batch, order, kind }
+            })
+            .collect::<Vec<_>>();
 
-        {
-            let mut instance_offset: u64 = 0;
-            let mut overflow = false;
-
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("main_encoder"),
+        for (layer_index, layer) in retained_layers.iter().enumerate() {
+            if layer.cache_valid {
+                commands.push(DrawCommand::RetainedLayer {
+                    layer_index,
+                    order: layer.draw_order,
+                    kind: 9,
                 });
+            }
+        }
 
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("main_pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &frame_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    ..Default::default()
-                });
+        commands.sort_by_key(|command| match command {
+            DrawCommand::Batch { order, kind, .. }
+            | DrawCommand::RetainedLayer { order, kind, .. } => (*order, *kind),
+        });
 
-                for batch in scene.batches() {
-                    let ok = match batch {
-                        PrimitiveBatch::Quads(range) => {
-                            self.draw_quads(&scene.quads[range], &mut instance_offset, &mut pass)
+        self.draw_commands(
+            scene,
+            retained_layers,
+            &commands,
+            encoder,
+            target_texture,
+            target_view,
+            target_size,
+            target_supports_copy_src,
+            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            instance_offset,
+        )
+    }
+
+    fn draw_scene_batches(
+        &mut self,
+        scene: &Scene,
+        encoder: &mut wgpu::CommandEncoder,
+        target_texture: &wgpu::Texture,
+        target_view: &wgpu::TextureView,
+        target_size: Size<DevicePixels>,
+        target_supports_copy_src: bool,
+        load: wgpu::LoadOp<wgpu::Color>,
+        instance_offset: &mut u64,
+    ) -> bool {
+        let commands = scene
+            .batches()
+            .map(|batch| {
+                let (order, kind) = Self::batch_key(scene, &batch);
+                DrawCommand::Batch { batch, order, kind }
+            })
+            .collect::<Vec<_>>();
+        self.draw_commands(
+            scene,
+            &[],
+            &commands,
+            encoder,
+            target_texture,
+            target_view,
+            target_size,
+            target_supports_copy_src,
+            load,
+            instance_offset,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_commands(
+        &mut self,
+        scene: &Scene,
+        retained_layers: &[PreparedRetainedLayer],
+        commands: &[DrawCommand],
+        encoder: &mut wgpu::CommandEncoder,
+        target_texture: &wgpu::Texture,
+        target_view: &wgpu::TextureView,
+        target_size: Size<DevicePixels>,
+        target_supports_copy_src: bool,
+        load: wgpu::LoadOp<wgpu::Color>,
+        instance_offset: &mut u64,
+    ) -> bool {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("main_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+
+        for command in commands {
+            let ok = match command {
+                DrawCommand::Batch { batch, .. } => match batch {
+                    PrimitiveBatch::Quads(range) => {
+                        self.draw_quads(&scene.quads[range.clone()], instance_offset, &mut pass)
+                    }
+                    PrimitiveBatch::Shadows(range) => {
+                        self.draw_shadows(&scene.shadows[range.clone()], instance_offset, &mut pass)
+                    }
+                    PrimitiveBatch::BackdropBlurs(range) => {
+                        let blurs = &scene.backdrop_blurs[range.clone()];
+                        if blurs.is_empty() || !target_supports_copy_src {
+                            continue;
                         }
-                        PrimitiveBatch::Shadows(range) => self.draw_shadows(
-                            &scene.shadows[range],
-                            &mut instance_offset,
-                            &mut pass,
-                        ),
-                        PrimitiveBatch::BackdropBlurs(range) => {
-                            let blurs = &scene.backdrop_blurs[range];
-                            if blurs.is_empty() || !self.surface_supports_copy_src {
-                                continue;
-                            }
+                        let Some(mut scratch_bounds) =
+                            Self::backdrop_scratch_bounds(blurs, target_size)
+                        else {
+                            continue;
+                        };
+                        let Some(texture_size) = self.ensure_backdrop_texture(
+                            scratch_bounds.texture_size,
+                            Self::max_backdrop_texture_size(scratch_bounds, target_size),
+                        ) else {
+                            continue;
+                        };
+                        scratch_bounds.texture_size = texture_size;
+                        let Some(backdrop_texture) = self.backdrop_texture.as_ref() else {
+                            continue;
+                        };
+                        let prepared_blurs = Self::prepare_backdrop_blurs(blurs, scratch_bounds);
+                        drop(pass);
+                        encoder.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: target_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d {
+                                    x: scratch_bounds.bounds.origin.x.0.max(0.0) as u32,
+                                    y: scratch_bounds.bounds.origin.y.0.max(0.0) as u32,
+                                    z: 0,
+                                },
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: backdrop_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::Extent3d {
+                                width: scratch_bounds.texture_size.width.0 as u32,
+                                height: scratch_bounds.texture_size.height.0 as u32,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("main_pass_backdrop"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: target_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+                        self.draw_backdrop_blurs(&prepared_blurs, instance_offset, &mut pass)
+                    }
+                    PrimitiveBatch::Paths(range) => {
+                        let paths = &scene.paths[range.clone()];
+                        if paths.is_empty() {
+                            continue;
+                        }
+
+                        let viewport_size = target_size;
+                        drop(pass);
+
+                        let path_ranges: Vec<_> =
+                            (0..paths.len()).map(|index| index..index + 1).collect();
+                        let mut ok = true;
+
+                        for path_range in path_ranges {
+                            let paths = &paths[path_range];
                             let Some(mut scratch_bounds) =
-                                Self::backdrop_scratch_bounds(blurs, self.viewport_size())
+                                Self::path_scratch_bounds(paths, viewport_size)
                             else {
                                 continue;
                             };
-                            let Some(texture_size) = self.ensure_backdrop_texture(
-                                scratch_bounds.texture_size,
-                                Self::max_backdrop_texture_size(
-                                    scratch_bounds,
-                                    self.viewport_size(),
-                                ),
-                            ) else {
-                                continue;
+                            let Some(texture_size) =
+                                self.ensure_intermediate_textures(scratch_bounds.texture_size)
+                            else {
+                                ok = false;
+                                break;
                             };
                             scratch_bounds.texture_size = texture_size;
-                            let Some(backdrop_texture) = self.backdrop_texture.as_ref() else {
-                                continue;
-                            };
-                            let prepared_blurs =
-                                Self::prepare_backdrop_blurs(blurs, scratch_bounds);
-                            drop(pass);
-                            encoder.copy_texture_to_texture(
-                                wgpu::TexelCopyTextureInfo {
-                                    texture: &frame.texture,
-                                    mip_level: 0,
-                                    origin: wgpu::Origin3d {
-                                        x: scratch_bounds.bounds.origin.x.0 as u32,
-                                        y: scratch_bounds.bounds.origin.y.0 as u32,
-                                        z: 0,
-                                    },
-                                    aspect: wgpu::TextureAspect::All,
-                                },
-                                wgpu::TexelCopyTextureInfo {
-                                    texture: backdrop_texture,
-                                    mip_level: 0,
-                                    origin: wgpu::Origin3d::ZERO,
-                                    aspect: wgpu::TextureAspect::All,
-                                },
-                                wgpu::Extent3d {
-                                    width: scratch_bounds.texture_size.width.0 as u32,
-                                    height: scratch_bounds.texture_size.height.0 as u32,
-                                    depth_or_array_layers: 1,
-                                },
+
+                            let did_draw = self.draw_paths_to_intermediate(
+                                encoder,
+                                paths,
+                                scratch_bounds,
+                                instance_offset,
                             );
-                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("main_pass_backdrop"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &frame_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Load,
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                    depth_slice: None,
-                                })],
-                                depth_stencil_attachment: None,
-                                ..Default::default()
-                            });
-                            self.draw_backdrop_blurs(
-                                &prepared_blurs,
-                                &mut instance_offset,
-                                &mut pass,
-                            )
-                        }
-                        PrimitiveBatch::Paths(range) => {
-                            let paths = &scene.paths[range];
-                            if paths.is_empty() {
-                                continue;
-                            }
-
-                            let viewport_size = Size {
-                                width: DevicePixels(self.surface_config.width as i32),
-                                height: DevicePixels(self.surface_config.height as i32),
-                            };
-                            drop(pass);
-
-                            let path_ranges: Vec<_> =
-                                (0..paths.len()).map(|index| index..index + 1).collect();
-                            let mut ok = true;
-
-                            for path_range in path_ranges {
-                                let paths = &paths[path_range];
-                                let Some(mut scratch_bounds) =
-                                    Self::path_scratch_bounds(paths, viewport_size)
-                                else {
-                                    continue;
-                                };
-                                let Some(texture_size) =
-                                    self.ensure_intermediate_textures(scratch_bounds.texture_size)
-                                else {
-                                    ok = false;
-                                    break;
-                                };
-                                scratch_bounds.texture_size = texture_size;
-
-                                let did_draw = self.draw_paths_to_intermediate(
-                                    &mut encoder,
-                                    paths,
-                                    scratch_bounds,
-                                    &mut instance_offset,
-                                );
-
-                                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                    label: Some("main_pass_continued"),
-                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                        view: &frame_view,
-                                        resolve_target: None,
-                                        ops: wgpu::Operations {
-                                            load: wgpu::LoadOp::Load,
-                                            store: wgpu::StoreOp::Store,
-                                        },
-                                        depth_slice: None,
-                                    })],
-                                    depth_stencil_attachment: None,
-                                    ..Default::default()
-                                });
-
-                                ok = did_draw
-                                    && self.draw_paths_from_intermediate(
-                                        paths,
-                                        scratch_bounds,
-                                        &mut instance_offset,
-                                        &mut pass,
-                                    );
-                                drop(pass);
-                                if !ok {
-                                    break;
-                                }
-                            }
 
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: &frame_view,
+                                    view: target_view,
                                     resolve_target: None,
                                     ops: wgpu::Operations {
                                         load: wgpu::LoadOp::Load,
@@ -1378,59 +1790,123 @@ impl WgpuRenderer {
                                 depth_stencil_attachment: None,
                                 ..Default::default()
                             });
-                            ok
+
+                            ok = did_draw
+                                && self.draw_paths_from_intermediate(
+                                    paths,
+                                    scratch_bounds,
+                                    instance_offset,
+                                    &mut pass,
+                                );
+                            drop(pass);
+                            if !ok {
+                                break;
+                            }
                         }
-                        PrimitiveBatch::Underlines(range) => self.draw_underlines(
-                            &scene.underlines[range],
-                            &mut instance_offset,
+
+                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("main_pass_continued"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: target_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+                        ok
+                    }
+                    PrimitiveBatch::Underlines(range) => self.draw_underlines(
+                        &scene.underlines[range.clone()],
+                        instance_offset,
+                        &mut pass,
+                    ),
+                    PrimitiveBatch::MonochromeSprites { texture_id, range } => self
+                        .draw_monochrome_sprites(
+                            &scene.monochrome_sprites[range.clone()],
+                            *texture_id,
+                            instance_offset,
                             &mut pass,
                         ),
-                        PrimitiveBatch::MonochromeSprites { texture_id, range } => self
-                            .draw_monochrome_sprites(
-                                &scene.monochrome_sprites[range],
-                                texture_id,
-                                &mut instance_offset,
-                                &mut pass,
-                            ),
-                        PrimitiveBatch::SubpixelSprites { texture_id, range } => self
-                            .draw_subpixel_sprites(
-                                &scene.subpixel_sprites[range],
-                                texture_id,
-                                &mut instance_offset,
-                                &mut pass,
-                            ),
-                        PrimitiveBatch::PolychromeSprites { texture_id, range } => self
-                            .draw_polychrome_sprites(
-                                &scene.polychrome_sprites[range],
-                                texture_id,
-                                &mut instance_offset,
-                                &mut pass,
-                            ),
-                        PrimitiveBatch::Surfaces(_surfaces) => {
-                            // Surfaces are macOS-only for video playback
-                            // Not implemented for Linux/wgpu
-                            true
-                        }
+                    PrimitiveBatch::SubpixelSprites { texture_id, range } => self
+                        .draw_subpixel_sprites(
+                            &scene.subpixel_sprites[range.clone()],
+                            *texture_id,
+                            instance_offset,
+                            &mut pass,
+                        ),
+                    PrimitiveBatch::PolychromeSprites { texture_id, range } => self
+                        .draw_polychrome_sprites(
+                            &scene.polychrome_sprites[range.clone()],
+                            *texture_id,
+                            instance_offset,
+                            &mut pass,
+                        ),
+                    PrimitiveBatch::Surfaces(_surfaces) => true,
+                },
+                DrawCommand::RetainedLayer { layer_index, .. } => {
+                    let layer = &retained_layers[*layer_index].layer;
+                    let Some(cache) = self.retained_layers.get(&layer.id) else {
+                        continue;
                     };
-                    if !ok {
-                        overflow = true;
-                        break;
-                    }
+                    self.draw_retained_layer(layer, &cache.view, instance_offset, &mut pass)
                 }
+            };
+            if !ok {
+                return false;
             }
+        }
 
-            if overflow {
-                drop(encoder);
-                log::error!(
-                    "precomputed instance buffer size was too small: {}",
-                    self.instance_buffer_capacity
-                );
-                frame.present();
-                return;
+        drop(pass);
+        true
+    }
+
+    fn draw_retained_layer(
+        &self,
+        layer: &RetainedLayer,
+        texture_view: &wgpu::TextureView,
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        let sprite = RetainedLayerSprite {
+            bounds: layer.bounds,
+            content_mask: layer.content_mask.clone(),
+            transformation: layer.transform,
+            opacity: layer.opacity.clamp(0.0, 1.0),
+            pad: [0.0; 3],
+        };
+        let data = unsafe { Self::instance_bytes(std::slice::from_ref(&sprite)) };
+        self.draw_instances_with_texture(
+            data,
+            1,
+            texture_view,
+            &self.pipelines.retained_layers,
+            instance_offset,
+            pass,
+        )
+    }
+
+    fn batch_key(scene: &Scene, batch: &PrimitiveBatch) -> (u32, u8) {
+        match batch {
+            PrimitiveBatch::Shadows(range) => (scene.shadows[range.start].order, 0),
+            PrimitiveBatch::BackdropBlurs(range) => (scene.backdrop_blurs[range.start].order, 1),
+            PrimitiveBatch::Quads(range) => (scene.quads[range.start].order, 2),
+            PrimitiveBatch::Paths(range) => (scene.paths[range.start].order, 3),
+            PrimitiveBatch::Underlines(range) => (scene.underlines[range.start].order, 4),
+            PrimitiveBatch::MonochromeSprites { range, .. } => {
+                (scene.monochrome_sprites[range.start].order, 5)
             }
-
-            self.queue.submit(std::iter::once(encoder.finish()));
-            frame.present();
+            PrimitiveBatch::SubpixelSprites { range, .. } => {
+                (scene.subpixel_sprites[range.start].order, 6)
+            }
+            PrimitiveBatch::PolychromeSprites { range, .. } => {
+                (scene.polychrome_sprites[range.start].order, 7)
+            }
+            PrimitiveBatch::Surfaces(range) => (scene.surfaces[range.start].order, 8),
         }
     }
 
@@ -2005,6 +2481,9 @@ impl WgpuRenderer {
         self.backdrop_texture = None;
         self.backdrop_view = None;
         self.backdrop_size = None;
+        for (_, layer) in self.retained_layers.drain() {
+            layer.texture.destroy();
+        }
     }
 
     /// Returns true if the GPU device was lost and recovery is needed.

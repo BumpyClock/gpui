@@ -996,6 +996,46 @@ fragment float4 path_sprite_fragment(
   return intermediate_texture.sample(intermediate_texture_sampler, input.texture_coords);
 }
 
+struct RetainedLayerVertexOutput {
+  float4 position [[position]];
+  float2 texture_coords;
+  float clip_distance [[clip_distance]][4];
+};
+
+struct RetainedLayerFragmentInput {
+  float4 position [[position]];
+  float2 texture_coords;
+};
+
+vertex RetainedLayerVertexOutput retained_layer_vertex(
+  uint unit_vertex_id [[vertex_id]],
+  constant float2 *unit_vertices [[buffer(RetainedLayerInputIndex_Vertices)]],
+  constant RetainedLayerSprite *layer [[buffer(RetainedLayerInputIndex_Layer)]],
+  constant Size_DevicePixels *viewport_size [[buffer(RetainedLayerInputIndex_ViewportSize)]]
+) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  RetainedLayerSprite sprite = layer[0];
+  float4 device_position =
+      to_device_position_transformed(unit_vertex, sprite.bounds, sprite.transform, viewport_size);
+  float4 clip_distance = distance_from_clip_rect_transformed(
+      unit_vertex, sprite.bounds, sprite.content_mask.bounds, sprite.transform);
+
+  return RetainedLayerVertexOutput{
+    device_position,
+    unit_vertex,
+    {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}
+  };
+}
+
+fragment float4 retained_layer_fragment(
+  RetainedLayerFragmentInput input [[stage_in]],
+  texture2d<float> layer_texture [[texture(RetainedLayerInputIndex_LayerTexture)]],
+  constant RetainedLayerSprite *layer [[buffer(RetainedLayerInputIndex_Layer)]]
+) {
+  constexpr sampler layer_texture_sampler(mag_filter::linear, min_filter::linear);
+  return layer_texture.sample(layer_texture_sampler, input.texture_coords) * layer[0].opacity;
+}
+
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;

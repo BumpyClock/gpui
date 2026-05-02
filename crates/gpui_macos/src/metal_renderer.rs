@@ -7,9 +7,10 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite,
-    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
-    Size, Surface, Underline, point, size,
+    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, GlobalElementId,
+    MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
+    RetainedLayer, RetainedLayerContentRevision, ScaledPixels, Scene, Shadow, Size, Surface,
+    TransformationMatrix, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -27,7 +28,7 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{cell::Cell, collections::HashMap, ffi::c_void, mem, ptr, sync::Arc};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -175,6 +176,7 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    retained_layer_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -188,6 +190,7 @@ pub(crate) struct MetalRenderer {
     backdrop_blur_level_sizes: Vec<Size<DevicePixels>>,
     backdrop_blur_downsample_textures: Vec<metal::Texture>,
     backdrop_blur_upsample_textures: Vec<metal::Texture>,
+    retained_layers: HashMap<GlobalElementId, CachedRetainedLayer>,
     path_sample_count: u32,
 }
 
@@ -220,6 +223,22 @@ struct BackdropBlurParams {
     pad: f32,
 }
 
+struct CachedRetainedLayer {
+    content_revision: RetainedLayerContentRevision,
+    texture_size: Size<DevicePixels>,
+    texture: metal::Texture,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[repr(C)]
+pub struct RetainedLayerSprite {
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub transform: TransformationMatrix,
+    pub opacity: f32,
+    pub pad: [f32; 3],
+}
+
 impl MetalRenderer {
     pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
@@ -248,7 +267,7 @@ impl MetalRenderer {
         // Support direct-to-display rendering if the window is not transparent
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
-        layer.set_maximum_drawable_count(3);
+        layer.set_maximum_drawable_count(2);
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "test-support"))]
         layer.set_framebuffer_only(false);
@@ -380,6 +399,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let retained_layer_pipeline_state = build_path_sprite_pipeline_state(
+            &device,
+            &library,
+            "retained_layers",
+            "retained_layer_vertex",
+            "retained_layer_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone()));
@@ -402,6 +429,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            retained_layer_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -414,6 +442,7 @@ impl MetalRenderer {
             backdrop_blur_level_sizes: Vec::new(),
             backdrop_blur_downsample_textures: Vec::new(),
             backdrop_blur_upsample_textures: Vec::new(),
+            retained_layers: HashMap::default(),
             path_sample_count: PATH_SAMPLE_COUNT,
         }
     }
@@ -449,6 +478,7 @@ impl MetalRenderer {
         }
         self.discard_path_intermediate_textures();
         self.discard_backdrop_textures();
+        self.retained_layers.clear();
     }
 
     fn discard_path_intermediate_textures(&mut self) {
@@ -648,8 +678,7 @@ impl MetalRenderer {
             .lock()
             .acquire(&self.device, required_instance_buffer_size);
 
-        let command_buffer =
-            self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
+        let command_buffer = self.draw_scene(scene, &mut instance_buffer, drawable, viewport_size);
 
         match command_buffer {
             Ok(command_buffer) => {
@@ -702,7 +731,7 @@ impl MetalRenderer {
             .acquire(&self.device, required_instance_buffer_size);
 
         let command_buffer =
-            match self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size) {
+            match self.draw_scene(scene, &mut instance_buffer, drawable, viewport_size) {
                 Ok(command_buffer) => command_buffer,
                 Err(err) => {
                     self.instance_buffer_pool.lock().release(instance_buffer);
@@ -796,10 +825,13 @@ impl MetalRenderer {
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
+        for _ in &scene.retained_layers {
+            add_instance_bytes::<RetainedLayerSprite>(&mut size, 1);
+        }
         size
     }
 
-    fn draw_primitives(
+    fn draw_scene(
         &mut self,
         scene: &Scene,
         instance_buffer: &mut InstanceBuffer,
@@ -811,13 +843,380 @@ impl MetalRenderer {
         let alpha = if self.layer.is_opaque() { 1. } else { 0. };
         let mut instance_offset = 0;
 
-        let mut command_encoder = new_command_encoder(
+        let retained_layers = Self::retained_layers_for_scene(scene);
+        if retained_layers.is_empty() {
+            self.draw_primitives(
+                &command_buffer,
+                drawable.texture(),
+                scene,
+                instance_buffer,
+                &mut instance_offset,
+                viewport_size,
+                metal::MTLLoadAction::Clear,
+                alpha,
+            )?;
+            self.flush_instance_buffer(instance_buffer, instance_offset);
+            return Ok(command_buffer.to_owned());
+        }
+
+        let mut cursor = 0;
+        let mut load_action = metal::MTLLoadAction::Clear;
+        for layer in &retained_layers {
+            if cursor < layer.paint_range.start {
+                self.draw_scene_range(
+                    &command_buffer,
+                    drawable.texture(),
+                    scene,
+                    cursor..layer.paint_range.start,
+                    instance_buffer,
+                    &mut instance_offset,
+                    viewport_size,
+                    load_action,
+                    alpha,
+                )?;
+                load_action = metal::MTLLoadAction::Load;
+            }
+
+            let texture = self.retained_layer_texture(
+                &command_buffer,
+                scene,
+                layer,
+                instance_buffer,
+                &mut instance_offset,
+            )?;
+            self.draw_retained_layer(
+                &command_buffer,
+                drawable.texture(),
+                layer,
+                &texture,
+                instance_buffer,
+                &mut instance_offset,
+                viewport_size,
+                load_action,
+                alpha,
+            )?;
+            load_action = metal::MTLLoadAction::Load;
+            cursor = layer.paint_range.end;
+        }
+
+        if cursor < scene.len() {
+            self.draw_scene_range(
+                &command_buffer,
+                drawable.texture(),
+                scene,
+                cursor..scene.len(),
+                instance_buffer,
+                &mut instance_offset,
+                viewport_size,
+                load_action,
+                alpha,
+            )?;
+        }
+
+        self.retained_layers
+            .retain(|id, _| retained_layers.iter().any(|layer| &layer.id == id));
+
+        self.flush_instance_buffer(instance_buffer, instance_offset);
+        Ok(command_buffer.to_owned())
+    }
+
+    fn flush_instance_buffer(&self, instance_buffer: &InstanceBuffer, length: usize) {
+        if instance_buffer.managed {
+            instance_buffer.metal_buffer.did_modify_range(NSRange {
+                location: 0,
+                length: length as NSUInteger,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_scene_range(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        target_texture: &metal::TextureRef,
+        scene: &Scene,
+        range: std::ops::Range<usize>,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        load_action: metal::MTLLoadAction,
+        clear_alpha: f64,
+    ) -> Result<()> {
+        if range.is_empty() {
+            return Ok(());
+        }
+
+        let mut range_scene = Scene::default();
+        range_scene.replay(range, scene);
+        range_scene.finish();
+        self.draw_primitives(
             command_buffer,
-            drawable,
+            target_texture,
+            &range_scene,
+            instance_buffer,
+            instance_offset,
+            viewport_size,
+            load_action,
+            clear_alpha,
+        )
+    }
+
+    fn retained_layers_for_scene(scene: &Scene) -> Vec<&RetainedLayer> {
+        let mut layers = scene
+            .retained_layers
+            .iter()
+            .filter(|layer| layer.paint_range.start < layer.paint_range.end)
+            .filter(|layer| layer.paint_range.end <= scene.len())
+            .filter(|layer| !layer.bounds.is_empty())
+            .filter(|layer| !Self::retained_layer_contains_backdrop_blurs(scene, layer))
+            .collect::<Vec<_>>();
+        layers.sort_by(|a, b| {
+            a.paint_range
+                .start
+                .cmp(&b.paint_range.start)
+                .then_with(|| b.paint_range.end.cmp(&a.paint_range.end))
+        });
+
+        let mut cursor = 0;
+        layers
+            .into_iter()
+            .filter(|layer| {
+                if layer.paint_range.start < cursor {
+                    return false;
+                }
+                cursor = layer.paint_range.end;
+                true
+            })
+            .collect()
+    }
+
+    fn retained_layer_contains_backdrop_blurs(scene: &Scene, layer: &RetainedLayer) -> bool {
+        !Self::retained_layer_scene(scene, layer)
+            .backdrop_blurs
+            .is_empty()
+    }
+
+    fn retained_layer_scene(scene: &Scene, layer: &RetainedLayer) -> Scene {
+        let mut layer_scene = Scene::default();
+        layer_scene.replay(layer.paint_range.clone(), scene);
+        layer_scene.finish();
+        layer_scene
+    }
+
+    fn retained_layer_texture_size(layer: &RetainedLayer) -> Size<DevicePixels> {
+        size(
+            layer.bounds.size.width.into(),
+            layer.bounds.size.height.into(),
+        )
+    }
+
+    fn localize_retained_layer_scene(scene: &mut Scene, origin: Point<ScaledPixels>) {
+        for shadow in &mut scene.shadows {
+            Self::localize_bounds(&mut shadow.bounds, origin);
+            Self::localize_content_mask(&mut shadow.content_mask, origin);
+        }
+        for blur in &mut scene.backdrop_blurs {
+            Self::localize_bounds(&mut blur.bounds, origin);
+            Self::localize_content_mask(&mut blur.content_mask, origin);
+        }
+        for quad in &mut scene.quads {
+            Self::localize_bounds(&mut quad.bounds, origin);
+            Self::localize_content_mask(&mut quad.content_mask, origin);
+        }
+        for path in &mut scene.paths {
+            Self::localize_bounds(&mut path.bounds, origin);
+            Self::localize_content_mask(&mut path.content_mask, origin);
+            for vertex in &mut path.vertices {
+                vertex.xy_position = vertex.xy_position - origin;
+                Self::localize_content_mask(&mut vertex.content_mask, origin);
+            }
+        }
+        for underline in &mut scene.underlines {
+            Self::localize_bounds(&mut underline.bounds, origin);
+            Self::localize_content_mask(&mut underline.content_mask, origin);
+        }
+        for sprite in &mut scene.monochrome_sprites {
+            Self::localize_bounds(&mut sprite.bounds, origin);
+            Self::localize_content_mask(&mut sprite.content_mask, origin);
+            sprite.transformation = Self::localize_transformation(sprite.transformation, origin);
+        }
+        for sprite in &mut scene.subpixel_sprites {
+            Self::localize_bounds(&mut sprite.bounds, origin);
+            Self::localize_content_mask(&mut sprite.content_mask, origin);
+            sprite.transformation = Self::localize_transformation(sprite.transformation, origin);
+        }
+        for sprite in &mut scene.polychrome_sprites {
+            Self::localize_bounds(&mut sprite.bounds, origin);
+            Self::localize_content_mask(&mut sprite.content_mask, origin);
+        }
+        for surface in &mut scene.surfaces {
+            Self::localize_bounds(&mut surface.bounds, origin);
+            Self::localize_content_mask(&mut surface.content_mask, origin);
+        }
+    }
+
+    fn localize_bounds(bounds: &mut Bounds<ScaledPixels>, origin: Point<ScaledPixels>) {
+        *bounds = *bounds - origin;
+    }
+
+    fn localize_content_mask(
+        content_mask: &mut ContentMask<ScaledPixels>,
+        origin: Point<ScaledPixels>,
+    ) {
+        Self::localize_bounds(&mut content_mask.bounds, origin);
+    }
+
+    fn localize_transformation(
+        mut transformation: TransformationMatrix,
+        origin: Point<ScaledPixels>,
+    ) -> TransformationMatrix {
+        let x = origin.x.0;
+        let y = origin.y.0;
+        transformation.translation[0] +=
+            transformation.rotation_scale[0][0] * x + transformation.rotation_scale[0][1] * y - x;
+        transformation.translation[1] +=
+            transformation.rotation_scale[1][0] * x + transformation.rotation_scale[1][1] * y - y;
+        transformation
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retained_layer_texture(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        scene: &Scene,
+        layer: &RetainedLayer,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+    ) -> Result<metal::Texture> {
+        let texture_size = Self::retained_layer_texture_size(layer);
+        let cache_is_valid = self
+            .retained_layers
+            .get(&layer.id)
+            .map(|cached| {
+                !layer.content_dirty
+                    && cached.content_revision == layer.content_revision
+                    && cached.texture_size == texture_size
+            })
+            .unwrap_or(false);
+
+        if !cache_is_valid {
+            let texture = self.create_retained_layer_texture(texture_size)?;
+            let mut layer_scene = Self::retained_layer_scene(scene, layer);
+            Self::localize_retained_layer_scene(&mut layer_scene, layer.bounds.origin);
+            self.draw_primitives(
+                command_buffer,
+                &texture,
+                &layer_scene,
+                instance_buffer,
+                instance_offset,
+                texture_size,
+                metal::MTLLoadAction::Clear,
+                0.0,
+            )?;
+            self.retained_layers.insert(
+                layer.id.clone(),
+                CachedRetainedLayer {
+                    content_revision: layer.content_revision,
+                    texture_size,
+                    texture,
+                },
+            );
+        }
+
+        Ok(self
+            .retained_layers
+            .get(&layer.id)
+            .expect("retained layer cache should exist")
+            .texture
+            .clone())
+    }
+
+    fn create_retained_layer_texture(&self, size: Size<DevicePixels>) -> Result<metal::Texture> {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            anyhow::bail!("retained layer texture size must be non-zero");
+        }
+
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(size.width.0 as u64);
+        texture_descriptor.set_height(size.height.0 as u64);
+        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        texture_descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        Ok(self.device.new_texture(&texture_descriptor))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_retained_layer(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        target_texture: &metal::TextureRef,
+        layer: &RetainedLayer,
+        texture: &metal::TextureRef,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        load_action: metal::MTLLoadAction,
+        clear_alpha: f64,
+    ) -> Result<()> {
+        let command_encoder = new_command_encoder(
+            command_buffer,
+            target_texture,
             viewport_size,
             |color_attachment| {
-                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-                color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
+                color_attachment.set_load_action(load_action);
+                if matches!(load_action, metal::MTLLoadAction::Clear) {
+                    color_attachment.set_clear_color(metal::MTLClearColor::new(
+                        0.,
+                        0.,
+                        0.,
+                        clear_alpha,
+                    ));
+                }
+            },
+        );
+
+        let ok = self.draw_retained_layer_texture(
+            layer,
+            texture,
+            instance_buffer,
+            instance_offset,
+            viewport_size,
+            command_encoder,
+        );
+        command_encoder.end_encoding();
+        if !ok {
+            anyhow::bail!("scene too large for retained layer composite");
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_primitives(
+        &mut self,
+        command_buffer: &metal::CommandBufferRef,
+        target_texture: &metal::TextureRef,
+        scene: &Scene,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        load_action: metal::MTLLoadAction,
+        clear_alpha: f64,
+    ) -> Result<()> {
+        let mut command_encoder = new_command_encoder(
+            command_buffer,
+            target_texture,
+            viewport_size,
+            |color_attachment| {
+                color_attachment.set_load_action(load_action);
+                if matches!(load_action, metal::MTLLoadAction::Clear) {
+                    color_attachment.set_clear_color(metal::MTLClearColor::new(
+                        0.,
+                        0.,
+                        0.,
+                        clear_alpha,
+                    ));
+                }
             },
         );
 
@@ -826,7 +1225,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(
                     &scene.shadows[range],
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
@@ -836,7 +1235,7 @@ impl MetalRenderer {
                     if blurs.is_empty() {
                         command_encoder = new_command_encoder(
                             command_buffer,
-                            drawable,
+                            target_texture,
                             viewport_size,
                             |color_attachment| {
                                 color_attachment.set_load_action(metal::MTLLoadAction::Load);
@@ -849,7 +1248,7 @@ impl MetalRenderer {
                         else {
                             command_encoder = new_command_encoder(
                                 command_buffer,
-                                drawable,
+                                target_texture,
                                 viewport_size,
                                 |color_attachment| {
                                     color_attachment.set_load_action(metal::MTLLoadAction::Load);
@@ -865,9 +1264,9 @@ impl MetalRenderer {
                         }
                         let prepared_blurs = Self::prepare_backdrop_blurs(blurs, scratch_bounds);
                         let did_copy = self.backdrop_texture.is_some()
-                            && self.copy_drawable_to_backdrop(
+                            && self.copy_texture_to_backdrop(
                                 command_buffer,
-                                drawable,
+                                target_texture,
                                 scratch_bounds,
                             );
                         let mut ok = true;
@@ -900,7 +1299,7 @@ impl MetalRenderer {
                                 };
                                 command_encoder = new_command_encoder(
                                     command_buffer,
-                                    drawable,
+                                    target_texture,
                                     viewport_size,
                                     |color_attachment| {
                                         color_attachment
@@ -915,7 +1314,7 @@ impl MetalRenderer {
                                 ok = self.draw_backdrop_blurs(
                                     &prepared_blurs[start..end],
                                     instance_buffer,
-                                    &mut instance_offset,
+                                    instance_offset,
                                     viewport_size,
                                     command_encoder,
                                     blur_texture,
@@ -932,7 +1331,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Quads(range) => self.draw_quads(
                     &scene.quads[range],
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
@@ -942,7 +1341,7 @@ impl MetalRenderer {
                     if paths.is_empty() {
                         command_encoder = new_command_encoder(
                             command_buffer,
-                            drawable,
+                            target_texture,
                             viewport_size,
                             |color_attachment| {
                                 color_attachment.set_load_action(metal::MTLLoadAction::Load);
@@ -970,7 +1369,7 @@ impl MetalRenderer {
                                 paths,
                                 scratch_bounds,
                                 instance_buffer,
-                                &mut instance_offset,
+                                instance_offset,
                                 command_buffer,
                             )
                         } else {
@@ -979,7 +1378,7 @@ impl MetalRenderer {
 
                         command_encoder = new_command_encoder(
                             command_buffer,
-                            drawable,
+                            target_texture,
                             viewport_size,
                             |color_attachment| {
                                 color_attachment.set_load_action(metal::MTLLoadAction::Load);
@@ -991,7 +1390,7 @@ impl MetalRenderer {
                                 paths,
                                 scratch_bounds,
                                 instance_buffer,
-                                &mut instance_offset,
+                                instance_offset,
                                 viewport_size,
                                 command_encoder,
                             );
@@ -1003,7 +1402,7 @@ impl MetalRenderer {
                     }
                     command_encoder = new_command_encoder(
                         command_buffer,
-                        drawable,
+                        target_texture,
                         viewport_size,
                         |color_attachment| {
                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
@@ -1014,7 +1413,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(
                     &scene.underlines[range],
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
@@ -1023,7 +1422,7 @@ impl MetalRenderer {
                         texture_id,
                         &scene.monochrome_sprites[range],
                         instance_buffer,
-                        &mut instance_offset,
+                        instance_offset,
                         viewport_size,
                         command_encoder,
                     ),
@@ -1032,14 +1431,14 @@ impl MetalRenderer {
                         texture_id,
                         &scene.polychrome_sprites[range],
                         instance_buffer,
-                        &mut instance_offset,
+                        instance_offset,
                         viewport_size,
                         command_encoder,
                     ),
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(
                     &scene.surfaces[range],
                     instance_buffer,
-                    &mut instance_offset,
+                    instance_offset,
                     viewport_size,
                     command_encoder,
                 ),
@@ -1066,16 +1465,16 @@ impl MetalRenderer {
         if instance_buffer.managed {
             instance_buffer.metal_buffer.did_modify_range(NSRange {
                 location: 0,
-                length: instance_offset as NSUInteger,
+                length: *instance_offset as NSUInteger,
             });
         }
-        Ok(command_buffer.to_owned())
+        Ok(())
     }
 
-    fn copy_drawable_to_backdrop(
+    fn copy_texture_to_backdrop(
         &self,
         command_buffer: &metal::CommandBufferRef,
-        drawable: &metal::MetalDrawableRef,
+        source_texture: &metal::TextureRef,
         scratch_bounds: BackdropScratchBounds,
     ) -> bool {
         let Some(backdrop_texture) = &self.backdrop_texture else {
@@ -1095,7 +1494,7 @@ impl MetalRenderer {
             depth: 1,
         };
         blit_encoder.copy_from_texture(
-            drawable.texture(),
+            source_texture,
             0,
             0,
             source_origin,
@@ -2014,11 +2413,66 @@ impl MetalRenderer {
         }
         true
     }
+
+    fn draw_retained_layer_texture(
+        &mut self,
+        layer: &RetainedLayer,
+        texture: &metal::TextureRef,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        align_offset(instance_offset);
+        let next_offset = *instance_offset + mem::size_of::<RetainedLayerSprite>();
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+
+        command_encoder.set_render_pipeline_state(&self.retained_layer_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            RetainedLayerInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            RetainedLayerInputIndex::Layer as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            RetainedLayerInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder
+            .set_fragment_texture(RetainedLayerInputIndex::LayerTexture as u64, Some(texture));
+
+        unsafe {
+            let buffer_contents = (instance_buffer.metal_buffer.contents() as *mut u8)
+                .add(*instance_offset)
+                as *mut RetainedLayerSprite;
+            ptr::write(
+                buffer_contents,
+                RetainedLayerSprite {
+                    bounds: layer.bounds,
+                    content_mask: layer.content_mask.clone(),
+                    transform: layer.transform,
+                    opacity: layer.opacity.clamp(0.0, 1.0),
+                    pad: [0.0; 3],
+                },
+            );
+        }
+
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        *instance_offset = next_offset;
+        true
+    }
 }
 
 fn new_command_encoder<'a>(
     command_buffer: &'a metal::CommandBufferRef,
-    drawable: &'a metal::MetalDrawableRef,
+    target_texture: &'a metal::TextureRef,
     viewport_size: Size<DevicePixels>,
     configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
 ) -> &'a metal::RenderCommandEncoderRef {
@@ -2027,7 +2481,7 @@ fn new_command_encoder<'a>(
         .color_attachments()
         .object_at(0)
         .unwrap();
-    color_attachment.set_texture(Some(drawable.texture()));
+    color_attachment.set_texture(Some(target_texture));
     color_attachment.set_store_action(metal::MTLStoreAction::Store);
     configure_color_attachment(color_attachment);
 
@@ -2216,6 +2670,14 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+}
+
+#[repr(C)]
+enum RetainedLayerInputIndex {
+    Vertices = 0,
+    Layer = 1,
+    ViewportSize = 2,
+    LayerTexture = 3,
 }
 
 #[repr(C)]

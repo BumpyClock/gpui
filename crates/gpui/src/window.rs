@@ -839,6 +839,12 @@ pub(crate) struct PaintIndex {
     line_layout_index: LineLayoutIndex,
 }
 
+impl PaintIndex {
+    pub(crate) fn scene_index(&self) -> usize {
+        self.scene_index
+    }
+}
+
 impl Frame {
     pub(crate) fn new(dispatch_tree: DispatchTree) -> Self {
         Frame {

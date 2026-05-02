@@ -1220,6 +1220,51 @@ fn fs_path(input: PathVarying) -> @location(0) vec4<f32> {
     return sample;
 }
 
+// --- retained layers --- //
+
+struct RetainedLayerSprite {
+    bounds: Bounds,
+    content_mask: Bounds,
+    transformation: TransformationMatrix,
+    opacity: f32,
+    pad0: f32,
+    pad1: f32,
+    pad2: f32,
+}
+@group(1) @binding(0) var<storage, read> b_retained_layers: array<RetainedLayerSprite>;
+
+struct RetainedLayerVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) texture_coords: vec2<f32>,
+    @location(1) clip_distances: vec4<f32>,
+    @location(2) @interpolate(flat) opacity: f32,
+}
+
+@vertex
+fn vs_retained_layer(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> RetainedLayerVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let layer = b_retained_layers[instance_id];
+
+    var out = RetainedLayerVarying();
+    out.position = to_device_position_transformed(unit_vertex, layer.bounds, layer.transformation);
+    out.texture_coords = unit_vertex;
+    out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, layer.bounds, layer.content_mask, layer.transformation);
+    out.opacity = layer.opacity;
+    return out;
+}
+
+@fragment
+fn fs_retained_layer(input: RetainedLayerVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let sample = textureSample(t_sprite, s_sprite, input.texture_coords);
+    let alpha = sample.a * input.opacity;
+    let color_multiplier = select(1.0, input.opacity, globals.premultiplied_alpha != 0u);
+    return vec4<f32>(sample.rgb * color_multiplier, alpha);
+}
+
 // --- underlines --- //
 
 struct Underline {

@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, GlobalElementId,
+    Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -28,6 +28,8 @@ pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
+    /// Retained compositor layers in this scene.
+    pub retained_layers: Vec<RetainedLayer>,
     pub shadows: Vec<Shadow>,
     pub backdrop_blurs: Vec<BackdropBlur>,
     pub quads: Vec<Quad>,
@@ -45,6 +47,7 @@ impl Scene {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
+        self.retained_layers.clear();
         self.paths.clear();
         self.shadows.clear();
         self.backdrop_blurs.clear();
@@ -131,11 +134,84 @@ impl Scene {
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
-        for operation in &prev_scene.paint_operations[range] {
+        let start = self.paint_operations.len();
+        for operation in &prev_scene.paint_operations[range.clone()] {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+            }
+        }
+
+        self.retained_layers.extend(
+            prev_scene
+                .retained_layers
+                .iter()
+                .filter(|layer| {
+                    range.start <= layer.paint_range.start && layer.paint_range.end <= range.end
+                })
+                .map(|layer| {
+                    let mut layer = layer.clone();
+                    layer.content_dirty = false;
+                    layer.paint_range = start + (layer.paint_range.start - range.start)
+                        ..start + (layer.paint_range.end - range.start);
+                    layer
+                }),
+        );
+    }
+
+    pub(crate) fn insert_retained_layer(&mut self, layer: RetainedLayer) {
+        debug_assert!(layer.paint_range.end <= self.paint_operations.len());
+        self.retained_layers.push(layer);
+    }
+
+    #[doc(hidden)]
+    pub fn paint_operation_count(&self) -> usize {
+        self.paint_operations.len()
+    }
+
+    pub fn clone_paint_range(&self, range: Range<usize>) -> Self {
+        self.clone_paint_operations(|index| range.contains(&index))
+    }
+
+    pub fn clone_excluding_paint_ranges(&self, excluded_ranges: &[Range<usize>]) -> Self {
+        self.clone_paint_operations(|index| {
+            !excluded_ranges
+                .iter()
+                .any(|range| range.start <= index && index < range.end)
+        })
+    }
+
+    fn clone_paint_operations(&self, include: impl Fn(usize) -> bool) -> Self {
+        let mut scene = Self::default();
+        for (index, operation) in self.paint_operations.iter().enumerate() {
+            if include(index) {
+                scene.push_cloned_operation(operation);
+            }
+        }
+        scene.finish();
+        scene
+    }
+
+    fn push_cloned_operation(&mut self, operation: &PaintOperation) {
+        self.paint_operations.push(operation.clone());
+        if let PaintOperation::Primitive(primitive) = operation {
+            match primitive {
+                Primitive::Shadow(shadow) => self.shadows.push(shadow.clone()),
+                Primitive::BackdropBlur(blur) => self.backdrop_blurs.push(blur.clone()),
+                Primitive::Quad(quad) => self.quads.push(quad.clone()),
+                Primitive::Path(path) => self.paths.push(path.clone()),
+                Primitive::Underline(underline) => self.underlines.push(underline.clone()),
+                Primitive::MonochromeSprite(sprite) => {
+                    self.monochrome_sprites.push(sprite.clone());
+                }
+                Primitive::SubpixelSprite(sprite) => {
+                    self.subpixel_sprites.push(sprite.clone());
+                }
+                Primitive::PolychromeSprite(sprite) => {
+                    self.polychrome_sprites.push(sprite.clone());
+                }
+                Primitive::Surface(surface) => self.surfaces.push(surface.clone()),
             }
         }
     }
@@ -186,6 +262,37 @@ impl Scene {
     }
 }
 
+/// Monotonic caller-owned revision for cached retained layer content.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct RetainedLayerContentRevision(pub u64);
+
+impl From<u64> for RetainedLayerContentRevision {
+    fn from(revision: u64) -> Self {
+        Self(revision)
+    }
+}
+
+/// Stable scene contract for renderer-owned retained compositor layer caches.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetainedLayer {
+    /// Stable element id for cache lookup across frames.
+    pub id: GlobalElementId,
+    /// Caller-owned revision for child paint output.
+    pub content_revision: RetainedLayerContentRevision,
+    /// Whether renderer must repaint cached child content for this frame.
+    pub content_dirty: bool,
+    /// Layer bounds in scene coordinates.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Active mask in scene coordinates.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Compositor transform applied to cached child content.
+    pub transform: TransformationMatrix,
+    /// Compositor opacity applied to cached child content.
+    pub opacity: f32,
+    /// Paint operation range that produced child content.
+    pub paint_range: Range<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Default)]
 #[cfg_attr(
     all(
@@ -207,6 +314,7 @@ pub(crate) enum PrimitiveKind {
     Surface,
 }
 
+#[derive(Clone)]
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
@@ -988,5 +1096,90 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{ElementId, size};
+
+    fn test_bounds() -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(10.0), ScaledPixels(10.0)),
+        )
+    }
+
+    fn test_global_id() -> GlobalElementId {
+        GlobalElementId(Arc::from([ElementId::from("layer")]))
+    }
+
+    #[test]
+    fn replay_retained_layer_ranges_and_marks_content_clean() {
+        let bounds = test_bounds();
+        let content_mask = ContentMask { bounds };
+        let mut prev_scene = Scene::default();
+
+        prev_scene.insert_primitive(Quad {
+            bounds,
+            content_mask: content_mask.clone(),
+            ..Default::default()
+        });
+        prev_scene.insert_retained_layer(RetainedLayer {
+            id: test_global_id(),
+            content_revision: 1.into(),
+            content_dirty: true,
+            bounds,
+            content_mask,
+            transform: TransformationMatrix::unit(),
+            opacity: 0.5,
+            paint_range: 0..1,
+        });
+
+        let mut next_scene = Scene::default();
+        next_scene.replay(0..1, &prev_scene);
+
+        assert_eq!(next_scene.paint_operations.len(), 1);
+        assert_eq!(next_scene.retained_layers.len(), 1);
+        assert_eq!(next_scene.retained_layers[0].paint_range, 0..1);
+        assert!(!next_scene.retained_layers[0].content_dirty);
+        assert_eq!(next_scene.retained_layers[0].opacity, 0.5);
+    }
+
+    #[test]
+    fn replay_offsets_retained_layer_ranges_after_existing_ops() {
+        let bounds = test_bounds();
+        let content_mask = ContentMask { bounds };
+        let mut prev_scene = Scene::default();
+
+        prev_scene.insert_primitive(Quad {
+            bounds,
+            content_mask: content_mask.clone(),
+            ..Default::default()
+        });
+        prev_scene.insert_retained_layer(RetainedLayer {
+            id: test_global_id(),
+            content_revision: 1.into(),
+            content_dirty: true,
+            bounds,
+            content_mask: content_mask.clone(),
+            transform: TransformationMatrix::unit(),
+            opacity: 1.0,
+            paint_range: 0..1,
+        });
+
+        let mut next_scene = Scene::default();
+        next_scene.insert_primitive(Quad {
+            bounds,
+            content_mask,
+            ..Default::default()
+        });
+        next_scene.replay(0..1, &prev_scene);
+
+        assert_eq!(next_scene.paint_operations.len(), 2);
+        assert_eq!(next_scene.retained_layers[0].paint_range, 1..2);
     }
 }

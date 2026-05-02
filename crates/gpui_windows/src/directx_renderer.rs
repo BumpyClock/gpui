@@ -1,4 +1,6 @@
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     slice,
     sync::{Arc, OnceLock},
 };
@@ -16,7 +18,7 @@ use windows::{
             Dxgi::{Common::*, *},
         },
     },
-    core::Interface,
+    core::{IUnknown, Interface},
 };
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
@@ -136,6 +138,33 @@ struct DirectComposition {
     comp_device: IDCompositionDevice,
     comp_target: IDCompositionTarget,
     comp_visual: IDCompositionVisual,
+    retained_compositor: RetainedCompositor,
+    retained_layers_enabled: bool,
+}
+
+fn retained_layer_id(id: &GlobalElementId) -> RetainedLayerId {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    RetainedLayerId(hasher.finish())
+}
+
+fn retained_layer_state(layer: &gpui::RetainedLayer, order: usize) -> RetainedLayerState {
+    RetainedLayerState {
+        order: order.min(u32::MAX as usize) as u32,
+        transform: matrix_from_transformation(layer.transform),
+        opacity: layer.opacity,
+    }
+}
+
+fn matrix_from_transformation(transform: TransformationMatrix) -> windows_numerics::Matrix3x2 {
+    windows_numerics::Matrix3x2 {
+        M11: transform.rotation_scale[0][0],
+        M12: transform.rotation_scale[1][0],
+        M21: transform.rotation_scale[0][1],
+        M22: transform.rotation_scale[1][1],
+        M31: transform.translation[0],
+        M32: transform.translation[1],
+    }
 }
 
 impl DirectXRendererDevices {
@@ -189,8 +218,9 @@ impl DirectXRenderer {
         let direct_composition = if disable_direct_composition {
             None
         } else {
-            let composition = DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), hwnd)
-                .context("Creating DirectComposition")?;
+            let mut composition =
+                DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), hwnd)
+                    .context("Creating DirectComposition")?;
             composition
                 .set_swap_chain(&resources.swap_chain)
                 .context("Setting swap chain for DirectComposition")?;
@@ -260,6 +290,96 @@ impl DirectXRenderer {
         result.ok().context("Presenting swap chain failed")
     }
 
+    fn update_clean_retained_layers(&mut self, scene: &Scene) -> Result<bool> {
+        if !self.supports_retained_layer_scene(scene)
+            || scene
+                .retained_layers
+                .iter()
+                .any(|layer| layer.content_dirty)
+        {
+            return Ok(false);
+        }
+
+        let Some(direct_composition) = self.direct_composition.as_mut() else {
+            return Ok(false);
+        };
+        let active_layers = Self::retained_layer_ids(scene);
+        if !direct_composition
+            .retained_compositor
+            .contains_layers(&active_layers)
+        {
+            return Ok(false);
+        }
+
+        direct_composition.enable_retained_layers()?;
+        for (order, layer) in scene.retained_layers.iter().enumerate() {
+            direct_composition.retained_compositor.update_layer_state(
+                retained_layer_id(&layer.id),
+                retained_layer_state(layer, order),
+            )?;
+        }
+        direct_composition
+            .retained_compositor
+            .retain_layers(&active_layers)?;
+        direct_composition.commit()?;
+        Ok(true)
+    }
+
+    fn update_retained_layer_cache(&mut self, scene: &Scene) -> Result<()> {
+        let Some(direct_composition) = self.direct_composition.as_mut() else {
+            return Ok(());
+        };
+        let swap_chain = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .swap_chain
+            .clone();
+
+        if !self.supports_retained_layer_scene(scene) {
+            direct_composition.disable_retained_layers(&swap_chain)?;
+            return Ok(());
+        }
+
+        direct_composition.enable_retained_layers()?;
+        let active_layers = Self::retained_layer_ids(scene);
+        for (order, layer) in scene.retained_layers.iter().enumerate() {
+            direct_composition.retained_compositor.set_layer(
+                retained_layer_id(&layer.id),
+                retained_layer_state(layer, order),
+                RetainedLayerContent::SwapChain(&swap_chain),
+            )?;
+        }
+        direct_composition
+            .retained_compositor
+            .retain_layers(&active_layers)?;
+        direct_composition.commit()
+    }
+
+    fn supports_retained_layer_scene(&self, scene: &Scene) -> bool {
+        let [layer] = scene.retained_layers.as_slice() else {
+            return false;
+        };
+        let viewport_bounds = Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(
+                ScaledPixels(self.width.max(1) as f32),
+                ScaledPixels(self.height.max(1) as f32),
+            ),
+        );
+        layer.paint_range == (0..scene.paint_operation_count())
+            && layer.bounds == viewport_bounds
+            && layer.content_mask.bounds == viewport_bounds
+    }
+
+    fn retained_layer_ids(scene: &Scene) -> Vec<RetainedLayerId> {
+        scene
+            .retained_layers
+            .iter()
+            .map(|layer| retained_layer_id(&layer.id))
+            .collect()
+    }
+
     pub(crate) fn handle_device_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
         try_to_recover_from_device_lost(|| {
             self.handle_device_lost_impl(directx_devices)
@@ -311,7 +431,7 @@ impl DirectXRenderer {
         let direct_composition = if disable_direct_composition {
             None
         } else {
-            let composition =
+            let mut composition =
                 DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
             composition.set_swap_chain(&resources.swap_chain)?;
             Some(composition)
@@ -342,6 +462,9 @@ impl DirectXRenderer {
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
+            return Ok(());
+        }
+        if self.update_clean_retained_layers(scene)? {
             return Ok(());
         }
         self.pre_draw(&match background_appearance {
@@ -471,7 +594,8 @@ impl DirectXRenderer {
                 scene.surfaces.len(),
             ))?;
         }
-        self.present()
+        self.present()?;
+        self.update_retained_layer_cache(scene)
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -546,7 +670,7 @@ impl DirectXRenderer {
             height,
         )
         .context("Failed to create composition swap chain")?;
-        let direct_composition =
+        let mut direct_composition =
             DirectComposition::new(dxgi_device, self.hwnd).context("Creating DirectComposition")?;
         direct_composition
             .set_swap_chain(&swap_chain)
@@ -1560,21 +1684,57 @@ impl DirectComposition {
         let comp_device = get_comp_device(dxgi_device)?;
         let comp_target = unsafe { comp_device.CreateTargetForHwnd(hwnd, true) }?;
         let comp_visual = unsafe { comp_device.CreateVisual() }?;
+        let retained_compositor = RetainedCompositor::new(comp_device.clone(), comp_visual.clone());
 
         Ok(Self {
             comp_device,
             comp_target,
             comp_visual,
+            retained_compositor,
+            retained_layers_enabled: false,
         })
     }
 
-    pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
+    pub fn set_swap_chain(&mut self, swap_chain: &IDXGISwapChain1) -> Result<()> {
         unsafe {
+            self.retained_compositor.retain_layers(&[])?;
             self.comp_visual.SetContent(swap_chain)?;
             self.comp_target.SetRoot(&self.comp_visual)?;
             self.comp_device.Commit()?;
         }
+        self.retained_layers_enabled = false;
         Ok(())
+    }
+
+    pub fn enable_retained_layers(&mut self) -> Result<()> {
+        if self.retained_layers_enabled {
+            return Ok(());
+        }
+
+        unsafe {
+            self.comp_visual.SetContent(None::<&IUnknown>)?;
+            self.comp_target.SetRoot(&self.comp_visual)?;
+        }
+        self.retained_layers_enabled = true;
+        Ok(())
+    }
+
+    pub fn disable_retained_layers(&mut self, swap_chain: &IDXGISwapChain1) -> Result<()> {
+        if !self.retained_layers_enabled {
+            return Ok(());
+        }
+
+        self.retained_compositor.retain_layers(&[])?;
+        unsafe {
+            self.comp_visual.SetContent(swap_chain)?;
+            self.comp_target.SetRoot(&self.comp_visual)?;
+        }
+        self.retained_layers_enabled = false;
+        self.commit()
+    }
+
+    pub fn commit(&self) -> Result<()> {
+        self.retained_compositor.commit()
     }
 }
 
