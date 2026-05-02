@@ -789,8 +789,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
-                    let Some(mut scratch_bounds) = Self::path_scratch_bounds(paths, viewport_size)
-                    else {
+                    let Some(first_path) = paths.first() else {
                         command_encoder = new_command_encoder(
                             command_buffer,
                             drawable,
@@ -801,21 +800,60 @@ impl MetalRenderer {
                         );
                         continue;
                     };
-                    let did_draw = if let Some(texture_size) =
-                        self.ensure_path_intermediate_textures(scratch_bounds.texture_size)
-                    {
-                        scratch_bounds.texture_size = texture_size;
-                        self.draw_paths_to_intermediate(
-                            paths,
-                            scratch_bounds,
-                            instance_buffer,
-                            &mut instance_offset,
-                            command_buffer,
-                        )
+
+                    let mut ok = true;
+                    let path_ranges: Vec<_> = if paths.last().unwrap().order == first_path.order {
+                        (0..paths.len()).map(|index| index..index + 1).collect()
                     } else {
-                        false
+                        vec![0..paths.len()]
                     };
 
+                    for path_range in path_ranges {
+                        let paths = &paths[path_range];
+                        let Some(mut scratch_bounds) =
+                            Self::path_scratch_bounds(paths, viewport_size)
+                        else {
+                            continue;
+                        };
+                        let did_draw = if let Some(texture_size) =
+                            self.ensure_path_intermediate_textures(scratch_bounds.texture_size)
+                        {
+                            scratch_bounds.texture_size = texture_size;
+                            self.draw_paths_to_intermediate(
+                                paths,
+                                scratch_bounds,
+                                instance_buffer,
+                                &mut instance_offset,
+                                command_buffer,
+                            )
+                        } else {
+                            false
+                        };
+
+                        command_encoder = new_command_encoder(
+                            command_buffer,
+                            drawable,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        );
+
+                        ok = did_draw
+                            && self.draw_paths_from_intermediate(
+                                paths,
+                                scratch_bounds,
+                                instance_buffer,
+                                &mut instance_offset,
+                                viewport_size,
+                                command_encoder,
+                            );
+                        if !ok {
+                            break;
+                        }
+
+                        command_encoder.end_encoding();
+                    }
                     command_encoder = new_command_encoder(
                         command_buffer,
                         drawable,
@@ -824,19 +862,7 @@ impl MetalRenderer {
                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
                         },
                     );
-
-                    if did_draw {
-                        self.draw_paths_from_intermediate(
-                            paths,
-                            scratch_bounds,
-                            instance_buffer,
-                            &mut instance_offset,
-                            viewport_size,
-                            command_encoder,
-                        )
-                    } else {
-                        false
-                    }
+                    ok
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(
                     &scene.underlines[range],

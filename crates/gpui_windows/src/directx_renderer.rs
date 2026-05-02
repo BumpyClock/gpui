@@ -385,27 +385,38 @@ impl DirectXRenderer {
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    if let Some(mut scratch_bounds) =
-                        Self::path_scratch_bounds(paths, self.width, self.height)
-                    {
-                        let devices = self.devices.as_ref().context("devices missing")?;
-                        let texture_size = self
-                            .resources
-                            .as_mut()
-                            .context("resources missing")?
-                            .ensure_path_intermediate_resources(
-                                devices,
-                                scratch_bounds.texture_size,
-                            )?;
-                        let Some(texture_size) = texture_size else {
-                            return Ok(());
-                        };
-                        scratch_bounds.texture_size = texture_size;
-                        self.draw_paths_to_intermediate(paths, scratch_bounds)?;
-                        self.draw_paths_from_intermediate(paths, scratch_bounds)
+                    let Some(first_path) = paths.first() else {
+                        return Ok(());
+                    };
+                    let path_ranges: Vec<_> = if paths.last().unwrap().order == first_path.order {
+                        (0..paths.len()).map(|index| index..index + 1).collect()
                     } else {
-                        Ok(())
+                        vec![0..paths.len()]
+                    };
+
+                    for path_range in path_ranges {
+                        let paths = &paths[path_range];
+                        if let Some(mut scratch_bounds) =
+                            Self::path_scratch_bounds(paths, self.width, self.height)
+                        {
+                            let devices = self.devices.as_ref().context("devices missing")?;
+                            let texture_size = self
+                                .resources
+                                .as_mut()
+                                .context("resources missing")?
+                                .ensure_path_intermediate_resources(
+                                    devices,
+                                    scratch_bounds.texture_size,
+                                )?;
+                            let Some(texture_size) = texture_size else {
+                                return Ok(());
+                            };
+                            scratch_bounds.texture_size = texture_size;
+                            self.draw_paths_to_intermediate(paths, scratch_bounds)?;
+                            self.draw_paths_from_intermediate(paths, scratch_bounds)?;
+                        }
                     }
+                    Ok(())
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {

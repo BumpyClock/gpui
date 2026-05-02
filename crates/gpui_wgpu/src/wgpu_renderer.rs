@@ -1199,33 +1199,73 @@ impl WgpuRenderer {
                         }
                         PrimitiveBatch::Paths(range) => {
                             let paths = &scene.paths[range];
-                            if paths.is_empty() {
+                            let Some(first_path) = paths.first() else {
                                 continue;
-                            }
+                            };
 
-                            let Some(mut scratch_bounds) = Self::path_scratch_bounds(
-                                paths,
-                                Size {
-                                    width: DevicePixels(self.surface_config.width as i32),
-                                    height: DevicePixels(self.surface_config.height as i32),
-                                },
-                            ) else {
-                                continue;
+                            let viewport_size = Size {
+                                width: DevicePixels(self.surface_config.width as i32),
+                                height: DevicePixels(self.surface_config.height as i32),
                             };
-                            let Some(texture_size) =
-                                self.ensure_intermediate_textures(scratch_bounds.texture_size)
-                            else {
-                                continue;
-                            };
-                            scratch_bounds.texture_size = texture_size;
                             drop(pass);
 
-                            let did_draw = self.draw_paths_to_intermediate(
-                                &mut encoder,
-                                paths,
-                                scratch_bounds,
-                                &mut instance_offset,
-                            );
+                            let path_ranges: Vec<_> =
+                                if paths.last().unwrap().order == first_path.order {
+                                    (0..paths.len()).map(|index| index..index + 1).collect()
+                                } else {
+                                    vec![0..paths.len()]
+                                };
+                            let mut ok = true;
+
+                            for path_range in path_ranges {
+                                let paths = &paths[path_range];
+                                let Some(mut scratch_bounds) =
+                                    Self::path_scratch_bounds(paths, viewport_size)
+                                else {
+                                    continue;
+                                };
+                                let Some(texture_size) =
+                                    self.ensure_intermediate_textures(scratch_bounds.texture_size)
+                                else {
+                                    ok = false;
+                                    break;
+                                };
+                                scratch_bounds.texture_size = texture_size;
+
+                                let did_draw = self.draw_paths_to_intermediate(
+                                    &mut encoder,
+                                    paths,
+                                    scratch_bounds,
+                                    &mut instance_offset,
+                                );
+
+                                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("main_pass_continued"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: &frame_view,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    ..Default::default()
+                                });
+
+                                ok = did_draw
+                                    && self.draw_paths_from_intermediate(
+                                        paths,
+                                        scratch_bounds,
+                                        &mut instance_offset,
+                                        &mut pass,
+                                    );
+                                drop(pass);
+                                if !ok {
+                                    break;
+                                }
+                            }
 
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                                 label: Some("main_pass_continued"),
@@ -1241,17 +1281,7 @@ impl WgpuRenderer {
                                 depth_stencil_attachment: None,
                                 ..Default::default()
                             });
-
-                            if did_draw {
-                                self.draw_paths_from_intermediate(
-                                    paths,
-                                    scratch_bounds,
-                                    &mut instance_offset,
-                                    &mut pass,
-                                )
-                            } else {
-                                false
-                            }
+                            ok
                         }
                         PrimitiveBatch::Underlines(range) => self.draw_underlines(
                             &scene.underlines[range],
