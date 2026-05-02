@@ -202,8 +202,8 @@ impl DirectXAtlasState {
         };
         let mut texture: Option<ID3D11Texture2D> = None;
         unsafe {
-            // This only returns None if the device is lost, which we will recreate later.
-            // So it's ok to return None here.
+            // Allocation can fail under device loss or memory/resource pressure.
+            // Returning None lets the caller skip this tile until the device recovers.
             self.device
                 .CreateTexture2D(&texture_desc, None, Some(&mut texture))
                 .ok()?;
