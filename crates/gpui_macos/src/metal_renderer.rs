@@ -138,6 +138,7 @@ pub(crate) struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    last_command_buffer: Option<metal::CommandBuffer>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_intermediate_size: Option<Size<DevicePixels>>,
@@ -364,6 +365,7 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            last_command_buffer: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_intermediate_size: None,
@@ -550,6 +552,9 @@ impl MetalRenderer {
 
     pub fn draw(&mut self, scene: &Scene) {
         let _autorelease_pool = ScopedAutoreleasePool::new();
+        if let Some(command_buffer) = self.last_command_buffer.take() {
+            command_buffer.wait_until_completed();
+        }
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
@@ -591,8 +596,8 @@ impl MetalRenderer {
                     } else {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
-                        command_buffer.wait_until_scheduled();
                     }
+                    self.last_command_buffer = Some(command_buffer);
                     return;
                 }
                 Err(err) => {
