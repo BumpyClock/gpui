@@ -1199,9 +1199,9 @@ impl WgpuRenderer {
                         }
                         PrimitiveBatch::Paths(range) => {
                             let paths = &scene.paths[range];
-                            let Some(first_path) = paths.first() else {
+                            if paths.is_empty() {
                                 continue;
-                            };
+                            }
 
                             let viewport_size = Size {
                                 width: DevicePixels(self.surface_config.width as i32),
@@ -1210,11 +1210,7 @@ impl WgpuRenderer {
                             drop(pass);
 
                             let path_ranges: Vec<_> =
-                                if paths.last().unwrap().order == first_path.order {
-                                    (0..paths.len()).map(|index| index..index + 1).collect()
-                                } else {
-                                    vec![0..paths.len()]
-                                };
+                                (0..paths.len()).map(|index| index..index + 1).collect();
                             let mut ok = true;
 
                             for path_range in path_ranges {

@@ -385,14 +385,11 @@ impl DirectXRenderer {
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    let Some(first_path) = paths.first() else {
+                    if paths.is_empty() {
                         return Ok(());
-                    };
-                    let path_ranges: Vec<_> = if paths.last().unwrap().order == first_path.order {
-                        (0..paths.len()).map(|index| index..index + 1).collect()
-                    } else {
-                        vec![0..paths.len()]
-                    };
+                    }
+                    let path_ranges: Vec<_> =
+                        (0..paths.len()).map(|index| index..index + 1).collect();
 
                     for path_range in path_ranges {
                         let paths = &paths[path_range];
