@@ -89,6 +89,21 @@ impl Default for InstanceBufferPool {
 pub(crate) struct InstanceBuffer {
     metal_buffer: metal::Buffer,
     size: usize,
+    managed: bool,
+}
+
+fn dynamic_buffer_options(device: &metal::Device) -> (MTLResourceOptions, bool) {
+    let managed = !device.has_unified_memory();
+    let storage_mode = if managed {
+        MTLResourceOptions::StorageModeManaged
+    } else {
+        MTLResourceOptions::StorageModeShared
+    };
+
+    (
+        MTLResourceOptions::CPUCacheModeWriteCombined | storage_mode,
+        managed,
+    )
 }
 
 impl InstanceBufferPool {
@@ -98,15 +113,15 @@ impl InstanceBufferPool {
     }
 
     pub(crate) fn acquire(&mut self, device: &metal::Device) -> InstanceBuffer {
-        let buffer = self.buffers.pop().unwrap_or_else(|| {
-            device.new_buffer(
-                self.buffer_size as u64,
-                MTLResourceOptions::StorageModeManaged,
-            )
-        });
+        let (options, managed) = dynamic_buffer_options(device);
+        let buffer = self
+            .buffers
+            .pop()
+            .unwrap_or_else(|| device.new_buffer(self.buffer_size as u64, options));
         InstanceBuffer {
             metal_buffer: buffer,
             size: self.buffer_size,
+            managed,
         }
     }
 
@@ -138,7 +153,6 @@ pub(crate) struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
-    last_command_buffer: Option<metal::CommandBuffer>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_intermediate_size: Option<Size<DevicePixels>>,
@@ -247,7 +261,7 @@ impl MetalRenderer {
         let unit_vertices = device.new_buffer_with_data(
             unit_vertices.as_ptr() as *const c_void,
             mem::size_of_val(&unit_vertices) as u64,
-            MTLResourceOptions::StorageModeManaged,
+            dynamic_buffer_options(&device).0,
         );
 
         let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
@@ -365,7 +379,6 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
-            last_command_buffer: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_intermediate_size: None,
@@ -552,9 +565,6 @@ impl MetalRenderer {
 
     pub fn draw(&mut self, scene: &Scene) {
         let _autorelease_pool = ScopedAutoreleasePool::new();
-        if let Some(command_buffer) = self.last_command_buffer.take() {
-            command_buffer.wait_until_completed();
-        }
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
@@ -597,7 +607,6 @@ impl MetalRenderer {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
                     }
-                    self.last_command_buffer = Some(command_buffer);
                     return;
                 }
                 Err(err) => {
@@ -971,10 +980,12 @@ impl MetalRenderer {
 
         command_encoder.end_encoding();
 
-        instance_buffer.metal_buffer.did_modify_range(NSRange {
-            location: 0,
-            length: instance_offset as NSUInteger,
-        });
+        if instance_buffer.managed {
+            instance_buffer.metal_buffer.did_modify_range(NSRange {
+                location: 0,
+                length: instance_offset as NSUInteger,
+            });
+        }
         Ok(command_buffer.to_owned())
     }
 
