@@ -2,8 +2,8 @@ use crate::metal_atlas::MetalAtlas;
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
-    base::{NO, YES},
-    foundation::{NSSize, NSUInteger},
+    base::{NO, YES, id, nil},
+    foundation::{NSAutoreleasePool, NSSize, NSUInteger},
     quartzcore::AutoresizingMask,
 };
 use gpui::{
@@ -45,6 +45,22 @@ const BACKDROP_BLUR_OFFSET: f32 = 1.0;
 
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
 pub(crate) type Renderer = MetalRenderer;
+
+struct ScopedAutoreleasePool(id);
+
+impl ScopedAutoreleasePool {
+    fn new() -> Self {
+        Self(unsafe { NSAutoreleasePool::new(nil) })
+    }
+}
+
+impl Drop for ScopedAutoreleasePool {
+    fn drop(&mut self) {
+        unsafe {
+            self.0.drain();
+        }
+    }
+}
 
 pub(crate) unsafe fn new_renderer(
     context: self::Context,
@@ -516,6 +532,7 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        let _autorelease_pool = ScopedAutoreleasePool::new();
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
@@ -586,6 +603,7 @@ impl MetalRenderer {
     /// where we want to capture what would be rendered without displaying it.
     #[cfg(any(test, feature = "test-support"))]
     pub fn render_to_image(&mut self, scene: &Scene) -> Result<RgbaImage> {
+        let _autorelease_pool = ScopedAutoreleasePool::new();
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
