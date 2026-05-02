@@ -12,6 +12,9 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
 const BACKDROP_BLUR_RADIUS_PER_LEVEL: f32 = 6.0;
+const INITIAL_INSTANCE_BUFFER_SIZE: u64 = 2 * 1024 * 1024;
+const INSTANCE_BUFFER_SIZE_BUCKET: u64 = 1024 * 1024;
+const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -119,6 +122,7 @@ pub struct WgpuRenderer {
     queue: Arc<wgpu::Queue>,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
+    surface_supports_copy_src: bool,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas: Arc<WgpuAtlas>,
@@ -251,6 +255,7 @@ impl WgpuRenderer {
             context,
             surface,
             surface_format,
+            surface_caps.usages,
             alpha_mode,
             transparent_alpha_mode,
             opaque_alpha_mode,
@@ -262,6 +267,7 @@ impl WgpuRenderer {
         context: &WgpuContext,
         surface: wgpu::Surface<'static>,
         surface_format: wgpu::TextureFormat,
+        surface_usages: wgpu::TextureUsages,
         alpha_mode: wgpu::CompositeAlphaMode,
         transparent_alpha_mode: wgpu::CompositeAlphaMode,
         opaque_alpha_mode: wgpu::CompositeAlphaMode,
@@ -283,8 +289,16 @@ impl WgpuRenderer {
             );
         }
 
+        let surface_supports_copy_src = surface_usages.contains(wgpu::TextureUsages::COPY_SRC);
+        if !surface_supports_copy_src {
+            warn!("WGPU surface lacks COPY_SRC usage; backdrop blur is disabled");
+        }
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if surface_supports_copy_src {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -330,10 +344,9 @@ impl WgpuRenderer {
         });
 
         let storage_buffer_alignment = device.limits().min_storage_buffer_offset_alignment as u64;
-        let initial_instance_buffer_capacity = 2 * 1024 * 1024;
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instance_buffer"),
-            size: initial_instance_buffer_capacity,
+            size: INITIAL_INSTANCE_BUFFER_SIZE,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -398,6 +411,7 @@ impl WgpuRenderer {
             queue,
             surface,
             surface_config,
+            surface_supports_copy_src,
             pipelines,
             bind_group_layouts,
             atlas,
@@ -408,7 +422,7 @@ impl WgpuRenderer {
             globals_bind_group,
             path_globals_bind_group,
             instance_buffer,
-            instance_buffer_capacity: initial_instance_buffer_capacity,
+            instance_buffer_capacity: INITIAL_INSTANCE_BUFFER_SIZE,
             storage_buffer_alignment,
             path_intermediate_texture: None,
             path_intermediate_view: None,
@@ -933,8 +947,19 @@ impl WgpuRenderer {
             if current_size.width >= size.width && current_size.height >= size.height {
                 return Some(current_size);
             }
+            return self.create_intermediate_textures(Size {
+                width: current_size.width.max(size.width),
+                height: current_size.height.max(size.height),
+            });
         }
 
+        self.create_intermediate_textures(size)
+    }
+
+    fn create_intermediate_textures(
+        &mut self,
+        size: Size<DevicePixels>,
+    ) -> Option<Size<DevicePixels>> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.path_intermediate_texture = None;
             self.path_intermediate_view = None;
@@ -978,11 +1003,34 @@ impl WgpuRenderer {
         Some(size)
     }
 
-    fn ensure_backdrop_texture(&mut self, size: Size<DevicePixels>) -> bool {
-        if self.backdrop_texture.is_some() && self.backdrop_size == Some(size) {
-            return true;
+    fn ensure_backdrop_texture(
+        &mut self,
+        size: Size<DevicePixels>,
+        max_size: Size<DevicePixels>,
+    ) -> Option<Size<DevicePixels>> {
+        if let Some(current_size) = self.backdrop_size
+            && self.backdrop_texture.is_some()
+        {
+            if current_size.width >= size.width
+                && current_size.height >= size.height
+                && current_size.width <= max_size.width
+                && current_size.height <= max_size.height
+            {
+                return Some(current_size);
+            }
+            return self.create_backdrop_resources(Size {
+                width: current_size.width.max(size.width).min(max_size.width),
+                height: current_size.height.max(size.height).min(max_size.height),
+            });
         }
 
+        self.create_backdrop_resources(size)
+    }
+
+    fn create_backdrop_resources(
+        &mut self,
+        size: Size<DevicePixels>,
+    ) -> Option<Size<DevicePixels>> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             if let Some(ref texture) = self.backdrop_texture {
                 texture.destroy();
@@ -990,7 +1038,7 @@ impl WgpuRenderer {
             self.backdrop_texture = None;
             self.backdrop_view = None;
             self.backdrop_size = None;
-            return false;
+            return None;
         }
 
         if let Some(ref texture) = self.backdrop_texture {
@@ -1006,7 +1054,7 @@ impl WgpuRenderer {
         self.backdrop_texture = Some(backdrop_texture);
         self.backdrop_view = Some(backdrop_view);
         self.backdrop_size = Some(size);
-        true
+        Some(size)
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -1143,7 +1191,9 @@ impl WgpuRenderer {
             bytemuck::bytes_of(&gamma_params),
         );
 
-        loop {
+        self.ensure_instance_buffer_capacity(self.required_instance_buffer_size(scene));
+
+        {
             let mut instance_offset: u64 = 0;
             let mut overflow = false;
 
@@ -1181,17 +1231,24 @@ impl WgpuRenderer {
                         ),
                         PrimitiveBatch::BackdropBlurs(range) => {
                             let blurs = &scene.backdrop_blurs[range];
-                            if blurs.is_empty() {
+                            if blurs.is_empty() || !self.surface_supports_copy_src {
                                 continue;
                             }
-                            let Some(scratch_bounds) =
+                            let Some(mut scratch_bounds) =
                                 Self::backdrop_scratch_bounds(blurs, self.viewport_size())
                             else {
                                 continue;
                             };
-                            if !self.ensure_backdrop_texture(scratch_bounds.texture_size) {
+                            let Some(texture_size) = self.ensure_backdrop_texture(
+                                scratch_bounds.texture_size,
+                                Self::max_backdrop_texture_size(
+                                    scratch_bounds,
+                                    self.viewport_size(),
+                                ),
+                            ) else {
                                 continue;
-                            }
+                            };
+                            scratch_bounds.texture_size = texture_size;
                             let Some(backdrop_texture) = self.backdrop_texture.as_ref() else {
                                 continue;
                             };
@@ -1364,21 +1421,16 @@ impl WgpuRenderer {
 
             if overflow {
                 drop(encoder);
-                if self.instance_buffer_capacity >= 256 * 1024 * 1024 {
-                    log::error!(
-                        "instance buffer size grew too large: {}",
-                        self.instance_buffer_capacity
-                    );
-                    frame.present();
-                    return;
-                }
-                self.grow_instance_buffer();
-                continue;
+                log::error!(
+                    "precomputed instance buffer size was too small: {}",
+                    self.instance_buffer_capacity
+                );
+                frame.present();
+                return;
             }
 
             self.queue.submit(std::iter::once(encoder.finish()));
             frame.present();
-            return;
         }
     }
 
@@ -1669,6 +1721,20 @@ impl WgpuRenderer {
         })
     }
 
+    fn max_backdrop_texture_size(
+        scratch_bounds: BackdropScratchBounds,
+        viewport_size: Size<DevicePixels>,
+    ) -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels(
+                (viewport_size.width.0 - scratch_bounds.bounds.origin.x.0 as i32).max(0),
+            ),
+            height: DevicePixels(
+                (viewport_size.height.0 - scratch_bounds.bounds.origin.y.0 as i32).max(0),
+            ),
+        }
+    }
+
     fn backdrop_blur_padding(radius: f32) -> ScaledPixels {
         ScaledPixels((radius + BACKDROP_BLUR_RADIUS_PER_LEVEL * 2.0).ceil())
     }
@@ -1683,8 +1749,8 @@ impl WgpuRenderer {
             .map(|mut blur| {
                 blur.source_origin_x = scratch_bounds.bounds.origin.x.0;
                 blur.source_origin_y = scratch_bounds.bounds.origin.y.0;
-                blur.source_width = scratch_bounds.bounds.size.width.0;
-                blur.source_height = scratch_bounds.bounds.size.height.0;
+                blur.source_width = scratch_bounds.texture_size.width.0 as f32;
+                blur.source_height = scratch_bounds.texture_size.height.0 as f32;
                 blur
             })
             .collect()
@@ -1819,9 +1885,74 @@ impl WgpuRenderer {
         true
     }
 
-    fn grow_instance_buffer(&mut self) {
-        let new_capacity = self.instance_buffer_capacity * 2;
-        log::info!("increased instance buffer size to {}", new_capacity);
+    fn required_instance_buffer_size(&self, scene: &Scene) -> u64 {
+        let mut size = 0;
+        for batch in scene.batches() {
+            match batch {
+                PrimitiveBatch::Quads(range) => {
+                    self.add_instance_bytes::<Quad>(&mut size, range.len());
+                }
+                PrimitiveBatch::Shadows(range) => {
+                    self.add_instance_bytes::<Shadow>(&mut size, range.len());
+                }
+                PrimitiveBatch::BackdropBlurs(range) => {
+                    self.add_instance_bytes::<BackdropBlur>(&mut size, range.len());
+                }
+                PrimitiveBatch::Paths(range) => {
+                    for path in &scene.paths[range] {
+                        size = size.next_multiple_of(self.storage_buffer_alignment);
+                        size += path.vertices.len() as u64
+                            * std::mem::size_of::<PathRasterizationVertex>() as u64;
+                        self.add_instance_bytes::<PathSprite>(&mut size, 1);
+                    }
+                }
+                PrimitiveBatch::Underlines(range) => {
+                    self.add_instance_bytes::<Underline>(&mut size, range.len());
+                }
+                PrimitiveBatch::MonochromeSprites { range, .. } => {
+                    self.add_instance_bytes::<MonochromeSprite>(&mut size, range.len());
+                }
+                PrimitiveBatch::SubpixelSprites { range, .. } => {
+                    self.add_instance_bytes::<SubpixelSprite>(&mut size, range.len());
+                }
+                PrimitiveBatch::PolychromeSprites { range, .. } => {
+                    self.add_instance_bytes::<PolychromeSprite>(&mut size, range.len());
+                }
+                PrimitiveBatch::Surfaces(_) => {}
+            }
+        }
+        size
+    }
+
+    fn add_instance_bytes<T>(&self, offset: &mut u64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        *offset = (*offset).next_multiple_of(self.storage_buffer_alignment);
+        *offset += (std::mem::size_of::<T>() as u64 * count as u64).max(16);
+    }
+
+    fn ensure_instance_buffer_capacity(&mut self, required_capacity: u64) {
+        let max_capacity = MAX_INSTANCE_BUFFER_SIZE.min(self.device.limits().max_buffer_size);
+        let mut new_capacity = required_capacity
+            .next_multiple_of(INSTANCE_BUFFER_SIZE_BUCKET)
+            .max(INITIAL_INSTANCE_BUFFER_SIZE);
+        if new_capacity > max_capacity {
+            log::error!(
+                "required instance buffer size {} exceeds maximum {}; dropping frame may occur",
+                new_capacity,
+                max_capacity
+            );
+            new_capacity = max_capacity;
+        }
+        if new_capacity <= self.instance_buffer_capacity {
+            return;
+        }
+        log::info!(
+            "increased instance buffer size from {} to {}",
+            self.instance_buffer_capacity,
+            new_capacity
+        );
         self.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instance_buffer"),
             size: new_capacity,

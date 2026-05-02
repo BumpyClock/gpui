@@ -77,10 +77,14 @@ pub(crate) struct InstanceBufferPool {
     buffers: Vec<metal::Buffer>,
 }
 
+const INITIAL_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+const INSTANCE_BUFFER_SIZE_BUCKET: usize = 1024 * 1024;
+const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: INITIAL_INSTANCE_BUFFER_SIZE,
             buffers: Vec::new(),
         }
     }
@@ -107,12 +111,35 @@ fn dynamic_buffer_options(device: &metal::Device) -> (MTLResourceOptions, bool) 
 }
 
 impl InstanceBufferPool {
-    pub(crate) fn reset(&mut self, buffer_size: usize) {
-        self.buffer_size = buffer_size;
-        self.buffers.clear();
+    fn ensure_size(&mut self, required_size: usize) {
+        let mut required_size = required_size
+            .next_multiple_of(INSTANCE_BUFFER_SIZE_BUCKET)
+            .max(INITIAL_INSTANCE_BUFFER_SIZE);
+        if required_size > MAX_INSTANCE_BUFFER_SIZE {
+            log::error!(
+                "required instance buffer size {} exceeds maximum {}; dropping frame may occur",
+                required_size,
+                MAX_INSTANCE_BUFFER_SIZE
+            );
+            required_size = MAX_INSTANCE_BUFFER_SIZE;
+        }
+        if required_size > self.buffer_size {
+            log::info!(
+                "increased instance buffer size from {} to {}",
+                self.buffer_size,
+                required_size
+            );
+            self.buffer_size = required_size;
+            self.buffers.clear();
+        }
     }
 
-    pub(crate) fn acquire(&mut self, device: &metal::Device) -> InstanceBuffer {
+    pub(crate) fn acquire(
+        &mut self,
+        device: &metal::Device,
+        required_size: usize,
+    ) -> InstanceBuffer {
+        self.ensure_size(required_size);
         let (options, managed) = dynamic_buffer_options(device);
         let buffer = self
             .buffers
@@ -446,8 +473,19 @@ impl MetalRenderer {
             if current_size.width >= size.width && current_size.height >= size.height {
                 return Some(current_size);
             }
+            return self.create_path_intermediate_textures(Size {
+                width: current_size.width.max(size.width),
+                height: current_size.height.max(size.height),
+            });
         }
 
+        self.create_path_intermediate_textures(size)
+    }
+
+    fn create_path_intermediate_textures(
+        &mut self,
+        size: Size<DevicePixels>,
+    ) -> Option<Size<DevicePixels>> {
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
@@ -479,20 +517,40 @@ impl MetalRenderer {
         Some(size)
     }
 
-    fn ensure_backdrop_textures(&mut self, size: Size<DevicePixels>) -> bool {
-        if self.backdrop_texture.is_some() && self.backdrop_texture_size == Some(size) {
-            return true;
+    fn ensure_backdrop_textures(
+        &mut self,
+        size: Size<DevicePixels>,
+        max_size: Size<DevicePixels>,
+    ) -> Option<Size<DevicePixels>> {
+        if let Some(current_size) = self.backdrop_texture_size
+            && self.backdrop_texture.is_some()
+        {
+            if current_size.width >= size.width
+                && current_size.height >= size.height
+                && current_size.width <= max_size.width
+                && current_size.height <= max_size.height
+            {
+                return Some(current_size);
+            }
+            return self.create_backdrop_textures(Size {
+                width: current_size.width.max(size.width).min(max_size.width),
+                height: current_size.height.max(size.height).min(max_size.height),
+            });
         }
 
+        self.create_backdrop_textures(size)
+    }
+
+    fn create_backdrop_textures(&mut self, size: Size<DevicePixels>) -> Option<Size<DevicePixels>> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.discard_backdrop_textures();
-            return false;
+            return None;
         }
 
         self.update_backdrop_texture(size);
         self.update_backdrop_blur_textures(size);
         self.backdrop_texture_size = Some(size);
-        true
+        Some(size)
     }
 
     fn update_backdrop_texture(&mut self, size: Size<DevicePixels>) {
@@ -581,51 +639,39 @@ impl MetalRenderer {
             return;
         };
 
-        loop {
-            let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
+        let required_instance_buffer_size = self.required_instance_buffer_size(scene);
+        let mut instance_buffer = self
+            .instance_buffer_pool
+            .lock()
+            .acquire(&self.device, required_instance_buffer_size);
 
-            let command_buffer =
-                self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
+        let command_buffer =
+            self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
 
-            match command_buffer {
-                Ok(command_buffer) => {
-                    let instance_buffer_pool = self.instance_buffer_pool.clone();
-                    let instance_buffer = Cell::new(Some(instance_buffer));
-                    let block = ConcreteBlock::new(move |_| {
-                        if let Some(instance_buffer) = instance_buffer.take() {
-                            instance_buffer_pool.lock().release(instance_buffer);
-                        }
-                    });
-                    let block = block.copy();
-                    command_buffer.add_completed_handler(&block);
-
-                    if self.presents_with_transaction {
-                        command_buffer.commit();
-                        command_buffer.wait_until_scheduled();
-                        drawable.present();
-                    } else {
-                        command_buffer.present_drawable(drawable);
-                        command_buffer.commit();
+        match command_buffer {
+            Ok(command_buffer) => {
+                let instance_buffer_pool = self.instance_buffer_pool.clone();
+                let instance_buffer = Cell::new(Some(instance_buffer));
+                let block = ConcreteBlock::new(move |_| {
+                    if let Some(instance_buffer) = instance_buffer.take() {
+                        instance_buffer_pool.lock().release(instance_buffer);
                     }
-                    return;
+                });
+                let block = block.copy();
+                command_buffer.add_completed_handler(&block);
+
+                if self.presents_with_transaction {
+                    command_buffer.commit();
+                    command_buffer.wait_until_scheduled();
+                    drawable.present();
+                } else {
+                    command_buffer.present_drawable(drawable);
+                    command_buffer.commit();
                 }
-                Err(err) => {
-                    log::error!(
-                        "failed to render: {}. retrying with larger instance buffer size",
-                        err
-                    );
-                    let mut instance_buffer_pool = self.instance_buffer_pool.lock();
-                    let buffer_size = instance_buffer_pool.buffer_size;
-                    if buffer_size >= 256 * 1024 * 1024 {
-                        log::error!("instance buffer size grew too large: {}", buffer_size);
-                        break;
-                    }
-                    instance_buffer_pool.reset(buffer_size * 2);
-                    log::info!(
-                        "increased instance buffer size to {}",
-                        instance_buffer_pool.buffer_size
-                    );
-                }
+            }
+            Err(err) => {
+                self.instance_buffer_pool.lock().release(instance_buffer);
+                log::error!("failed to render: {}", err);
             }
         }
     }
@@ -646,80 +692,108 @@ impl MetalRenderer {
             .next_drawable()
             .ok_or_else(|| anyhow::anyhow!("Failed to get drawable for render_to_image"))?;
 
-        loop {
-            let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
+        let required_instance_buffer_size = self.required_instance_buffer_size(scene);
+        let mut instance_buffer = self
+            .instance_buffer_pool
+            .lock()
+            .acquire(&self.device, required_instance_buffer_size);
 
-            let command_buffer =
-                self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
-
-            match command_buffer {
-                Ok(command_buffer) => {
-                    let instance_buffer_pool = self.instance_buffer_pool.clone();
-                    let instance_buffer = Cell::new(Some(instance_buffer));
-                    let block = ConcreteBlock::new(move |_| {
-                        if let Some(instance_buffer) = instance_buffer.take() {
-                            instance_buffer_pool.lock().release(instance_buffer);
-                        }
-                    });
-                    let block = block.copy();
-                    command_buffer.add_completed_handler(&block);
-
-                    // Commit and wait for completion without presenting
-                    command_buffer.commit();
-                    command_buffer.wait_until_completed();
-
-                    // Read pixels from the texture
-                    let texture = drawable.texture();
-                    let width = texture.width() as u32;
-                    let height = texture.height() as u32;
-                    let bytes_per_row = width as usize * 4;
-                    let buffer_size = height as usize * bytes_per_row;
-
-                    let mut pixels = vec![0u8; buffer_size];
-
-                    let region = metal::MTLRegion {
-                        origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
-                        size: metal::MTLSize {
-                            width: width as u64,
-                            height: height as u64,
-                            depth: 1,
-                        },
-                    };
-
-                    texture.get_bytes(
-                        pixels.as_mut_ptr() as *mut std::ffi::c_void,
-                        bytes_per_row as u64,
-                        region,
-                        0,
-                    );
-
-                    // Convert BGRA to RGBA (swap B and R channels)
-                    for chunk in pixels.chunks_exact_mut(4) {
-                        chunk.swap(0, 2);
-                    }
-
-                    return RgbaImage::from_raw(width, height, pixels).ok_or_else(|| {
-                        anyhow::anyhow!("Failed to create RgbaImage from pixel data")
-                    });
-                }
+        let command_buffer =
+            match self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size) {
+                Ok(command_buffer) => command_buffer,
                 Err(err) => {
-                    log::error!(
-                        "failed to render: {}. retrying with larger instance buffer size",
-                        err
-                    );
-                    let mut instance_buffer_pool = self.instance_buffer_pool.lock();
-                    let buffer_size = instance_buffer_pool.buffer_size;
-                    if buffer_size >= 256 * 1024 * 1024 {
-                        anyhow::bail!("instance buffer size grew too large: {}", buffer_size);
-                    }
-                    instance_buffer_pool.reset(buffer_size * 2);
-                    log::info!(
-                        "increased instance buffer size to {}",
-                        instance_buffer_pool.buffer_size
-                    );
+                    self.instance_buffer_pool.lock().release(instance_buffer);
+                    anyhow::bail!("failed to render: {}", err);
                 }
+            };
+        let instance_buffer_pool = self.instance_buffer_pool.clone();
+        let instance_buffer = Cell::new(Some(instance_buffer));
+        let block = ConcreteBlock::new(move |_| {
+            if let Some(instance_buffer) = instance_buffer.take() {
+                instance_buffer_pool.lock().release(instance_buffer);
+            }
+        });
+        let block = block.copy();
+        command_buffer.add_completed_handler(&block);
+
+        // Commit and wait for completion without presenting
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // Read pixels from the texture
+        let texture = drawable.texture();
+        let width = texture.width() as u32;
+        let height = texture.height() as u32;
+        let bytes_per_row = width as usize * 4;
+        let buffer_size = height as usize * bytes_per_row;
+
+        let mut pixels = vec![0u8; buffer_size];
+
+        let region = metal::MTLRegion {
+            origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            size: metal::MTLSize {
+                width: width as u64,
+                height: height as u64,
+                depth: 1,
+            },
+        };
+
+        texture.get_bytes(
+            pixels.as_mut_ptr() as *mut std::ffi::c_void,
+            bytes_per_row as u64,
+            region,
+            0,
+        );
+
+        // Convert BGRA to RGBA (swap B and R channels)
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk.swap(0, 2);
+        }
+
+        RgbaImage::from_raw(width, height, pixels)
+            .ok_or_else(|| anyhow::anyhow!("Failed to create RgbaImage from pixel data"))
+    }
+
+    fn required_instance_buffer_size(&self, scene: &Scene) -> usize {
+        let mut size = 0;
+        for batch in scene.batches() {
+            match batch {
+                PrimitiveBatch::Shadows(range) => {
+                    add_instance_bytes::<Shadow>(&mut size, range.len());
+                }
+                PrimitiveBatch::BackdropBlurs(range) => {
+                    for _ in range {
+                        add_instance_bytes::<BackdropBlur>(&mut size, 1);
+                    }
+                }
+                PrimitiveBatch::Quads(range) => {
+                    add_instance_bytes::<Quad>(&mut size, range.len());
+                }
+                PrimitiveBatch::Paths(range) => {
+                    for path in &scene.paths[range] {
+                        align_offset(&mut size);
+                        size += path.vertices.len() * mem::size_of::<PathRasterizationVertex>();
+                        add_instance_bytes::<PathSprite>(&mut size, 1);
+                    }
+                }
+                PrimitiveBatch::Underlines(range) => {
+                    add_instance_bytes::<Underline>(&mut size, range.len());
+                }
+                PrimitiveBatch::MonochromeSprites { range, .. } => {
+                    add_instance_bytes::<MonochromeSprite>(&mut size, range.len());
+                }
+                PrimitiveBatch::PolychromeSprites { range, .. } => {
+                    add_instance_bytes::<PolychromeSprite>(&mut size, range.len());
+                }
+                PrimitiveBatch::Surfaces(range) => {
+                    for _ in range {
+                        add_instance_bytes::<Surface>(&mut size, 1);
+                    }
+                }
+                PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
+        size
     }
 
     fn draw_primitives(
@@ -767,7 +841,7 @@ impl MetalRenderer {
                         );
                         true
                     } else {
-                        let Some(scratch_bounds) =
+                        let Some(mut scratch_bounds) =
                             Self::backdrop_scratch_bounds(blurs, viewport_size)
                         else {
                             command_encoder = new_command_encoder(
@@ -780,8 +854,14 @@ impl MetalRenderer {
                             );
                             continue;
                         };
+                        if let Some(texture_size) = self.ensure_backdrop_textures(
+                            scratch_bounds.texture_size,
+                            Self::max_backdrop_texture_size(scratch_bounds, viewport_size),
+                        ) {
+                            scratch_bounds.texture_size = texture_size;
+                        }
                         let prepared_blurs = Self::prepare_backdrop_blurs(blurs, scratch_bounds);
-                        let did_copy = self.ensure_backdrop_textures(scratch_bounds.texture_size)
+                        let did_copy = self.backdrop_texture.is_some()
                             && self.copy_drawable_to_backdrop(
                                 command_buffer,
                                 drawable,
@@ -1066,6 +1146,20 @@ impl MetalRenderer {
         })
     }
 
+    fn max_backdrop_texture_size(
+        scratch_bounds: BackdropScratchBounds,
+        viewport_size: Size<DevicePixels>,
+    ) -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels(
+                (viewport_size.width.0 - scratch_bounds.bounds.origin.x.0 as i32).max(0),
+            ),
+            height: DevicePixels(
+                (viewport_size.height.0 - scratch_bounds.bounds.origin.y.0 as i32).max(0),
+            ),
+        }
+    }
+
     fn backdrop_blur_padding(radius: f32) -> ScaledPixels {
         ScaledPixels((radius + BACKDROP_BLUR_RADIUS_PER_LEVEL * 2.0).ceil())
     }
@@ -1080,8 +1174,8 @@ impl MetalRenderer {
             .map(|mut blur| {
                 blur.source_origin_x = scratch_bounds.bounds.origin.x.0;
                 blur.source_origin_y = scratch_bounds.bounds.origin.y.0;
-                blur.source_width = scratch_bounds.bounds.size.width.0;
-                blur.source_height = scratch_bounds.bounds.size.height.0;
+                blur.source_width = scratch_bounds.texture_size.width.0 as f32;
+                blur.source_height = scratch_bounds.texture_size.height.0 as f32;
                 blur
             })
             .collect()
@@ -2056,6 +2150,14 @@ fn build_path_rasterization_pipeline_state(
 // Align to multiples of 256 make Metal happy.
 fn align_offset(offset: &mut usize) {
     *offset = (*offset).div_ceil(256) * 256;
+}
+
+fn add_instance_bytes<T>(offset: &mut usize, count: usize) {
+    if count == 0 {
+        return;
+    }
+    align_offset(offset);
+    *offset += mem::size_of::<T>() * count;
 }
 
 #[repr(C)]

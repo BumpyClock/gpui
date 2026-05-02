@@ -30,6 +30,7 @@ const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const BACKDROP_BLUR_RADIUS_PER_LEVEL: f32 = 6.0;
 const MAX_BACKDROP_BLUR_LEVELS: usize = 4;
 const BACKDROP_BLUR_OFFSET: f32 = 1.0;
+const MAX_STRUCTURED_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -358,20 +359,32 @@ impl DirectXRenderer {
                     if blurs.is_empty() {
                         Ok(())
                     } else {
-                        let Some(scratch_bounds) =
+                        let Some(mut scratch_bounds) =
                             Self::backdrop_scratch_bounds(blurs, self.width, self.height)
                         else {
                             continue;
                         };
-                        let prepared_blurs =
-                            Self::prepare_backdrop_blurs(blurs, scratch_bounds);
                         {
                             let devices = self.devices.as_ref().context("devices missing")?;
-                            self.resources
+                            if let Some(texture_size) = self
+                                .resources
                                 .as_mut()
                                 .context("resources missing")?
-                                .ensure_backdrop_resources(devices, scratch_bounds.texture_size)?;
+                                .ensure_backdrop_resources(
+                                    devices,
+                                    scratch_bounds.texture_size,
+                                    Self::max_backdrop_texture_size(
+                                        scratch_bounds,
+                                        self.width,
+                                        self.height,
+                                    ),
+                                )?
+                            {
+                                scratch_bounds.texture_size = texture_size;
+                            }
                         }
+                        let prepared_blurs =
+                            Self::prepare_backdrop_blurs(blurs, scratch_bounds);
                         self.copy_render_target_to_backdrop(scratch_bounds)?;
                         let mut current_passes = None;
                         let mut current_blur_srv = None;
@@ -716,6 +729,17 @@ impl DirectXRenderer {
         })
     }
 
+    fn max_backdrop_texture_size(
+        scratch_bounds: BackdropScratchBounds,
+        width: u32,
+        height: u32,
+    ) -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels((width as i32 - scratch_bounds.bounds.origin.x.0 as i32).max(0)),
+            height: DevicePixels((height as i32 - scratch_bounds.bounds.origin.y.0 as i32).max(0)),
+        }
+    }
+
     fn backdrop_blur_padding(radius: f32) -> ScaledPixels {
         ScaledPixels((radius + BACKDROP_BLUR_RADIUS_PER_LEVEL * 2.0).ceil())
     }
@@ -730,8 +754,8 @@ impl DirectXRenderer {
             .map(|mut blur| {
                 blur.source_origin_x = scratch_bounds.bounds.origin.x.0;
                 blur.source_origin_y = scratch_bounds.bounds.origin.y.0;
-                blur.source_width = scratch_bounds.bounds.size.width.0;
-                blur.source_height = scratch_bounds.bounds.size.height.0;
+                blur.source_width = scratch_bounds.texture_size.width.0 as f32;
+                blur.source_height = scratch_bounds.texture_size.height.0 as f32;
                 blur
             })
             .collect()
@@ -1347,8 +1371,23 @@ impl DirectXResources {
             if current_size.width >= size.width && current_size.height >= size.height {
                 return Ok(Some(current_size));
             }
+            return self.create_path_intermediate_resources(
+                devices,
+                Size {
+                    width: current_size.width.max(size.width),
+                    height: current_size.height.max(size.height),
+                },
+            );
         }
 
+        self.create_path_intermediate_resources(devices, size)
+    }
+
+    fn create_path_intermediate_resources(
+        &mut self,
+        devices: &DirectXRendererDevices,
+        size: Size<DevicePixels>,
+    ) -> Result<Option<Size<DevicePixels>>> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.discard_path_intermediate_resources();
             return Ok(None);
@@ -1373,14 +1412,38 @@ impl DirectXResources {
         &mut self,
         devices: &DirectXRendererDevices,
         size: Size<DevicePixels>,
-    ) -> Result<()> {
-        if self.backdrop_texture.is_some() && self.backdrop_size == Some(size) {
-            return Ok(());
+        max_size: Size<DevicePixels>,
+    ) -> Result<Option<Size<DevicePixels>>> {
+        if let Some(current_size) = self.backdrop_size
+            && self.backdrop_texture.is_some()
+        {
+            if current_size.width >= size.width
+                && current_size.height >= size.height
+                && current_size.width <= max_size.width
+                && current_size.height <= max_size.height
+            {
+                return Ok(Some(current_size));
+            }
+            return self.create_backdrop_resources(
+                devices,
+                Size {
+                    width: current_size.width.max(size.width).min(max_size.width),
+                    height: current_size.height.max(size.height).min(max_size.height),
+                },
+            );
         }
 
+        self.create_backdrop_resources(devices, size)
+    }
+
+    fn create_backdrop_resources(
+        &mut self,
+        devices: &DirectXRendererDevices,
+        size: Size<DevicePixels>,
+    ) -> Result<Option<Size<DevicePixels>>> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.discard_backdrop_resources();
-            return Ok(());
+            return Ok(None);
         }
 
         let width = size.width.0 as u32;
@@ -1392,7 +1455,7 @@ impl DirectXResources {
         self.backdrop_srv = backdrop_srv;
         self.backdrop_size = Some(size);
         self.backdrop_blur = Some(backdrop_blur);
-        Ok(())
+        Ok(Some(size))
     }
 }
 
@@ -2227,8 +2290,18 @@ fn create_buffer(
     element_size: usize,
     buffer_size: usize,
 ) -> Result<ID3D11Buffer> {
+    let byte_width = element_size
+        .checked_mul(buffer_size)
+        .context("structured buffer size overflow")?;
+    if byte_width > MAX_STRUCTURED_BUFFER_BYTES {
+        anyhow::bail!(
+            "structured buffer size {} exceeds maximum {}",
+            byte_width,
+            MAX_STRUCTURED_BUFFER_BYTES
+        );
+    }
     let desc = D3D11_BUFFER_DESC {
-        ByteWidth: (element_size * buffer_size) as u32,
+        ByteWidth: u32::try_from(byte_width).context("structured buffer size exceeds u32")?,
         Usage: D3D11_USAGE_DYNAMIC,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
         CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
