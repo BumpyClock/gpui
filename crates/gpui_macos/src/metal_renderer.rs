@@ -591,6 +591,7 @@ impl MetalRenderer {
                     } else {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
+                        command_buffer.wait_until_scheduled();
                     }
                     return;
                 }
