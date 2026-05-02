@@ -117,8 +117,8 @@ pub struct WgpuRenderer {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
-    backdrop_texture: wgpu::Texture,
-    backdrop_view: wgpu::TextureView,
+    backdrop_texture: Option<wgpu::Texture>,
+    backdrop_view: Option<wgpu::TextureView>,
     rendering_params: RenderingParameters,
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
@@ -318,13 +318,6 @@ impl WgpuRenderer {
             mapped_at_creation: false,
         });
 
-        let (backdrop_texture, backdrop_view) = Self::create_backdrop_texture(
-            &device,
-            surface_format,
-            surface_config.width,
-            surface_config.height,
-        );
-
         let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("globals_bind_group"),
             layout: &bind_group_layouts.globals,
@@ -401,8 +394,8 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
-            backdrop_texture,
-            backdrop_view,
+            backdrop_texture: None,
+            backdrop_view: None,
             rendering_params,
             dual_source_blending,
             adapter_info,
@@ -900,14 +893,11 @@ impl WgpuRenderer {
             self.path_msaa_texture = None;
             self.path_msaa_view = None;
 
-            let (backdrop_texture, backdrop_view) = Self::create_backdrop_texture(
-                &self.device,
-                self.surface_config.format,
-                self.surface_config.width,
-                self.surface_config.height,
-            );
-            self.backdrop_texture = backdrop_texture;
-            self.backdrop_view = backdrop_view;
+            if let Some(ref texture) = self.backdrop_texture {
+                texture.destroy();
+            }
+            self.backdrop_texture = None;
+            self.backdrop_view = None;
         }
     }
 
@@ -939,6 +929,21 @@ impl WgpuRenderer {
         .unwrap_or((None, None));
         self.path_msaa_texture = path_msaa_texture;
         self.path_msaa_view = path_msaa_view;
+    }
+
+    fn ensure_backdrop_texture(&mut self) {
+        if self.backdrop_texture.is_some() {
+            return;
+        }
+
+        let (backdrop_texture, backdrop_view) = Self::create_backdrop_texture(
+            &self.device,
+            self.surface_config.format,
+            self.surface_config.width,
+            self.surface_config.height,
+        );
+        self.backdrop_texture = Some(backdrop_texture);
+        self.backdrop_view = Some(backdrop_view);
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -1030,9 +1035,6 @@ impl WgpuRenderer {
             }
         };
 
-        // Now that we know the surface is healthy, ensure intermediate textures exist
-        self.ensure_intermediate_textures();
-
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1119,6 +1121,10 @@ impl WgpuRenderer {
                             if blurs.is_empty() {
                                 continue;
                             }
+                            self.ensure_backdrop_texture();
+                            let Some(backdrop_texture) = self.backdrop_texture.as_ref() else {
+                                continue;
+                            };
                             drop(pass);
                             encoder.copy_texture_to_texture(
                                 wgpu::TexelCopyTextureInfo {
@@ -1128,7 +1134,7 @@ impl WgpuRenderer {
                                     aspect: wgpu::TextureAspect::All,
                                 },
                                 wgpu::TexelCopyTextureInfo {
-                                    texture: &self.backdrop_texture,
+                                    texture: backdrop_texture,
                                     mip_level: 0,
                                     origin: wgpu::Origin3d::ZERO,
                                     aspect: wgpu::TextureAspect::All,
@@ -1161,6 +1167,7 @@ impl WgpuRenderer {
                                 continue;
                             }
 
+                            self.ensure_intermediate_textures();
                             drop(pass);
 
                             let did_draw = self.draw_paths_to_intermediate(
@@ -1291,11 +1298,14 @@ impl WgpuRenderer {
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
+        let Some(backdrop_view) = self.backdrop_view.as_ref() else {
+            return false;
+        };
         let data = unsafe { Self::instance_bytes(blurs) };
         self.draw_instances_with_texture(
             data,
             blurs.len() as u32,
-            &self.backdrop_view,
+            backdrop_view,
             &self.pipelines.backdrop_blurs,
             instance_offset,
             pass,
@@ -1616,7 +1626,11 @@ impl WgpuRenderer {
         }
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
-        self.backdrop_texture.destroy();
+        if let Some(ref texture) = self.backdrop_texture {
+            texture.destroy();
+        }
+        self.backdrop_texture = None;
+        self.backdrop_view = None;
     }
 
     /// Returns true if the GPU device was lost and recovery is needed.

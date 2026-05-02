@@ -371,22 +371,32 @@ impl MetalRenderer {
                 setDrawableSize: size
             ];
         }
-        let device_pixels_size = Size {
-            width: DevicePixels(size.width as i32),
-            height: DevicePixels(size.height as i32),
-        };
-        self.update_path_intermediate_textures(device_pixels_size);
-        self.update_backdrop_texture(device_pixels_size);
-        self.update_backdrop_blur_textures(device_pixels_size);
+        self.discard_path_intermediate_textures();
+        self.discard_backdrop_textures();
     }
 
-    fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+    fn discard_path_intermediate_textures(&mut self) {
+        self.path_intermediate_texture = None;
+        self.path_intermediate_msaa_texture = None;
+    }
+
+    fn discard_backdrop_textures(&mut self) {
+        self.backdrop_texture = None;
+        self.backdrop_blur_level_sizes.clear();
+        self.backdrop_blur_downsample_textures.clear();
+        self.backdrop_blur_upsample_textures.clear();
+    }
+
+    fn ensure_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+        if self.path_intermediate_texture.is_some() {
+            return;
+        }
+
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
         if size.width.0 <= 0 || size.height.0 <= 0 {
-            self.path_intermediate_texture = None;
-            self.path_intermediate_msaa_texture = None;
+            self.discard_path_intermediate_textures();
             return;
         }
 
@@ -407,6 +417,15 @@ impl MetalRenderer {
         } else {
             self.path_intermediate_msaa_texture = None;
         }
+    }
+
+    fn ensure_backdrop_textures(&mut self, size: Size<DevicePixels>) {
+        if self.backdrop_texture.is_some() {
+            return;
+        }
+
+        self.update_backdrop_texture(size);
+        self.update_backdrop_blur_textures(size);
     }
 
     fn update_backdrop_texture(&mut self, size: Size<DevicePixels>) {
@@ -678,6 +697,7 @@ impl MetalRenderer {
                         );
                         true
                     } else {
+                        self.ensure_backdrop_textures(viewport_size);
                         let did_copy =
                             self.copy_drawable_to_backdrop(command_buffer, drawable, viewport_size);
                         let mut ok = true;
@@ -749,6 +769,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
+                    self.ensure_path_intermediate_textures(viewport_size);
 
                     let did_draw = self.draw_paths_to_intermediate(
                         paths,

@@ -74,14 +74,14 @@ struct DirectXResources {
     render_target_view: Option<ID3D11RenderTargetView>,
 
     // Path intermediate textures (with MSAA)
-    path_intermediate_texture: ID3D11Texture2D,
+    path_intermediate_texture: Option<ID3D11Texture2D>,
     path_intermediate_srv: Option<ID3D11ShaderResourceView>,
-    path_intermediate_msaa_texture: ID3D11Texture2D,
+    path_intermediate_msaa_texture: Option<ID3D11Texture2D>,
     path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
     // Backdrop copy texture
-    backdrop_texture: ID3D11Texture2D,
+    backdrop_texture: Option<ID3D11Texture2D>,
     backdrop_srv: Option<ID3D11ShaderResourceView>,
-    backdrop_blur: BackdropBlurResources,
+    backdrop_blur: Option<BackdropBlurResources>,
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
@@ -340,11 +340,18 @@ impl DirectXRenderer {
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::BackdropBlurs(range) => {
-                    self.copy_render_target_to_backdrop()?;
                     let blurs = &scene.backdrop_blurs[range];
                     if blurs.is_empty() {
                         Ok(())
                     } else {
+                        {
+                            let devices = self.devices.as_ref().context("devices missing")?;
+                            self.resources
+                                .as_mut()
+                                .context("resources missing")?
+                                .ensure_backdrop_resources(devices, self.width, self.height)?;
+                        }
+                        self.copy_render_target_to_backdrop()?;
                         let mut current_passes = None;
                         let mut current_blur_srv = None;
                         let mut start = 0;
@@ -371,8 +378,23 @@ impl DirectXRenderer {
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    self.draw_paths_to_intermediate(paths)?;
-                    self.draw_paths_from_intermediate(paths)
+                    if paths.is_empty() {
+                        Ok(())
+                    } else {
+                        {
+                            let devices = self.devices.as_ref().context("devices missing")?;
+                            self.resources
+                                .as_mut()
+                                .context("resources missing")?
+                                .ensure_path_intermediate_resources(
+                                    devices,
+                                    self.width,
+                                    self.height,
+                                )?;
+                        }
+                        self.draw_paths_to_intermediate(paths)?;
+                        self.draw_paths_from_intermediate(paths)
+                    }
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
@@ -582,11 +604,15 @@ impl DirectXRenderer {
             .render_target
             .as_ref()
             .context("render target missing")?;
+        let backdrop_texture = resources
+            .backdrop_texture
+            .as_ref()
+            .context("backdrop texture missing")?;
         unsafe {
             devices.device_context.OMSetRenderTargets(None, None);
             devices
                 .device_context
-                .CopyResource(&resources.backdrop_texture, render_target);
+                .CopyResource(backdrop_texture, render_target);
             if let Some(ref render_target_view) = resources.render_target_view {
                 devices
                     .device_context
@@ -604,7 +630,11 @@ impl DirectXRenderer {
             Some(resources) => resources,
             None => return 0,
         };
-        let max_levels = resources.backdrop_blur.level_sizes.len().saturating_sub(1);
+        let max_levels = resources
+            .backdrop_blur
+            .as_ref()
+            .map(|blur| blur.level_sizes.len().saturating_sub(1))
+            .unwrap_or(0);
         if max_levels == 0 {
             return 0;
         }
@@ -647,20 +677,22 @@ impl DirectXRenderer {
     ) -> Result<Option<ID3D11ShaderResourceView>> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
+        let backdrop_blur = resources
+            .backdrop_blur
+            .as_ref()
+            .context("backdrop blur resources missing")?;
         if passes == 0 {
             return Ok(resources.backdrop_srv.clone());
         }
-        if resources.backdrop_blur.downsample_srvs.len() < passes
-            || resources.backdrop_blur.upsample_srvs.is_empty()
-        {
+        if backdrop_blur.downsample_srvs.len() < passes || backdrop_blur.upsample_srvs.is_empty() {
             return Ok(resources.backdrop_srv.clone());
         }
 
         let mut input_srv = resources.backdrop_srv.clone();
         for level in 0..passes {
-            let input_size = resources.backdrop_blur.level_sizes[level];
-            let output_size = resources.backdrop_blur.level_sizes[level + 1];
-            let output_view = resources.backdrop_blur.downsample_views[level].as_ref();
+            let input_size = backdrop_blur.level_sizes[level];
+            let output_size = backdrop_blur.level_sizes[level + 1];
+            let output_view = backdrop_blur.downsample_views[level].as_ref();
             let viewport = D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -684,14 +716,14 @@ impl DirectXRenderer {
                 &viewport,
                 params,
             )?;
-            input_srv = resources.backdrop_blur.downsample_srvs[level].clone();
+            input_srv = backdrop_blur.downsample_srvs[level].clone();
         }
 
-        let mut input_srv = resources.backdrop_blur.downsample_srvs[passes - 1].clone();
+        let mut input_srv = backdrop_blur.downsample_srvs[passes - 1].clone();
         for level in (0..passes).rev() {
-            let input_size = resources.backdrop_blur.level_sizes[level + 1];
-            let output_size = resources.backdrop_blur.level_sizes[level];
-            let output_view = resources.backdrop_blur.upsample_views[level].as_ref();
+            let input_size = backdrop_blur.level_sizes[level + 1];
+            let output_size = backdrop_blur.level_sizes[level];
+            let output_view = backdrop_blur.upsample_views[level].as_ref();
             let viewport = D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
@@ -715,7 +747,7 @@ impl DirectXRenderer {
                 &viewport,
                 params,
             )?;
-            input_srv = resources.backdrop_blur.upsample_srvs[level].clone();
+            input_srv = backdrop_blur.upsample_srvs[level].clone();
         }
 
         unsafe {
@@ -729,12 +761,7 @@ impl DirectXRenderer {
                 .RSSetViewports(Some(slice::from_ref(&resources.viewport)));
         }
 
-        Ok(resources
-            .backdrop_blur
-            .upsample_srvs
-            .first()
-            .cloned()
-            .unwrap_or(None))
+        Ok(backdrop_blur.upsample_srvs.first().cloned().unwrap_or(None))
     }
 
     fn draw_backdrop_blur_pass(
@@ -796,17 +823,27 @@ impl DirectXRenderer {
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
+        let path_intermediate_msaa_view = resources
+            .path_intermediate_msaa_view
+            .as_ref()
+            .context("path intermediate MSAA view missing")?;
+        let path_intermediate_texture = resources
+            .path_intermediate_texture
+            .as_ref()
+            .context("path intermediate texture missing")?;
+        let path_intermediate_msaa_texture = resources
+            .path_intermediate_msaa_texture
+            .as_ref()
+            .context("path intermediate MSAA texture missing")?;
         // Clear intermediate MSAA texture
         unsafe {
-            devices.device_context.ClearRenderTargetView(
-                resources.path_intermediate_msaa_view.as_ref().unwrap(),
-                &[0.0; 4],
-            );
+            devices
+                .device_context
+                .ClearRenderTargetView(path_intermediate_msaa_view, &[0.0; 4]);
             // Set intermediate MSAA texture as render target
-            devices.device_context.OMSetRenderTargets(
-                Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
-                None,
-            );
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(&[Some(path_intermediate_msaa_view.clone())]), None);
         }
 
         // Collect all vertices and sprites for a single draw call
@@ -839,9 +876,9 @@ impl DirectXRenderer {
         // Resolve MSAA to non-MSAA intermediate texture
         unsafe {
             devices.device_context.ResolveSubresource(
-                &resources.path_intermediate_texture,
+                path_intermediate_texture,
                 0,
-                &resources.path_intermediate_msaa_texture,
+                path_intermediate_msaa_texture,
                 0,
                 RENDER_TARGET_FORMAT,
             );
@@ -883,6 +920,10 @@ impl DirectXRenderer {
 
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
+        let path_intermediate_srv = resources
+            .path_intermediate_srv
+            .as_ref()
+            .context("path intermediate shader resource missing")?;
         self.pipelines.path_sprite_pipeline.update_buffer(
             &devices.device,
             &devices.device_context,
@@ -892,7 +933,7 @@ impl DirectXRenderer {
         // Draw the sprites with the path texture
         self.pipelines.path_sprite_pipeline.draw_with_texture(
             &devices.device_context,
-            slice::from_ref(&resources.path_intermediate_srv),
+            &[Some(path_intermediate_srv.clone())],
             slice::from_ref(&resources.viewport),
             slice::from_ref(&self.globals.global_params_buffer),
             slice::from_ref(&self.globals.sampler),
@@ -1064,31 +1105,21 @@ impl DirectXResources {
             )?
         };
 
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            backdrop_texture,
-            backdrop_srv,
-            backdrop_blur,
-            viewport,
-        ) = create_resources(devices, &swap_chain, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
             swap_chain,
             render_target: Some(render_target),
             render_target_view,
-            path_intermediate_texture,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            path_intermediate_srv,
-            backdrop_texture,
-            backdrop_srv,
-            backdrop_blur,
+            path_intermediate_texture: None,
+            path_intermediate_msaa_texture: None,
+            path_intermediate_msaa_view: None,
+            path_intermediate_srv: None,
+            backdrop_texture: None,
+            backdrop_srv: None,
+            backdrop_blur: None,
             viewport,
         })
     }
@@ -1100,28 +1131,66 @@ impl DirectXResources {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let (
-            render_target,
-            render_target_view,
-            path_intermediate_texture,
-            path_intermediate_srv,
-            path_intermediate_msaa_texture,
-            path_intermediate_msaa_view,
-            backdrop_texture,
-            backdrop_srv,
-            backdrop_blur,
-            viewport,
-        ) = create_resources(devices, &self.swap_chain, width, height)?;
+        let (render_target, render_target_view, viewport) =
+            create_resources(devices, &self.swap_chain, width, height)?;
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
-        self.path_intermediate_texture = path_intermediate_texture;
-        self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
-        self.path_intermediate_msaa_view = path_intermediate_msaa_view;
-        self.path_intermediate_srv = path_intermediate_srv;
-        self.backdrop_texture = backdrop_texture;
-        self.backdrop_srv = backdrop_srv;
-        self.backdrop_blur = backdrop_blur;
+        self.discard_path_intermediate_resources();
+        self.discard_backdrop_resources();
         self.viewport = viewport;
+        Ok(())
+    }
+
+    fn discard_path_intermediate_resources(&mut self) {
+        self.path_intermediate_texture = None;
+        self.path_intermediate_srv = None;
+        self.path_intermediate_msaa_texture = None;
+        self.path_intermediate_msaa_view = None;
+    }
+
+    fn discard_backdrop_resources(&mut self) {
+        self.backdrop_texture = None;
+        self.backdrop_srv = None;
+        self.backdrop_blur = None;
+    }
+
+    fn ensure_path_intermediate_resources(
+        &mut self,
+        devices: &DirectXRendererDevices,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        if self.path_intermediate_texture.is_some() {
+            return Ok(());
+        }
+
+        let (path_intermediate_texture, path_intermediate_srv) =
+            create_path_intermediate_texture(&devices.device, width, height)?;
+        let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
+            create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
+        self.path_intermediate_texture = Some(path_intermediate_texture);
+        self.path_intermediate_srv = path_intermediate_srv;
+        self.path_intermediate_msaa_texture = Some(path_intermediate_msaa_texture);
+        self.path_intermediate_msaa_view = path_intermediate_msaa_view;
+        Ok(())
+    }
+
+    fn ensure_backdrop_resources(
+        &mut self,
+        devices: &DirectXRendererDevices,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        if self.backdrop_texture.is_some() {
+            return Ok(());
+        }
+
+        let (backdrop_texture, backdrop_srv) =
+            create_backdrop_texture_and_srv(&devices.device, width, height)?;
+        let backdrop_blur = create_backdrop_blur_resources(&devices.device, width, height)?;
+        self.backdrop_texture = Some(backdrop_texture);
+        self.backdrop_srv = backdrop_srv;
+        self.backdrop_blur = Some(backdrop_blur);
         Ok(())
     }
 }
@@ -1594,37 +1663,12 @@ fn create_resources(
 ) -> Result<(
     ID3D11Texture2D,
     Option<ID3D11RenderTargetView>,
-    ID3D11Texture2D,
-    Option<ID3D11ShaderResourceView>,
-    ID3D11Texture2D,
-    Option<ID3D11RenderTargetView>,
-    ID3D11Texture2D,
-    Option<ID3D11ShaderResourceView>,
-    BackdropBlurResources,
     D3D11_VIEWPORT,
 )> {
     let (render_target, render_target_view) =
         create_render_target_and_its_view(swap_chain, &devices.device)?;
-    let (path_intermediate_texture, path_intermediate_srv) =
-        create_path_intermediate_texture(&devices.device, width, height)?;
-    let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
-        create_path_intermediate_msaa_texture_and_view(&devices.device, width, height)?;
-    let (backdrop_texture, backdrop_srv) =
-        create_backdrop_texture_and_srv(&devices.device, width, height)?;
-    let backdrop_blur = create_backdrop_blur_resources(&devices.device, width, height)?;
     let viewport = set_viewport(&devices.device_context, width as f32, height as f32);
-    Ok((
-        render_target,
-        render_target_view,
-        path_intermediate_texture,
-        path_intermediate_srv,
-        path_intermediate_msaa_texture,
-        path_intermediate_msaa_view,
-        backdrop_texture,
-        backdrop_srv,
-        backdrop_blur,
-        viewport,
-    ))
+    Ok((render_target, render_target_view, viewport))
 }
 
 #[inline]
