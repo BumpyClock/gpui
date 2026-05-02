@@ -3306,6 +3306,10 @@ impl Window {
             content_mask: content_mask.scale(scale_factor),
             corner_radii: corner_radii.scale(scale_factor),
             blur_radius: blur_radius.scale(scale_factor),
+            source_origin_x: 0.0,
+            source_origin_y: 0.0,
+            source_width: 1.0,
+            source_height: 1.0,
         });
     }
 

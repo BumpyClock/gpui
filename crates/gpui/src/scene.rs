@@ -582,6 +582,10 @@ pub struct BackdropBlur {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub blur_radius: ScaledPixels,
+    pub source_origin_x: f32,
+    pub source_origin_y: f32,
+    pub source_width: f32,
+    pub source_height: f32,
 }
 
 impl From<BackdropBlur> for Primitive {

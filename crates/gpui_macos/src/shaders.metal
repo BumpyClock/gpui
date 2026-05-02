@@ -207,8 +207,9 @@ fragment float4 backdrop_blur_fragment(
     constant Size_DevicePixels *viewport_size [[buffer(BackdropBlurInputIndex_ViewportSize)]],
     texture2d<float> backdrop_texture [[texture(BackdropBlurInputIndex_BackdropTexture)]]) {
   BackdropBlur blur = blurs[input.blur_id];
-  float2 viewport = float2(viewport_size->width, viewport_size->height);
-  float2 uv = input.position.xy / viewport;
+  float2 source_origin = float2(blur.source_origin_x, blur.source_origin_y);
+  float2 source_size = max(float2(blur.source_width, blur.source_height), float2(1.0));
+  float2 uv = (input.position.xy - source_origin) / source_size;
 
   constexpr sampler blur_sampler(mag_filter::linear, min_filter::linear,
                                  address::clamp_to_edge);

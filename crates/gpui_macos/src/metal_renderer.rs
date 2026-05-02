@@ -142,6 +142,7 @@ pub(crate) struct MetalRenderer {
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_intermediate_size: Option<Size<DevicePixels>>,
     backdrop_texture: Option<metal::Texture>,
+    backdrop_texture_size: Option<Size<DevicePixels>>,
     backdrop_blur_level_sizes: Vec<Size<DevicePixels>>,
     backdrop_blur_downsample_textures: Vec<metal::Texture>,
     backdrop_blur_upsample_textures: Vec<metal::Texture>,
@@ -160,6 +161,12 @@ pub struct PathRasterizationVertex {
 
 #[derive(Clone, Copy)]
 struct PathScratchBounds {
+    bounds: Bounds<ScaledPixels>,
+    texture_size: Size<DevicePixels>,
+}
+
+#[derive(Clone, Copy)]
+struct BackdropScratchBounds {
     bounds: Bounds<ScaledPixels>,
     texture_size: Size<DevicePixels>,
 }
@@ -361,6 +368,7 @@ impl MetalRenderer {
             path_intermediate_msaa_texture: None,
             path_intermediate_size: None,
             backdrop_texture: None,
+            backdrop_texture_size: None,
             backdrop_blur_level_sizes: Vec::new(),
             backdrop_blur_downsample_textures: Vec::new(),
             backdrop_blur_upsample_textures: Vec::new(),
@@ -409,6 +417,7 @@ impl MetalRenderer {
 
     fn discard_backdrop_textures(&mut self) {
         self.backdrop_texture = None;
+        self.backdrop_texture_size = None;
         self.backdrop_blur_level_sizes.clear();
         self.backdrop_blur_downsample_textures.clear();
         self.backdrop_blur_upsample_textures.clear();
@@ -455,18 +464,26 @@ impl MetalRenderer {
         Some(size)
     }
 
-    fn ensure_backdrop_textures(&mut self, size: Size<DevicePixels>) {
-        if self.backdrop_texture.is_some() {
-            return;
+    fn ensure_backdrop_textures(&mut self, size: Size<DevicePixels>) -> bool {
+        if self.backdrop_texture.is_some() && self.backdrop_texture_size == Some(size) {
+            return true;
+        }
+
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.discard_backdrop_textures();
+            return false;
         }
 
         self.update_backdrop_texture(size);
         self.update_backdrop_blur_textures(size);
+        self.backdrop_texture_size = Some(size);
+        true
     }
 
     fn update_backdrop_texture(&mut self, size: Size<DevicePixels>) {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.backdrop_texture = None;
+            self.backdrop_texture_size = None;
             return;
         }
 
@@ -735,9 +752,26 @@ impl MetalRenderer {
                         );
                         true
                     } else {
-                        self.ensure_backdrop_textures(viewport_size);
-                        let did_copy =
-                            self.copy_drawable_to_backdrop(command_buffer, drawable, viewport_size);
+                        let Some(scratch_bounds) =
+                            Self::backdrop_scratch_bounds(blurs, viewport_size)
+                        else {
+                            command_encoder = new_command_encoder(
+                                command_buffer,
+                                drawable,
+                                viewport_size,
+                                |color_attachment| {
+                                    color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                                },
+                            );
+                            continue;
+                        };
+                        let prepared_blurs = Self::prepare_backdrop_blurs(blurs, scratch_bounds);
+                        let did_copy = self.ensure_backdrop_textures(scratch_bounds.texture_size)
+                            && self.copy_drawable_to_backdrop(
+                                command_buffer,
+                                drawable,
+                                scratch_bounds,
+                            );
                         let mut ok = true;
                         let mut current_passes = None;
                         let mut current_blur_texture = None;
@@ -781,7 +815,7 @@ impl MetalRenderer {
 
                             if let Some(blur_texture) = current_blur_texture {
                                 ok = self.draw_backdrop_blurs(
-                                    &blurs[start..end],
+                                    &prepared_blurs[start..end],
                                     instance_buffer,
                                     &mut instance_offset,
                                     viewport_size,
@@ -942,32 +976,98 @@ impl MetalRenderer {
         &self,
         command_buffer: &metal::CommandBufferRef,
         drawable: &metal::MetalDrawableRef,
-        viewport_size: Size<DevicePixels>,
+        scratch_bounds: BackdropScratchBounds,
     ) -> bool {
         let Some(backdrop_texture) = &self.backdrop_texture else {
             return false;
         };
 
         let blit_encoder = command_buffer.new_blit_command_encoder();
-        let origin = metal::MTLOrigin { x: 0, y: 0, z: 0 };
+        let source_origin = metal::MTLOrigin {
+            x: scratch_bounds.bounds.origin.x.0 as u64,
+            y: scratch_bounds.bounds.origin.y.0 as u64,
+            z: 0,
+        };
+        let destination_origin = metal::MTLOrigin { x: 0, y: 0, z: 0 };
         let size = metal::MTLSize {
-            width: viewport_size.width.0 as u64,
-            height: viewport_size.height.0 as u64,
+            width: scratch_bounds.texture_size.width.0 as u64,
+            height: scratch_bounds.texture_size.height.0 as u64,
             depth: 1,
         };
         blit_encoder.copy_from_texture(
             drawable.texture(),
             0,
             0,
-            origin,
+            source_origin,
             size,
             backdrop_texture,
             0,
             0,
-            origin,
+            destination_origin,
         );
         blit_encoder.end_encoding();
         true
+    }
+
+    fn backdrop_scratch_bounds(
+        blurs: &[BackdropBlur],
+        viewport_size: Size<DevicePixels>,
+    ) -> Option<BackdropScratchBounds> {
+        let mut bounds = blurs
+            .first()?
+            .bounds
+            .dilate(Self::backdrop_blur_padding(blurs.first()?.blur_radius.0));
+        for blur in blurs.iter().skip(1) {
+            bounds = bounds.union(
+                &blur
+                    .bounds
+                    .dilate(Self::backdrop_blur_padding(blur.blur_radius.0)),
+            );
+        }
+
+        let viewport_bounds = Bounds {
+            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(
+                ScaledPixels::from(viewport_size.width),
+                ScaledPixels::from(viewport_size.height),
+            ),
+        };
+        bounds = bounds.intersect(&viewport_bounds);
+        if bounds.is_empty() {
+            return None;
+        }
+
+        let origin = bounds.origin.map(|component| component.floor());
+        let bottom_right = bounds.bottom_right().map(|component| component.ceil());
+        let bounds = Bounds::from_corners(origin, bottom_right);
+        Some(BackdropScratchBounds {
+            texture_size: size(
+                DevicePixels::from(bounds.size.width),
+                DevicePixels::from(bounds.size.height),
+            ),
+            bounds,
+        })
+    }
+
+    fn backdrop_blur_padding(radius: f32) -> ScaledPixels {
+        ScaledPixels((radius + BACKDROP_BLUR_RADIUS_PER_LEVEL * 2.0).ceil())
+    }
+
+    fn prepare_backdrop_blurs(
+        blurs: &[BackdropBlur],
+        scratch_bounds: BackdropScratchBounds,
+    ) -> Vec<BackdropBlur> {
+        blurs
+            .iter()
+            .cloned()
+            .map(|mut blur| {
+                blur.source_origin_x = scratch_bounds.bounds.origin.x.0;
+                blur.source_origin_y = scratch_bounds.bounds.origin.y.0;
+                blur.source_width = scratch_bounds.bounds.size.width.0;
+                blur.source_height = scratch_bounds.bounds.size.height.0;
+                blur
+            })
+            .collect()
     }
 
     fn backdrop_blur_passes_for_radius(&self, radius: f32) -> usize {

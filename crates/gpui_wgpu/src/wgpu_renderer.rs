@@ -11,6 +11,8 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
+const BACKDROP_BLUR_RADIUS_PER_LEVEL: f32 = 6.0;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GlobalParams {
@@ -77,6 +79,12 @@ struct PathScratchBounds {
     texture_size: Size<DevicePixels>,
 }
 
+#[derive(Clone, Copy)]
+struct BackdropScratchBounds {
+    bounds: Bounds<ScaledPixels>,
+    texture_size: Size<DevicePixels>,
+}
+
 pub struct WgpuSurfaceConfig {
     pub size: Size<DevicePixels>,
     pub transparent: bool,
@@ -130,6 +138,7 @@ pub struct WgpuRenderer {
     path_intermediate_size: Option<Size<DevicePixels>>,
     backdrop_texture: Option<wgpu::Texture>,
     backdrop_view: Option<wgpu::TextureView>,
+    backdrop_size: Option<Size<DevicePixels>>,
     rendering_params: RenderingParameters,
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
@@ -408,6 +417,7 @@ impl WgpuRenderer {
             path_intermediate_size: None,
             backdrop_texture: None,
             backdrop_view: None,
+            backdrop_size: None,
             rendering_params,
             dual_source_blending,
             adapter_info,
@@ -911,6 +921,7 @@ impl WgpuRenderer {
             }
             self.backdrop_texture = None;
             self.backdrop_view = None;
+            self.backdrop_size = None;
         }
     }
 
@@ -967,19 +978,35 @@ impl WgpuRenderer {
         Some(size)
     }
 
-    fn ensure_backdrop_texture(&mut self) {
-        if self.backdrop_texture.is_some() {
-            return;
+    fn ensure_backdrop_texture(&mut self, size: Size<DevicePixels>) -> bool {
+        if self.backdrop_texture.is_some() && self.backdrop_size == Some(size) {
+            return true;
+        }
+
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            if let Some(ref texture) = self.backdrop_texture {
+                texture.destroy();
+            }
+            self.backdrop_texture = None;
+            self.backdrop_view = None;
+            self.backdrop_size = None;
+            return false;
+        }
+
+        if let Some(ref texture) = self.backdrop_texture {
+            texture.destroy();
         }
 
         let (backdrop_texture, backdrop_view) = Self::create_backdrop_texture(
             &self.device,
             self.surface_config.format,
-            self.surface_config.width,
-            self.surface_config.height,
+            size.width.0 as u32,
+            size.height.0 as u32,
         );
         self.backdrop_texture = Some(backdrop_texture);
         self.backdrop_view = Some(backdrop_view);
+        self.backdrop_size = Some(size);
+        true
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -1157,16 +1184,29 @@ impl WgpuRenderer {
                             if blurs.is_empty() {
                                 continue;
                             }
-                            self.ensure_backdrop_texture();
+                            let Some(scratch_bounds) =
+                                Self::backdrop_scratch_bounds(blurs, self.viewport_size())
+                            else {
+                                continue;
+                            };
+                            if !self.ensure_backdrop_texture(scratch_bounds.texture_size) {
+                                continue;
+                            }
                             let Some(backdrop_texture) = self.backdrop_texture.as_ref() else {
                                 continue;
                             };
+                            let prepared_blurs =
+                                Self::prepare_backdrop_blurs(blurs, scratch_bounds);
                             drop(pass);
                             encoder.copy_texture_to_texture(
                                 wgpu::TexelCopyTextureInfo {
                                     texture: &frame.texture,
                                     mip_level: 0,
-                                    origin: wgpu::Origin3d::ZERO,
+                                    origin: wgpu::Origin3d {
+                                        x: scratch_bounds.bounds.origin.x.0 as u32,
+                                        y: scratch_bounds.bounds.origin.y.0 as u32,
+                                        z: 0,
+                                    },
                                     aspect: wgpu::TextureAspect::All,
                                 },
                                 wgpu::TexelCopyTextureInfo {
@@ -1176,8 +1216,8 @@ impl WgpuRenderer {
                                     aspect: wgpu::TextureAspect::All,
                                 },
                                 wgpu::Extent3d {
-                                    width: self.surface_config.width,
-                                    height: self.surface_config.height,
+                                    width: scratch_bounds.texture_size.width.0 as u32,
+                                    height: scratch_bounds.texture_size.height.0 as u32,
                                     depth_or_array_layers: 1,
                                 },
                             );
@@ -1195,7 +1235,11 @@ impl WgpuRenderer {
                                 depth_stencil_attachment: None,
                                 ..Default::default()
                             });
-                            self.draw_backdrop_blurs(blurs, &mut instance_offset, &mut pass)
+                            self.draw_backdrop_blurs(
+                                &prepared_blurs,
+                                &mut instance_offset,
+                                &mut pass,
+                            )
                         }
                         PrimitiveBatch::Paths(range) => {
                             let paths = &scene.paths[range];
@@ -1582,6 +1626,70 @@ impl WgpuRenderer {
         })
     }
 
+    fn backdrop_scratch_bounds(
+        blurs: &[BackdropBlur],
+        viewport_size: Size<DevicePixels>,
+    ) -> Option<BackdropScratchBounds> {
+        let mut bounds = blurs
+            .first()?
+            .bounds
+            .dilate(Self::backdrop_blur_padding(blurs.first()?.blur_radius.0));
+        for blur in blurs.iter().skip(1) {
+            bounds = bounds.union(
+                &blur
+                    .bounds
+                    .dilate(Self::backdrop_blur_padding(blur.blur_radius.0)),
+            );
+        }
+
+        let viewport_bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(0.0),
+                y: ScaledPixels(0.0),
+            },
+            size: Size {
+                width: ScaledPixels::from(viewport_size.width),
+                height: ScaledPixels::from(viewport_size.height),
+            },
+        };
+        bounds = bounds.intersect(&viewport_bounds);
+        if bounds.is_empty() {
+            return None;
+        }
+
+        let origin = bounds.origin.map(|component| component.floor());
+        let bottom_right = bounds.bottom_right().map(|component| component.ceil());
+        let bounds = Bounds::from_corners(origin, bottom_right);
+        Some(BackdropScratchBounds {
+            texture_size: Size {
+                width: DevicePixels::from(bounds.size.width),
+                height: DevicePixels::from(bounds.size.height),
+            },
+            bounds,
+        })
+    }
+
+    fn backdrop_blur_padding(radius: f32) -> ScaledPixels {
+        ScaledPixels((radius + BACKDROP_BLUR_RADIUS_PER_LEVEL * 2.0).ceil())
+    }
+
+    fn prepare_backdrop_blurs(
+        blurs: &[BackdropBlur],
+        scratch_bounds: BackdropScratchBounds,
+    ) -> Vec<BackdropBlur> {
+        blurs
+            .iter()
+            .cloned()
+            .map(|mut blur| {
+                blur.source_origin_x = scratch_bounds.bounds.origin.x.0;
+                blur.source_origin_y = scratch_bounds.bounds.origin.y.0;
+                blur.source_width = scratch_bounds.bounds.size.width.0;
+                blur.source_height = scratch_bounds.bounds.size.height.0;
+                blur
+            })
+            .collect()
+    }
+
     fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
@@ -1765,6 +1873,7 @@ impl WgpuRenderer {
         }
         self.backdrop_texture = None;
         self.backdrop_view = None;
+        self.backdrop_size = None;
     }
 
     /// Returns true if the GPU device was lost and recovery is needed.

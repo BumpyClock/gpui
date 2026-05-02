@@ -82,6 +82,7 @@ struct DirectXResources {
     // Backdrop copy texture
     backdrop_texture: Option<ID3D11Texture2D>,
     backdrop_srv: Option<ID3D11ShaderResourceView>,
+    backdrop_size: Option<Size<DevicePixels>>,
     backdrop_blur: Option<BackdropBlurResources>,
 
     // Cached viewport
@@ -96,6 +97,12 @@ struct BackdropBlurResources {
     upsample_textures: Vec<ID3D11Texture2D>,
     upsample_views: Vec<Option<ID3D11RenderTargetView>>,
     upsample_srvs: Vec<Option<ID3D11ShaderResourceView>>,
+}
+
+#[derive(Clone, Copy)]
+struct BackdropScratchBounds {
+    bounds: Bounds<ScaledPixels>,
+    texture_size: Size<DevicePixels>,
 }
 
 struct DirectXRenderPipelines {
@@ -351,14 +358,21 @@ impl DirectXRenderer {
                     if blurs.is_empty() {
                         Ok(())
                     } else {
+                        let Some(scratch_bounds) =
+                            Self::backdrop_scratch_bounds(blurs, self.width, self.height)
+                        else {
+                            continue;
+                        };
+                        let prepared_blurs =
+                            Self::prepare_backdrop_blurs(blurs, scratch_bounds);
                         {
                             let devices = self.devices.as_ref().context("devices missing")?;
                             self.resources
                                 .as_mut()
                                 .context("resources missing")?
-                                .ensure_backdrop_resources(devices, self.width, self.height)?;
+                                .ensure_backdrop_resources(devices, scratch_bounds.texture_size)?;
                         }
-                        self.copy_render_target_to_backdrop()?;
+                        self.copy_render_target_to_backdrop(scratch_bounds)?;
                         let mut current_passes = None;
                         let mut current_blur_srv = None;
                         let mut start = 0;
@@ -376,7 +390,10 @@ impl DirectXRenderer {
                                 current_blur_srv = self.run_backdrop_blur_passes_for_passes(passes)?;
                                 current_passes = Some(passes);
                             }
-                            self.draw_backdrop_blurs(&blurs[start..end], &current_blur_srv)?;
+                            self.draw_backdrop_blurs(
+                                &prepared_blurs[start..end],
+                                &current_blur_srv,
+                            )?;
                             start = end;
                         }
                         Ok(())
@@ -616,7 +633,10 @@ impl DirectXRenderer {
         )
     }
 
-    fn copy_render_target_to_backdrop(&mut self) -> Result<()> {
+    fn copy_render_target_to_backdrop(
+        &mut self,
+        scratch_bounds: BackdropScratchBounds,
+    ) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
         let render_target = resources
@@ -627,11 +647,28 @@ impl DirectXRenderer {
             .backdrop_texture
             .as_ref()
             .context("backdrop texture missing")?;
+        let source_box = D3D11_BOX {
+            left: scratch_bounds.bounds.origin.x.0 as u32,
+            top: scratch_bounds.bounds.origin.y.0 as u32,
+            front: 0,
+            right: (scratch_bounds.bounds.origin.x.0 as u32)
+                + scratch_bounds.texture_size.width.0 as u32,
+            bottom: (scratch_bounds.bounds.origin.y.0 as u32)
+                + scratch_bounds.texture_size.height.0 as u32,
+            back: 1,
+        };
         unsafe {
             devices.device_context.OMSetRenderTargets(None, None);
-            devices
-                .device_context
-                .CopyResource(backdrop_texture, render_target);
+            devices.device_context.CopySubresourceRegion(
+                backdrop_texture,
+                0,
+                0,
+                0,
+                0,
+                render_target,
+                0,
+                Some(&source_box),
+            );
             if let Some(ref render_target_view) = resources.render_target_view {
                 devices
                     .device_context
@@ -639,6 +676,65 @@ impl DirectXRenderer {
             }
         }
         Ok(())
+    }
+
+    fn backdrop_scratch_bounds(
+        blurs: &[BackdropBlur],
+        width: u32,
+        height: u32,
+    ) -> Option<BackdropScratchBounds> {
+        let mut bounds = blurs
+            .first()?
+            .bounds
+            .dilate(Self::backdrop_blur_padding(blurs.first()?.blur_radius.0));
+        for blur in blurs.iter().skip(1) {
+            bounds = bounds.union(
+                &blur
+                    .bounds
+                    .dilate(Self::backdrop_blur_padding(blur.blur_radius.0)),
+            );
+        }
+
+        let viewport_bounds = Bounds {
+            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(ScaledPixels(width as f32), ScaledPixels(height as f32)),
+        };
+        bounds = bounds.intersect(&viewport_bounds);
+        if bounds.is_empty() {
+            return None;
+        }
+
+        let origin = bounds.origin.map(|component| component.floor());
+        let bottom_right = bounds.bottom_right().map(|component| component.ceil());
+        let bounds = Bounds::from_corners(origin, bottom_right);
+        Some(BackdropScratchBounds {
+            texture_size: size(
+                DevicePixels::from(bounds.size.width),
+                DevicePixels::from(bounds.size.height),
+            ),
+            bounds,
+        })
+    }
+
+    fn backdrop_blur_padding(radius: f32) -> ScaledPixels {
+        ScaledPixels((radius + BACKDROP_BLUR_RADIUS_PER_LEVEL * 2.0).ceil())
+    }
+
+    fn prepare_backdrop_blurs(
+        blurs: &[BackdropBlur],
+        scratch_bounds: BackdropScratchBounds,
+    ) -> Vec<BackdropBlur> {
+        blurs
+            .iter()
+            .cloned()
+            .map(|mut blur| {
+                blur.source_origin_x = scratch_bounds.bounds.origin.x.0;
+                blur.source_origin_y = scratch_bounds.bounds.origin.y.0;
+                blur.source_width = scratch_bounds.bounds.size.width.0;
+                blur.source_height = scratch_bounds.bounds.size.height.0;
+                blur
+            })
+            .collect()
     }
 
     fn backdrop_blur_passes_for_radius(&self, radius: f32) -> usize {
@@ -1204,6 +1300,7 @@ impl DirectXResources {
             path_intermediate_size: None,
             backdrop_texture: None,
             backdrop_srv: None,
+            backdrop_size: None,
             backdrop_blur: None,
             viewport,
         })
@@ -1237,6 +1334,7 @@ impl DirectXResources {
     fn discard_backdrop_resources(&mut self) {
         self.backdrop_texture = None;
         self.backdrop_srv = None;
+        self.backdrop_size = None;
         self.backdrop_blur = None;
     }
 
@@ -1274,18 +1372,25 @@ impl DirectXResources {
     fn ensure_backdrop_resources(
         &mut self,
         devices: &DirectXRendererDevices,
-        width: u32,
-        height: u32,
+        size: Size<DevicePixels>,
     ) -> Result<()> {
-        if self.backdrop_texture.is_some() {
+        if self.backdrop_texture.is_some() && self.backdrop_size == Some(size) {
             return Ok(());
         }
 
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.discard_backdrop_resources();
+            return Ok(());
+        }
+
+        let width = size.width.0 as u32;
+        let height = size.height.0 as u32;
         let (backdrop_texture, backdrop_srv) =
             create_backdrop_texture_and_srv(&devices.device, width, height)?;
         let backdrop_blur = create_backdrop_blur_resources(&devices.device, width, height)?;
         self.backdrop_texture = Some(backdrop_texture);
         self.backdrop_srv = backdrop_srv;
+        self.backdrop_size = Some(size);
         self.backdrop_blur = Some(backdrop_blur);
         Ok(())
     }

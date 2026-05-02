@@ -522,6 +522,10 @@ struct BackdropBlur {
     Bounds content_mask;
     Corners corner_radii;
     float blur_radius;
+    float source_origin_x;
+    float source_origin_y;
+    float source_width;
+    float source_height;
 };
 
 struct BackdropBlurParams {
@@ -652,8 +656,9 @@ BackdropBlurVertexOutput backdrop_blur_vertex(uint vertex_id: SV_VertexID, uint 
 
 float4 backdrop_blur_fragment(BackdropBlurFragmentInput input) : SV_Target {
     BackdropBlur blur = backdrop_blurs[input.blur_id];
-    float2 viewport = global_viewport_size;
-    float2 uv = input.position.xy / viewport;
+    float2 source_origin = float2(blur.source_origin_x, blur.source_origin_y);
+    float2 source_size = max(float2(blur.source_width, blur.source_height), float2(1.0, 1.0));
+    float2 uv = (input.position.xy - source_origin) / source_size;
     float4 color = t_sprite.Sample(s_sprite, uv);
 
     float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);

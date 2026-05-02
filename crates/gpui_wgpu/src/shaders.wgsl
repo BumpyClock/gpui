@@ -1029,6 +1029,10 @@ struct BackdropBlur {
     content_mask: Bounds,
     corner_radii: Corners,
     blur_radius: f32,
+    source_origin_x: f32,
+    source_origin_y: f32,
+    source_width: f32,
+    source_height: f32,
 }
 @group(1) @binding(0) var<storage, read> b_backdrop_blurs: array<BackdropBlur>;
 
@@ -1066,9 +1070,10 @@ fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
     }
 
     let blur = b_backdrop_blurs[input.blur_id];
-    let viewport = globals.viewport_size;
-    let uv = input.position.xy / viewport;
-    let texel = 1.0 / max(viewport, vec2<f32>(1.0));
+    let source_origin = vec2<f32>(blur.source_origin_x, blur.source_origin_y);
+    let source_size = max(vec2<f32>(blur.source_width, blur.source_height), vec2<f32>(1.0));
+    let uv = (input.position.xy - source_origin) / source_size;
+    let texel = 1.0 / source_size;
     let radius_scale = max(blur.blur_radius / 3.0, 1.0);
     let step = texel * radius_scale;
 
