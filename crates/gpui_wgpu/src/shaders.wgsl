@@ -1115,6 +1115,8 @@ struct PathRasterizationVertex {
     st_position: vec2<f32>,
     color: Background,
     bounds: Bounds,
+    scratch_bounds: Bounds,
+    texture_size: vec2<f32>,
 }
 
 @group(1) @binding(0) var<storage, read> b_path_vertices: array<PathRasterizationVertex>;
@@ -1123,6 +1125,7 @@ struct PathRasterizationVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) st_position: vec2<f32>,
     @location(1) vertex_id: u32,
+    @location(2) screen_position: vec2<f32>,
     //TODO: use `clip_distance` once Naga supports it
     @location(3) clip_distances: vec4<f32>,
 }
@@ -1132,9 +1135,12 @@ fn vs_path_rasterization(@builtin(vertex_index) vertex_id: u32) -> PathRasteriza
     let v = b_path_vertices[vertex_id];
 
     var out = PathRasterizationVarying();
-    out.position = to_device_position_impl(v.xy_position);
+    let scratch_position = v.xy_position - v.scratch_bounds.origin;
+    let device_position = scratch_position / v.texture_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
+    out.position = vec4<f32>(device_position, 0.0, 1.0);
     out.st_position = v.st_position;
     out.vertex_id = vertex_id;
+    out.screen_position = v.xy_position;
     out.clip_distances = distance_from_clip_rect_impl(v.xy_position, v.bounds);
     return out;
 }
@@ -1167,7 +1173,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         background.solid,
         background.colors,
     );
-    let color = gradient_color(background, input.position.xy, bounds,
+    let color = gradient_color(background, input.screen_position, bounds,
         gradient_color.solid, gradient_color.color0, gradient_color.color1);
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
 }
@@ -1176,6 +1182,8 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
 
 struct PathSprite {
     bounds: Bounds,
+    scratch_bounds: Bounds,
+    texture_size: vec2<f32>,
 }
 @group(1) @binding(0) var<storage, read> b_path_sprites: array<PathSprite>;
 
@@ -1192,7 +1200,7 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     let device_position = to_device_position(unit_vertex, sprite.bounds);
     // For screen-space intermediate texture, convert screen position to texture coordinates
     let screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    let texture_coords = screen_position / globals.viewport_size;
+    let texture_coords = (screen_position - sprite.scratch_bounds.origin) / sprite.texture_size;
 
     var out = PathVarying();
     out.position = device_position;

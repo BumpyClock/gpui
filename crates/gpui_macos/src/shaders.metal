@@ -877,6 +877,7 @@ fragment float4 polychrome_sprite_fragment(
 struct PathRasterizationVertexOutput {
   float4 position [[position]];
   float2 st_position;
+  float2 screen_position;
   uint vertex_id [[flat]];
   float clip_rect_distance [[clip_distance]][4];
 };
@@ -884,24 +885,27 @@ struct PathRasterizationVertexOutput {
 struct PathRasterizationFragmentInput {
   float4 position [[position]];
   float2 st_position;
+  float2 screen_position;
   uint vertex_id [[flat]];
 };
 
 vertex PathRasterizationVertexOutput path_rasterization_vertex(
   uint vertex_id [[vertex_id]],
-  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]],
-  constant Size_DevicePixels *atlas_size [[buffer(PathRasterizationInputIndex_ViewportSize)]]
+  constant PathRasterizationVertex *vertices [[buffer(PathRasterizationInputIndex_Vertices)]]
 ) {
   PathRasterizationVertex v = vertices[vertex_id];
   float2 vertex_position = float2(v.xy_position.x, v.xy_position.y);
+  float2 scratch_origin = float2(v.scratch_bounds.origin.x, v.scratch_bounds.origin.y);
+  float2 texture_size = float2(v.texture_size.width, v.texture_size.height);
   float4 position = float4(
-    vertex_position * float2(2. / atlas_size->width, -2. / atlas_size->height) + float2(-1., 1.),
+    (vertex_position - scratch_origin) * float2(2. / texture_size.x, -2. / texture_size.y) + float2(-1., 1.),
     0.,
     1.
   );
   return PathRasterizationVertexOutput{
       position,
       float2(v.st_position.x, v.st_position.y),
+      vertex_position,
       vertex_id,
       {
         v.xy_position.x - v.bounds.origin.x,
@@ -945,7 +949,7 @@ fragment float4 path_rasterization_fragment(
 
   float4 color = fill_color(
     background,
-    input.position.xy,
+    input.screen_position,
     path_bounds,
     gradient_color.solid,
     gradient_color.color0,
@@ -974,7 +978,8 @@ vertex PathSpriteVertexOutput path_sprite_vertex(
       to_device_position(unit_vertex, sprite.bounds, viewport_size);
 
   float2 screen_position = float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height);
-  float2 texture_coords = screen_position / float2(viewport_size->width, viewport_size->height);
+  float2 scratch_origin = float2(sprite.scratch_bounds.origin.x, sprite.scratch_bounds.origin.y);
+  float2 texture_coords = (screen_position - scratch_origin) / float2(sprite.texture_size.width, sprite.texture_size.height);
 
   return PathSpriteVertexOutput{
     device_position,

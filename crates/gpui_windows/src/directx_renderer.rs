@@ -78,6 +78,7 @@ struct DirectXResources {
     path_intermediate_srv: Option<ID3D11ShaderResourceView>,
     path_intermediate_msaa_texture: Option<ID3D11Texture2D>,
     path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
+    path_intermediate_size: Option<Size<DevicePixels>>,
     // Backdrop copy texture
     backdrop_texture: Option<ID3D11Texture2D>,
     backdrop_srv: Option<ID3D11ShaderResourceView>,
@@ -109,6 +110,12 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+}
+
+#[derive(Clone, Copy)]
+struct PathScratchBounds {
+    bounds: Bounds<ScaledPixels>,
+    texture_size: Size<DevicePixels>,
 }
 
 struct DirectXGlobalElements {
@@ -378,22 +385,26 @@ impl DirectXRenderer {
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
-                    if paths.is_empty() {
-                        Ok(())
+                    if let Some(mut scratch_bounds) =
+                        Self::path_scratch_bounds(paths, self.width, self.height)
+                    {
+                        let devices = self.devices.as_ref().context("devices missing")?;
+                        let texture_size = self
+                            .resources
+                            .as_mut()
+                            .context("resources missing")?
+                            .ensure_path_intermediate_resources(
+                                devices,
+                                scratch_bounds.texture_size,
+                            )?;
+                        let Some(texture_size) = texture_size else {
+                            return Ok(());
+                        };
+                        scratch_bounds.texture_size = texture_size;
+                        self.draw_paths_to_intermediate(paths, scratch_bounds)?;
+                        self.draw_paths_from_intermediate(paths, scratch_bounds)
                     } else {
-                        {
-                            let devices = self.devices.as_ref().context("devices missing")?;
-                            self.resources
-                                .as_mut()
-                                .context("resources missing")?
-                                .ensure_path_intermediate_resources(
-                                    devices,
-                                    self.width,
-                                    self.height,
-                                )?;
-                        }
-                        self.draw_paths_to_intermediate(paths)?;
-                        self.draw_paths_from_intermediate(paths)
+                        Ok(())
                     }
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
@@ -816,7 +827,45 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn path_scratch_bounds(
+        paths: &[Path<ScaledPixels>],
+        width: u32,
+        height: u32,
+    ) -> Option<PathScratchBounds> {
+        let mut bounds = paths.first()?.clipped_bounds();
+        for path in paths.iter().skip(1) {
+            bounds = bounds.union(&path.clipped_bounds());
+        }
+
+        let viewport_bounds = Bounds {
+            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(
+                ScaledPixels::from(DevicePixels(width as i32)),
+                ScaledPixels::from(DevicePixels(height as i32)),
+            ),
+        };
+        bounds = bounds.dilate(ScaledPixels(1.0)).intersect(&viewport_bounds);
+        if bounds.is_empty() {
+            return None;
+        }
+
+        let origin = bounds.origin.map(|component| component.floor());
+        let bottom_right = bounds.bottom_right().map(|component| component.ceil());
+        let bounds = Bounds::from_corners(origin, bottom_right);
+        Some(PathScratchBounds {
+            texture_size: size(
+                DevicePixels::from(bounds.size.width),
+                DevicePixels::from(bounds.size.height),
+            ),
+            bounds,
+        })
+    }
+
+    fn draw_paths_to_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        scratch_bounds: PathScratchBounds,
+    ) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -855,6 +904,11 @@ impl DirectXRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.clipped_bounds(),
+                scratch_bounds: scratch_bounds.bounds,
+                texture_size: [
+                    scratch_bounds.texture_size.width.0 as f32,
+                    scratch_bounds.texture_size.height.0 as f32,
+                ],
             }));
         }
 
@@ -864,9 +918,15 @@ impl DirectXRenderer {
             &vertices,
         )?;
 
+        let scratch_viewport = D3D11_VIEWPORT {
+            Width: scratch_bounds.texture_size.width.0 as f32,
+            Height: scratch_bounds.texture_size.height.0 as f32,
+            MaxDepth: 1.0,
+            ..Default::default()
+        };
         self.pipelines.path_rasterization_pipeline.draw(
             &devices.device_context,
-            slice::from_ref(&resources.viewport),
+            slice::from_ref(&scratch_viewport),
             slice::from_ref(&self.globals.global_params_buffer),
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             vertices.len() as u32,
@@ -891,7 +951,11 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn draw_paths_from_intermediate(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        scratch_bounds: PathScratchBounds,
+    ) -> Result<()> {
         let Some(first_path) = paths.first() else {
             return Ok(());
         };
@@ -908,6 +972,11 @@ impl DirectXRenderer {
                 .iter()
                 .map(|path| PathSprite {
                     bounds: path.clipped_bounds(),
+                    scratch_bounds: scratch_bounds.bounds,
+                    texture_size: [
+                        scratch_bounds.texture_size.width.0 as f32,
+                        scratch_bounds.texture_size.height.0 as f32,
+                    ],
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -915,7 +984,14 @@ impl DirectXRenderer {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
+            vec![PathSprite {
+                bounds,
+                scratch_bounds: scratch_bounds.bounds,
+                texture_size: [
+                    scratch_bounds.texture_size.width.0 as f32,
+                    scratch_bounds.texture_size.height.0 as f32,
+                ],
+            }]
         };
 
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -1117,6 +1193,7 @@ impl DirectXResources {
             path_intermediate_msaa_texture: None,
             path_intermediate_msaa_view: None,
             path_intermediate_srv: None,
+            path_intermediate_size: None,
             backdrop_texture: None,
             backdrop_srv: None,
             backdrop_blur: None,
@@ -1146,6 +1223,7 @@ impl DirectXResources {
         self.path_intermediate_srv = None;
         self.path_intermediate_msaa_texture = None;
         self.path_intermediate_msaa_view = None;
+        self.path_intermediate_size = None;
     }
 
     fn discard_backdrop_resources(&mut self) {
@@ -1157,13 +1235,22 @@ impl DirectXResources {
     fn ensure_path_intermediate_resources(
         &mut self,
         devices: &DirectXRendererDevices,
-        width: u32,
-        height: u32,
-    ) -> Result<()> {
-        if self.path_intermediate_texture.is_some() {
-            return Ok(());
+        size: Size<DevicePixels>,
+    ) -> Result<Option<Size<DevicePixels>>> {
+        if let Some(current_size) = self.path_intermediate_size {
+            if current_size.width >= size.width && current_size.height >= size.height {
+                return Ok(Some(current_size));
+            }
         }
 
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.discard_path_intermediate_resources();
+            return Ok(None);
+        }
+
+        self.discard_path_intermediate_resources();
+        let width = size.width.0 as u32;
+        let height = size.height.0 as u32;
         let (path_intermediate_texture, path_intermediate_srv) =
             create_path_intermediate_texture(&devices.device, width, height)?;
         let (path_intermediate_msaa_texture, path_intermediate_msaa_view) =
@@ -1172,7 +1259,8 @@ impl DirectXResources {
         self.path_intermediate_srv = path_intermediate_srv;
         self.path_intermediate_msaa_texture = Some(path_intermediate_msaa_texture);
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
-        Ok(())
+        self.path_intermediate_size = Some(size);
+        Ok(Some(size))
     }
 
     fn ensure_backdrop_resources(
@@ -1575,12 +1663,16 @@ struct PathRasterizationSprite {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    scratch_bounds: Bounds<ScaledPixels>,
+    texture_size: [f32; 2],
 }
 
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    scratch_bounds: Bounds<ScaledPixels>,
+    texture_size: [f32; 2],
 }
 
 impl Drop for DirectXRenderer {

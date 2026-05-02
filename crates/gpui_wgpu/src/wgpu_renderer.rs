@@ -56,6 +56,8 @@ struct GammaParams {
 #[repr(C)]
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
+    scratch_bounds: Bounds<ScaledPixels>,
+    texture_size: [f32; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +67,14 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    scratch_bounds: Bounds<ScaledPixels>,
+    texture_size: [f32; 2],
+}
+
+#[derive(Clone, Copy)]
+struct PathScratchBounds {
+    bounds: Bounds<ScaledPixels>,
+    texture_size: Size<DevicePixels>,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -117,6 +127,7 @@ pub struct WgpuRenderer {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    path_intermediate_size: Option<Size<DevicePixels>>,
     backdrop_texture: Option<wgpu::Texture>,
     backdrop_view: Option<wgpu::TextureView>,
     rendering_params: RenderingParameters,
@@ -394,6 +405,7 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            path_intermediate_size: None,
             backdrop_texture: None,
             backdrop_view: None,
             rendering_params,
@@ -892,6 +904,7 @@ impl WgpuRenderer {
             self.path_intermediate_view = None;
             self.path_msaa_texture = None;
             self.path_msaa_view = None;
+            self.path_intermediate_size = None;
 
             if let Some(ref texture) = self.backdrop_texture {
                 texture.destroy();
@@ -901,17 +914,38 @@ impl WgpuRenderer {
         }
     }
 
-    fn ensure_intermediate_textures(&mut self) {
-        if self.path_intermediate_texture.is_some() {
-            return;
+    fn ensure_intermediate_textures(
+        &mut self,
+        size: Size<DevicePixels>,
+    ) -> Option<Size<DevicePixels>> {
+        if let Some(current_size) = self.path_intermediate_size {
+            if current_size.width >= size.width && current_size.height >= size.height {
+                return Some(current_size);
+            }
+        }
+
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.path_intermediate_texture = None;
+            self.path_intermediate_view = None;
+            self.path_msaa_texture = None;
+            self.path_msaa_view = None;
+            self.path_intermediate_size = None;
+            return None;
+        }
+
+        if let Some(ref texture) = self.path_intermediate_texture {
+            texture.destroy();
+        }
+        if let Some(ref texture) = self.path_msaa_texture {
+            texture.destroy();
         }
 
         let (path_intermediate_texture, path_intermediate_view) = {
             let (t, v) = Self::create_path_intermediate(
                 &self.device,
                 self.surface_config.format,
-                self.surface_config.width,
-                self.surface_config.height,
+                size.width.0 as u32,
+                size.height.0 as u32,
             );
             (Some(t), Some(v))
         };
@@ -921,14 +955,16 @@ impl WgpuRenderer {
         let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
             &self.device,
             self.surface_config.format,
-            self.surface_config.width,
-            self.surface_config.height,
+            size.width.0 as u32,
+            size.height.0 as u32,
             self.rendering_params.path_sample_count,
         )
         .map(|(t, v)| (Some(t), Some(v)))
         .unwrap_or((None, None));
         self.path_msaa_texture = path_msaa_texture;
         self.path_msaa_view = path_msaa_view;
+        self.path_intermediate_size = Some(size);
+        Some(size)
     }
 
     fn ensure_backdrop_texture(&mut self) {
@@ -1167,12 +1203,27 @@ impl WgpuRenderer {
                                 continue;
                             }
 
-                            self.ensure_intermediate_textures();
+                            let Some(mut scratch_bounds) = Self::path_scratch_bounds(
+                                paths,
+                                Size {
+                                    width: DevicePixels(self.surface_config.width as i32),
+                                    height: DevicePixels(self.surface_config.height as i32),
+                                },
+                            ) else {
+                                continue;
+                            };
+                            let Some(texture_size) =
+                                self.ensure_intermediate_textures(scratch_bounds.texture_size)
+                            else {
+                                continue;
+                            };
+                            scratch_bounds.texture_size = texture_size;
                             drop(pass);
 
                             let did_draw = self.draw_paths_to_intermediate(
                                 &mut encoder,
                                 paths,
+                                scratch_bounds,
                                 &mut instance_offset,
                             );
 
@@ -1194,6 +1245,7 @@ impl WgpuRenderer {
                             if did_draw {
                                 self.draw_paths_from_intermediate(
                                     paths,
+                                    scratch_bounds,
                                     &mut instance_offset,
                                     &mut pass,
                                 )
@@ -1468,9 +1520,46 @@ impl WgpuRenderer {
         }
     }
 
+    fn path_scratch_bounds(
+        paths: &[Path<ScaledPixels>],
+        viewport_size: Size<DevicePixels>,
+    ) -> Option<PathScratchBounds> {
+        let mut bounds = paths.first()?.clipped_bounds();
+        for path in paths.iter().skip(1) {
+            bounds = bounds.union(&path.clipped_bounds());
+        }
+
+        let viewport_bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(0.0),
+                y: ScaledPixels(0.0),
+            },
+            size: Size {
+                width: ScaledPixels::from(viewport_size.width),
+                height: ScaledPixels::from(viewport_size.height),
+            },
+        };
+        bounds = bounds.dilate(ScaledPixels(1.0)).intersect(&viewport_bounds);
+        if bounds.is_empty() {
+            return None;
+        }
+
+        let origin = bounds.origin.map(|component| component.floor());
+        let bottom_right = bounds.bottom_right().map(|component| component.ceil());
+        let bounds = Bounds::from_corners(origin, bottom_right);
+        Some(PathScratchBounds {
+            texture_size: Size {
+                width: DevicePixels::from(bounds.size.width),
+                height: DevicePixels::from(bounds.size.height),
+            },
+            bounds,
+        })
+    }
+
     fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        scratch_bounds: PathScratchBounds,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
@@ -1481,6 +1570,11 @@ impl WgpuRenderer {
                 .iter()
                 .map(|p| PathSprite {
                     bounds: p.clipped_bounds(),
+                    scratch_bounds: scratch_bounds.bounds,
+                    texture_size: [
+                        scratch_bounds.texture_size.width.0 as f32,
+                        scratch_bounds.texture_size.height.0 as f32,
+                    ],
                 })
                 .collect()
         } else {
@@ -1488,7 +1582,14 @@ impl WgpuRenderer {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            vec![PathSprite { bounds }]
+            vec![PathSprite {
+                bounds,
+                scratch_bounds: scratch_bounds.bounds,
+                texture_size: [
+                    scratch_bounds.texture_size.width.0 as f32,
+                    scratch_bounds.texture_size.height.0 as f32,
+                ],
+            }]
         };
 
         let Some(path_intermediate_view) = self.path_intermediate_view.as_ref() else {
@@ -1510,6 +1611,7 @@ impl WgpuRenderer {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         paths: &[Path<ScaledPixels>],
+        scratch_bounds: PathScratchBounds,
         instance_offset: &mut u64,
     ) -> bool {
         let mut vertices = Vec::new();
@@ -1520,6 +1622,11 @@ impl WgpuRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                scratch_bounds: scratch_bounds.bounds,
+                texture_size: [
+                    scratch_bounds.texture_size.width.0 as f32,
+                    scratch_bounds.texture_size.height.0 as f32,
+                ],
             }));
         }
 
@@ -1626,6 +1733,7 @@ impl WgpuRenderer {
         }
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.path_intermediate_size = None;
         if let Some(ref texture) = self.backdrop_texture {
             texture.destroy();
         }

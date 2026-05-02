@@ -1068,6 +1068,8 @@ struct PathRasterizationSprite {
     float2 st_position;
     Background color;
     Bounds bounds;
+    Bounds scratch_bounds;
+    float2 texture_size;
 };
 
 StructuredBuffer<PathRasterizationSprite> path_rasterization_sprites: register(t1);
@@ -1076,6 +1078,7 @@ struct PathVertexOutput {
     float4 position: SV_Position;
     float2 st_position: TEXCOORD0;
     nointerpolation uint vertex_id: TEXCOORD1;
+    float2 screen_position: TEXCOORD2;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1083,15 +1086,19 @@ struct PathFragmentInput {
     float4 position: SV_Position;
     float2 st_position: TEXCOORD0;
     nointerpolation uint vertex_id: TEXCOORD1;
+    float2 screen_position: TEXCOORD2;
 };
 
 PathVertexOutput path_rasterization_vertex(uint vertex_id: SV_VertexID) {
     PathRasterizationSprite sprite = path_rasterization_sprites[vertex_id];
 
     PathVertexOutput output;
-    output.position = to_device_position_impl(sprite.xy_position);
+    float2 scratch_position = sprite.xy_position - sprite.scratch_bounds.origin;
+    float2 device_position = scratch_position / sprite.texture_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
+    output.position = float4(device_position, 0., 1.);
     output.st_position = sprite.st_position;
     output.vertex_id = vertex_id;
+    output.screen_position = sprite.xy_position;
     output.clip_distance = distance_from_clip_rect_impl(sprite.xy_position, sprite.bounds);
 
     return output;
@@ -1118,7 +1125,7 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
     GradientColor gradient = prepare_gradient_color(
         background.tag, background.color_space, background.solid, background.colors);
 
-    float4 color = gradient_color(background, input.position.xy, bounds,
+    float4 color = gradient_color(background, input.screen_position, bounds,
         gradient.solid, gradient.color0, gradient.color1);
     return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
@@ -1131,6 +1138,8 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
 
 struct PathSprite {
     Bounds bounds;
+    Bounds scratch_bounds;
+    float2 texture_size;
 };
 
 struct PathSpriteVertexOutput {
@@ -1148,7 +1157,7 @@ PathSpriteVertexOutput path_sprite_vertex(uint vertex_id: SV_VertexID, uint spri
     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
 
     float2 screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    float2 texture_coords = screen_position / global_viewport_size;
+    float2 texture_coords = (screen_position - sprite.scratch_bounds.origin) / sprite.texture_size;
 
     PathSpriteVertexOutput output;
     output.position = device_position;

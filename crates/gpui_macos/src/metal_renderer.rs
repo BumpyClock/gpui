@@ -124,6 +124,7 @@ pub(crate) struct MetalRenderer {
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
+    path_intermediate_size: Option<Size<DevicePixels>>,
     backdrop_texture: Option<metal::Texture>,
     backdrop_blur_level_sizes: Vec<Size<DevicePixels>>,
     backdrop_blur_downsample_textures: Vec<metal::Texture>,
@@ -137,6 +138,14 @@ pub struct PathRasterizationVertex {
     pub st_position: Point<f32>,
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
+    pub scratch_bounds: Bounds<ScaledPixels>,
+    pub texture_size: Size<DevicePixels>,
+}
+
+#[derive(Clone, Copy)]
+struct PathScratchBounds {
+    bounds: Bounds<ScaledPixels>,
+    texture_size: Size<DevicePixels>,
 }
 
 #[repr(C)]
@@ -334,6 +343,7 @@ impl MetalRenderer {
             core_video_texture_cache,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
+            path_intermediate_size: None,
             backdrop_texture: None,
             backdrop_blur_level_sizes: Vec::new(),
             backdrop_blur_downsample_textures: Vec::new(),
@@ -378,6 +388,7 @@ impl MetalRenderer {
     fn discard_path_intermediate_textures(&mut self) {
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
+        self.path_intermediate_size = None;
     }
 
     fn discard_backdrop_textures(&mut self) {
@@ -387,9 +398,14 @@ impl MetalRenderer {
         self.backdrop_blur_upsample_textures.clear();
     }
 
-    fn ensure_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
-        if self.path_intermediate_texture.is_some() {
-            return;
+    fn ensure_path_intermediate_textures(
+        &mut self,
+        size: Size<DevicePixels>,
+    ) -> Option<Size<DevicePixels>> {
+        if let Some(current_size) = self.path_intermediate_size {
+            if current_size.width >= size.width && current_size.height >= size.height {
+                return Some(current_size);
+            }
         }
 
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
@@ -397,8 +413,10 @@ impl MetalRenderer {
         // https://github.com/zed-industries/zed/issues/36229
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.discard_path_intermediate_textures();
-            return;
+            return None;
         }
+
+        self.discard_path_intermediate_textures();
 
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.0 as u64);
@@ -417,6 +435,8 @@ impl MetalRenderer {
         } else {
             self.path_intermediate_msaa_texture = None;
         }
+        self.path_intermediate_size = Some(size);
+        Some(size)
     }
 
     fn ensure_backdrop_textures(&mut self, size: Size<DevicePixels>) {
@@ -769,15 +789,32 @@ impl MetalRenderer {
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
-                    self.ensure_path_intermediate_textures(viewport_size);
-
-                    let did_draw = self.draw_paths_to_intermediate(
-                        paths,
-                        instance_buffer,
-                        &mut instance_offset,
-                        viewport_size,
-                        command_buffer,
-                    );
+                    let Some(mut scratch_bounds) = Self::path_scratch_bounds(paths, viewport_size)
+                    else {
+                        command_encoder = new_command_encoder(
+                            command_buffer,
+                            drawable,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        );
+                        continue;
+                    };
+                    let did_draw = if let Some(texture_size) =
+                        self.ensure_path_intermediate_textures(scratch_bounds.texture_size)
+                    {
+                        scratch_bounds.texture_size = texture_size;
+                        self.draw_paths_to_intermediate(
+                            paths,
+                            scratch_bounds,
+                            instance_buffer,
+                            &mut instance_offset,
+                            command_buffer,
+                        )
+                    } else {
+                        false
+                    };
 
                     command_encoder = new_command_encoder(
                         command_buffer,
@@ -791,6 +828,7 @@ impl MetalRenderer {
                     if did_draw {
                         self.draw_paths_from_intermediate(
                             paths,
+                            scratch_bounds,
                             instance_buffer,
                             &mut instance_offset,
                             viewport_size,
@@ -1010,12 +1048,45 @@ impl MetalRenderer {
         command_encoder.end_encoding();
     }
 
+    fn path_scratch_bounds(
+        paths: &[Path<ScaledPixels>],
+        viewport_size: Size<DevicePixels>,
+    ) -> Option<PathScratchBounds> {
+        let mut bounds = paths.first()?.clipped_bounds();
+        for path in paths.iter().skip(1) {
+            bounds = bounds.union(&path.clipped_bounds());
+        }
+
+        let viewport_bounds = Bounds {
+            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(
+                ScaledPixels::from(viewport_size.width),
+                ScaledPixels::from(viewport_size.height),
+            ),
+        };
+        bounds = bounds.dilate(ScaledPixels(1.0)).intersect(&viewport_bounds);
+        if bounds.is_empty() {
+            return None;
+        }
+
+        let origin = bounds.origin.map(|component| component.floor());
+        let bottom_right = bounds.bottom_right().map(|component| component.ceil());
+        let bounds = Bounds::from_corners(origin, bottom_right);
+        Some(PathScratchBounds {
+            texture_size: size(
+                DevicePixels::from(bounds.size.width),
+                DevicePixels::from(bounds.size.height),
+            ),
+            bounds,
+        })
+    }
+
     fn draw_paths_to_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        scratch_bounds: PathScratchBounds,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
-        viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
         if paths.is_empty() {
@@ -1053,6 +1124,8 @@ impl MetalRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.bounds.intersect(&path.content_mask.bounds),
+                scratch_bounds: scratch_bounds.bounds,
+                texture_size: scratch_bounds.texture_size,
             }));
         }
         let vertices_bytes_len = mem::size_of_val(vertices.as_slice());
@@ -1065,11 +1138,6 @@ impl MetalRenderer {
             PathRasterizationInputIndex::Vertices as u64,
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
-        );
-        command_encoder.set_vertex_bytes(
-            PathRasterizationInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
         );
         command_encoder.set_fragment_buffer(
             PathRasterizationInputIndex::Vertices as u64,
@@ -1288,6 +1356,7 @@ impl MetalRenderer {
     fn draw_paths_from_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
+        scratch_bounds: PathScratchBounds,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
@@ -1331,6 +1400,8 @@ impl MetalRenderer {
                 .iter()
                 .map(|path| PathSprite {
                     bounds: path.clipped_bounds(),
+                    scratch_bounds: scratch_bounds.bounds,
+                    texture_size: scratch_bounds.texture_size,
                 })
                 .collect();
         } else {
@@ -1338,7 +1409,11 @@ impl MetalRenderer {
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            sprites = vec![PathSprite { bounds }];
+            sprites = vec![PathSprite {
+                bounds,
+                scratch_bounds: scratch_bounds.bounds,
+                texture_size: scratch_bounds.texture_size,
+            }];
         }
 
         align_offset(instance_offset);
@@ -1883,13 +1958,14 @@ enum SurfaceInputIndex {
 #[repr(C)]
 enum PathRasterizationInputIndex {
     Vertices = 0,
-    ViewportSize = 1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
+    pub scratch_bounds: Bounds<ScaledPixels>,
+    pub texture_size: Size<DevicePixels>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
