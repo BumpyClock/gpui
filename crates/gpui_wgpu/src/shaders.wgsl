@@ -1172,14 +1172,14 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         let distance = f / length(gradient);
         alpha = saturate(0.5 - distance);
     }
-    let gradient_color = prepare_gradient_color(
+    let prepared_gradient_color = prepare_gradient_color(
         background.tag,
         background.color_space,
         background.solid,
         background.colors,
     );
     let color = gradient_color(background, input.screen_position, bounds,
-        gradient_color.solid, gradient_color.color0, gradient_color.color1);
+        prepared_gradient_color.solid, prepared_gradient_color.color0, prepared_gradient_color.color1);
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
 }
 
