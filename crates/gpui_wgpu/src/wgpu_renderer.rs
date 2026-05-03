@@ -137,7 +137,14 @@ struct WgpuRetainedLayer {
     valid: bool,
 }
 
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct RetainedLayerCacheKey {
+    id: GlobalElementId,
+    occurrence: usize,
+}
+
 struct PreparedRetainedLayer {
+    cache_key: RetainedLayerCacheKey,
     layer: RetainedLayer,
     scene: Scene,
     draw_order: u32,
@@ -187,7 +194,7 @@ pub struct WgpuRenderer {
     backdrop_texture: Option<wgpu::Texture>,
     backdrop_view: Option<wgpu::TextureView>,
     backdrop_size: Option<Size<DevicePixels>>,
-    retained_layers: HashMap<GlobalElementId, WgpuRetainedLayer>,
+    retained_layers: HashMap<RetainedLayerCacheKey, WgpuRetainedLayer>,
     rendering_params: RenderingParameters,
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
@@ -1227,7 +1234,7 @@ impl WgpuRenderer {
                 if !prepared_layer.cache_valid || !prepared_layer.needs_render {
                     continue;
                 }
-                let Some(mut cache) = self.retained_layers.remove(&prepared_layer.layer.id) else {
+                let Some(mut cache) = self.retained_layers.remove(&prepared_layer.cache_key) else {
                     prepared_layer.cache_valid = false;
                     continue;
                 };
@@ -1256,7 +1263,7 @@ impl WgpuRenderer {
                     self.queue.submit(std::iter::once(encoder.finish()));
                 }
                 self.retained_layers
-                    .insert(prepared_layer.layer.id.clone(), cache);
+                    .insert(prepared_layer.cache_key.clone(), cache);
                 if !rendered {
                     prepared_layer.cache_valid = false;
                     overflow = true;
@@ -1315,10 +1322,25 @@ impl WgpuRenderer {
     }
 
     fn prepare_retained_layers(&mut self, scene: &Scene) -> Vec<PreparedRetainedLayer> {
+        let mut occurrences = HashMap::new();
+        let cache_keys = scene
+            .retained_layers
+            .iter()
+            .map(|layer| {
+                let occurrence = occurrences.entry(layer.id.clone()).or_insert(0);
+                let cache_key = RetainedLayerCacheKey {
+                    id: layer.id.clone(),
+                    occurrence: *occurrence,
+                };
+                *occurrence += 1;
+                cache_key
+            })
+            .collect::<Vec<_>>();
         let prepared = Self::top_level_retained_layer_indices(&scene.retained_layers)
             .iter()
             .filter_map(|&index| {
                 let layer = scene.retained_layers[index].clone();
+                let cache_key = cache_keys[index].clone();
                 let texture_size = Self::retained_layer_texture_size(&layer)?;
                 if texture_size.width.0 as u32 > self.max_texture_size
                     || texture_size.height.0 as u32 > self.max_texture_size
@@ -1338,9 +1360,11 @@ impl WgpuRenderer {
                 let mut layer_scene = layer_scene;
                 let draw_order = Self::first_draw_order(&layer_scene).unwrap_or(u32::MAX);
                 Self::localize_scene(&mut layer_scene, layer.bounds.origin);
-                let needs_render = self.ensure_retained_layer_texture(&layer, texture_size);
+                let needs_render =
+                    self.ensure_retained_layer_texture(&cache_key, &layer, texture_size);
 
                 Some(PreparedRetainedLayer {
+                    cache_key,
                     layer,
                     scene: layer_scene,
                     draw_order,
@@ -1352,7 +1376,7 @@ impl WgpuRenderer {
 
         let active_ids = prepared
             .iter()
-            .map(|layer| layer.layer.id.clone())
+            .map(|layer| layer.cache_key.clone())
             .collect::<HashSet<_>>();
         self.retained_layers.retain(|id, _| active_ids.contains(id));
 
@@ -1397,10 +1421,11 @@ impl WgpuRenderer {
 
     fn ensure_retained_layer_texture(
         &mut self,
+        cache_key: &RetainedLayerCacheKey,
         layer: &RetainedLayer,
         texture_size: Size<DevicePixels>,
     ) -> bool {
-        let needs_render = match self.retained_layers.get(&layer.id) {
+        let needs_render = match self.retained_layers.get(cache_key) {
             Some(cache) => {
                 !cache.valid
                     || layer.content_dirty
@@ -1412,7 +1437,7 @@ impl WgpuRenderer {
 
         let needs_texture = self
             .retained_layers
-            .get(&layer.id)
+            .get(cache_key)
             .is_none_or(|cache| cache.texture_size != texture_size);
 
         if needs_texture {
@@ -1434,7 +1459,7 @@ impl WgpuRenderer {
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             if let Some(old) = self.retained_layers.insert(
-                layer.id.clone(),
+                cache_key.clone(),
                 WgpuRetainedLayer {
                     texture,
                     view,
@@ -1445,7 +1470,7 @@ impl WgpuRenderer {
             ) {
                 old.texture.destroy();
             }
-        } else if needs_render && let Some(cache) = self.retained_layers.get_mut(&layer.id) {
+        } else if needs_render && let Some(cache) = self.retained_layers.get_mut(cache_key) {
             cache.valid = false;
         }
 
@@ -1850,7 +1875,8 @@ impl WgpuRenderer {
                 },
                 DrawCommand::RetainedLayer { layer_index, .. } => {
                     let layer = &retained_layers[*layer_index].layer;
-                    let Some(cache) = self.retained_layers.get(&layer.id) else {
+                    let cache_key = &retained_layers[*layer_index].cache_key;
+                    let Some(cache) = self.retained_layers.get(cache_key) else {
                         continue;
                     };
                     self.draw_retained_layer(layer, &cache.view, instance_offset, &mut pass)

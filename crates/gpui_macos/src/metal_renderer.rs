@@ -28,7 +28,13 @@ use metal::{
 use objc::{self, msg_send, sel, sel_impl};
 use parking_lot::Mutex;
 
-use std::{cell::Cell, collections::HashMap, ffi::c_void, mem, ptr, sync::Arc};
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    ffi::c_void,
+    mem, ptr,
+    sync::Arc,
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -190,7 +196,7 @@ pub(crate) struct MetalRenderer {
     backdrop_blur_level_sizes: Vec<Size<DevicePixels>>,
     backdrop_blur_downsample_textures: Vec<metal::Texture>,
     backdrop_blur_upsample_textures: Vec<metal::Texture>,
-    retained_layers: HashMap<GlobalElementId, CachedRetainedLayer>,
+    retained_layers: HashMap<RetainedLayerCacheKey, CachedRetainedLayer>,
     path_sample_count: u32,
 }
 
@@ -227,6 +233,12 @@ struct CachedRetainedLayer {
     content_revision: RetainedLayerContentRevision,
     texture_size: Size<DevicePixels>,
     texture: metal::Texture,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct RetainedLayerCacheKey {
+    id: GlobalElementId,
+    occurrence: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -845,6 +857,7 @@ impl MetalRenderer {
 
         let retained_layers = Self::retained_layers_for_scene(scene);
         if retained_layers.is_empty() {
+            self.retained_layers.clear();
             self.draw_primitives(
                 &command_buffer,
                 drawable.texture(),
@@ -861,7 +874,7 @@ impl MetalRenderer {
 
         let mut cursor = 0;
         let mut load_action = metal::MTLLoadAction::Clear;
-        for layer in &retained_layers {
+        for (cache_key, layer) in &retained_layers {
             if cursor < layer.paint_range.start {
                 self.draw_scene_range(
                     &command_buffer,
@@ -880,6 +893,7 @@ impl MetalRenderer {
             let texture = self.retained_layer_texture(
                 &command_buffer,
                 scene,
+                cache_key,
                 layer,
                 instance_buffer,
                 &mut instance_offset,
@@ -913,8 +927,12 @@ impl MetalRenderer {
             )?;
         }
 
+        let active_layer_keys = retained_layers
+            .iter()
+            .map(|(cache_key, _)| cache_key.clone())
+            .collect::<HashSet<_>>();
         self.retained_layers
-            .retain(|id, _| retained_layers.iter().any(|layer| &layer.id == id));
+            .retain(|cache_key, _| active_layer_keys.contains(cache_key));
 
         self.flush_instance_buffer(instance_buffer, instance_offset);
         Ok(command_buffer.to_owned())
@@ -961,26 +979,36 @@ impl MetalRenderer {
         )
     }
 
-    fn retained_layers_for_scene(scene: &Scene) -> Vec<&RetainedLayer> {
+    fn retained_layers_for_scene(scene: &Scene) -> Vec<(RetainedLayerCacheKey, &RetainedLayer)> {
+        let mut occurrences = HashMap::new();
         let mut layers = scene
             .retained_layers
             .iter()
-            .filter(|layer| layer.paint_range.start < layer.paint_range.end)
-            .filter(|layer| layer.paint_range.end <= scene.len())
-            .filter(|layer| !layer.bounds.is_empty())
-            .filter(|layer| !Self::retained_layer_contains_backdrop_blurs(scene, layer))
+            .map(|layer| {
+                let occurrence = occurrences.entry(layer.id.clone()).or_insert(0);
+                let cache_key = RetainedLayerCacheKey {
+                    id: layer.id.clone(),
+                    occurrence: *occurrence,
+                };
+                *occurrence += 1;
+                (cache_key, layer)
+            })
+            .filter(|(_, layer)| layer.paint_range.start < layer.paint_range.end)
+            .filter(|(_, layer)| layer.paint_range.end <= scene.len())
+            .filter(|(_, layer)| !layer.bounds.is_empty())
+            .filter(|(_, layer)| !Self::retained_layer_contains_backdrop_blurs(scene, layer))
             .collect::<Vec<_>>();
         layers.sort_by(|a, b| {
-            a.paint_range
+            a.1.paint_range
                 .start
-                .cmp(&b.paint_range.start)
-                .then_with(|| b.paint_range.end.cmp(&a.paint_range.end))
+                .cmp(&b.1.paint_range.start)
+                .then_with(|| b.1.paint_range.end.cmp(&a.1.paint_range.end))
         });
 
         let mut cursor = 0;
         layers
             .into_iter()
-            .filter(|layer| {
+            .filter(|(_, layer)| {
                 if layer.paint_range.start < cursor {
                     return false;
                 }
@@ -1084,6 +1112,7 @@ impl MetalRenderer {
         &mut self,
         command_buffer: &metal::CommandBufferRef,
         scene: &Scene,
+        cache_key: &RetainedLayerCacheKey,
         layer: &RetainedLayer,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
@@ -1091,7 +1120,7 @@ impl MetalRenderer {
         let texture_size = Self::retained_layer_texture_size(layer);
         let cache_is_valid = self
             .retained_layers
-            .get(&layer.id)
+            .get(cache_key)
             .map(|cached| {
                 !layer.content_dirty
                     && cached.content_revision == layer.content_revision
@@ -1100,7 +1129,13 @@ impl MetalRenderer {
             .unwrap_or(false);
 
         if !cache_is_valid {
-            let texture = self.create_retained_layer_texture(texture_size)?;
+            let texture = if let Some(cached) = self.retained_layers.get(cache_key)
+                && cached.texture_size == texture_size
+            {
+                cached.texture.clone()
+            } else {
+                self.create_retained_layer_texture(texture_size)?
+            };
             let mut layer_scene = Self::retained_layer_scene(scene, layer);
             Self::localize_retained_layer_scene(&mut layer_scene, layer.bounds.origin);
             self.draw_primitives(
@@ -1114,7 +1149,7 @@ impl MetalRenderer {
                 0.0,
             )?;
             self.retained_layers.insert(
-                layer.id.clone(),
+                cache_key.clone(),
                 CachedRetainedLayer {
                     content_revision: layer.content_revision,
                     texture_size,
@@ -1125,7 +1160,7 @@ impl MetalRenderer {
 
         Ok(self
             .retained_layers
-            .get(&layer.id)
+            .get(cache_key)
             .expect("retained layer cache should exist")
             .texture
             .clone())
