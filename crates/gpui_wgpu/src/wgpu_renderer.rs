@@ -1120,17 +1120,10 @@ impl WgpuRenderer {
         size: Size<DevicePixels>,
     ) -> Option<Size<DevicePixels>> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
-            if let Some(ref texture) = self.backdrop_texture {
-                texture.destroy();
-            }
             self.backdrop_texture = None;
             self.backdrop_view = None;
             self.backdrop_size = None;
             return None;
-        }
-
-        if let Some(ref texture) = self.backdrop_texture {
-            texture.destroy();
         }
 
         let (backdrop_texture, backdrop_view) = Self::create_backdrop_texture(
@@ -1217,9 +1210,6 @@ impl WgpuRenderer {
             .iter()
             .any(|blur| Self::backdrop_source_bounds(blur, viewport_size).is_some())
         {
-            if let Some(ref texture) = self.backdrop_texture {
-                texture.destroy();
-            }
             self.backdrop_texture = None;
             self.backdrop_view = None;
             self.backdrop_size = None;

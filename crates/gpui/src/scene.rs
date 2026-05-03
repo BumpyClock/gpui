@@ -694,6 +694,7 @@ pub struct BackdropBlur {
     pub source_origin_y: f32,
     pub source_width: f32,
     pub source_height: f32,
+    pub pad2: u32, // align storage buffer stride to WGSL layout
 }
 
 impl From<BackdropBlur> for Primitive {

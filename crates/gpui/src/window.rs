@@ -3316,6 +3316,7 @@ impl Window {
             source_origin_y: 0.0,
             source_width: 1.0,
             source_height: 1.0,
+            pad2: 0,
         });
     }
 

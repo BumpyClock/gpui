@@ -1047,12 +1047,13 @@ struct BackdropBlurVarying {
 fn vs_backdrop_blur(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> BackdropBlurVarying {
     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
     let blur = b_backdrop_blurs[instance_id];
-    let pad = blur.pad;
+    let pad = f32(blur.pad);
+    let double_pad = pad * 2.0;
     var padded_bounds = blur.bounds;
     padded_bounds.origin -= vec2<f32>(pad, pad);
-    padded_bounds.size += vec2<f32>(pad * 2u, pad * 2u);
+    padded_bounds.size += vec2<f32>(double_pad, double_pad);
 
-    let padded_size = vec2<f32>(blur.bounds.size + vec2<f32>(pad * 2u, pad * 2u));
+    let padded_size = vec2<f32>(blur.bounds.size + vec2<f32>(double_pad, double_pad));
     let original_size = vec2<f32>(blur.bounds.size);
     let unit_vertex_original = (unit_vertex * padded_size - vec2<f32>(pad, pad)) / original_size;
 
