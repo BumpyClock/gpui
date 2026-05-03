@@ -16,6 +16,7 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 const BACKDROP_BLUR_RADIUS_PER_LEVEL: f32 = 6.0;
+const BACKDROP_TEXTURE_SIZE_QUANTUM: i32 = 64;
 const INITIAL_INSTANCE_BUFFER_SIZE: u64 = 2 * 1024 * 1024;
 const INSTANCE_BUFFER_SIZE_BUCKET: u64 = 1024 * 1024;
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
@@ -1073,11 +1074,16 @@ impl WgpuRenderer {
         size: Size<DevicePixels>,
         max_size: Size<DevicePixels>,
     ) -> Option<Size<DevicePixels>> {
+        let size = Self::quantize_backdrop_texture_size(size, max_size);
         if let Some(current_size) = self.backdrop_size
             && self.backdrop_texture.is_some()
         {
-            if current_size.width >= size.width && current_size.height >= size.height {
-                return Some(size);
+            if current_size.width >= size.width
+                && current_size.height >= size.height
+                && current_size.width <= max_size.width
+                && current_size.height <= max_size.height
+            {
+                return Some(current_size);
             }
             return self.create_backdrop_resources(Size {
                 width: current_size.width.max(size.width).min(max_size.width),
@@ -1086,6 +1092,27 @@ impl WgpuRenderer {
         }
 
         self.create_backdrop_resources(size)
+    }
+
+    fn quantize_backdrop_texture_size(
+        size: Size<DevicePixels>,
+        max_size: Size<DevicePixels>,
+    ) -> Size<DevicePixels> {
+        fn quantize(value: DevicePixels, max_value: DevicePixels) -> DevicePixels {
+            if value.0 <= 0 {
+                return value;
+            }
+
+            let rounded = ((value.0 + BACKDROP_TEXTURE_SIZE_QUANTUM - 1)
+                / BACKDROP_TEXTURE_SIZE_QUANTUM)
+                * BACKDROP_TEXTURE_SIZE_QUANTUM;
+            DevicePixels(rounded.min(max_value.0.max(0)))
+        }
+
+        Size {
+            width: quantize(size.width, max_size.width),
+            height: quantize(size.height, max_size.height),
+        }
     }
 
     fn create_backdrop_resources(
@@ -1184,6 +1211,19 @@ impl WgpuRenderer {
         }
 
         self.atlas.before_frame();
+        let viewport_size = self.viewport_size();
+        if !scene
+            .backdrop_blurs
+            .iter()
+            .any(|blur| Self::backdrop_source_bounds(blur, viewport_size).is_some())
+        {
+            if let Some(ref texture) = self.backdrop_texture {
+                texture.destroy();
+            }
+            self.backdrop_texture = None;
+            self.backdrop_view = None;
+            self.backdrop_size = None;
+        }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -1718,61 +1758,78 @@ impl WgpuRenderer {
                         if blurs.is_empty() || !target_supports_copy_src {
                             continue;
                         }
-                        let Some(mut scratch_bounds) =
-                            Self::backdrop_scratch_bounds(blurs, target_size)
-                        else {
+                        let blur_clusters = Self::backdrop_blur_clusters(blurs, target_size);
+                        if blur_clusters.is_empty() {
                             continue;
-                        };
-                        let Some(texture_size) = self.ensure_backdrop_texture(
-                            scratch_bounds.texture_size,
-                            Self::max_backdrop_texture_size(scratch_bounds, target_size),
-                        ) else {
-                            continue;
-                        };
-                        scratch_bounds.texture_size = texture_size;
-                        let Some(backdrop_texture) = self.backdrop_texture.as_ref() else {
-                            continue;
-                        };
-                        let prepared_blurs = Self::prepare_backdrop_blurs(blurs, scratch_bounds);
-                        drop(pass);
-                        encoder.copy_texture_to_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: target_texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d {
-                                    x: scratch_bounds.bounds.origin.x.0.max(0.0) as u32,
-                                    y: scratch_bounds.bounds.origin.y.0.max(0.0) as u32,
-                                    z: 0,
+                        }
+
+                        let mut ok = true;
+                        for blurs in blur_clusters {
+                            let Some(mut scratch_bounds) =
+                                Self::backdrop_scratch_bounds(&blurs, target_size)
+                            else {
+                                continue;
+                            };
+                            let Some(texture_size) = self.ensure_backdrop_texture(
+                                scratch_bounds.texture_size,
+                                Self::max_backdrop_texture_size(scratch_bounds, target_size),
+                            ) else {
+                                continue;
+                            };
+                            scratch_bounds.texture_size = texture_size;
+                            let Some(backdrop_texture) = self.backdrop_texture.as_ref() else {
+                                continue;
+                            };
+                            let prepared_blurs =
+                                Self::prepare_backdrop_blurs(&blurs, scratch_bounds);
+                            drop(pass);
+                            encoder.copy_texture_to_texture(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: target_texture,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d {
+                                        x: scratch_bounds.bounds.origin.x.0.max(0.0) as u32,
+                                        y: scratch_bounds.bounds.origin.y.0.max(0.0) as u32,
+                                        z: 0,
+                                    },
+                                    aspect: wgpu::TextureAspect::All,
                                 },
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::TexelCopyTextureInfo {
-                                texture: backdrop_texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::Extent3d {
-                                width: scratch_bounds.texture_size.width.0 as u32,
-                                height: scratch_bounds.texture_size.height.0 as u32,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("main_pass_backdrop"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: target_view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Load,
-                                    store: wgpu::StoreOp::Store,
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: backdrop_texture,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
                                 },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
-                        self.draw_backdrop_blurs(&prepared_blurs, instance_offset, &mut pass)
+                                wgpu::Extent3d {
+                                    width: scratch_bounds.texture_size.width.0 as u32,
+                                    height: scratch_bounds.texture_size.height.0 as u32,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                            pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("main_pass_backdrop"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: target_view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Load,
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                    depth_slice: None,
+                                })],
+                                depth_stencil_attachment: None,
+                                ..Default::default()
+                            });
+                            ok = self.draw_backdrop_blurs(
+                                &prepared_blurs,
+                                instance_offset,
+                                &mut pass,
+                            );
+                            if !ok {
+                                break;
+                            }
+                        }
+                        ok
                     }
                     PrimitiveBatch::Paths(range) => {
                         let paths = &scene.paths[range.clone()];
@@ -2229,6 +2286,75 @@ impl WgpuRenderer {
             },
             bounds,
         })
+    }
+
+    fn backdrop_source_bounds(
+        blur: &BackdropBlur,
+        viewport_size: Size<DevicePixels>,
+    ) -> Option<Bounds<ScaledPixels>> {
+        let viewport_bounds = Bounds {
+            origin: Point {
+                x: ScaledPixels(0.0),
+                y: ScaledPixels(0.0),
+            },
+            size: Size {
+                width: ScaledPixels::from(viewport_size.width),
+                height: ScaledPixels::from(viewport_size.height),
+            },
+        };
+        let bounds = blur
+            .bounds
+            .dilate(Self::backdrop_blur_padding(blur.blur_radius.0))
+            .intersect(&viewport_bounds);
+        if bounds.is_empty() {
+            return None;
+        }
+
+        let origin = bounds.origin.map(|component| component.floor());
+        let bottom_right = bounds.bottom_right().map(|component| component.ceil());
+        Some(Bounds::from_corners(origin, bottom_right))
+    }
+
+    fn backdrop_blur_clusters(
+        blurs: &[BackdropBlur],
+        viewport_size: Size<DevicePixels>,
+    ) -> Vec<Vec<BackdropBlur>> {
+        let mut clusters: Vec<(Bounds<ScaledPixels>, Vec<(usize, BackdropBlur)>)> = Vec::new();
+        for (blur_ix, blur) in blurs.iter().enumerate() {
+            let Some(mut cluster_bounds) = Self::backdrop_source_bounds(blur, viewport_size) else {
+                continue;
+            };
+            let mut cluster_blurs = vec![(blur_ix, blur.clone())];
+
+            loop {
+                let overlapping_cluster_ixs = clusters
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, (bounds, _))| {
+                        bounds.intersects(&cluster_bounds).then_some(ix)
+                    })
+                    .collect::<Vec<_>>();
+                if overlapping_cluster_ixs.is_empty() {
+                    break;
+                }
+
+                for ix in overlapping_cluster_ixs.into_iter().rev() {
+                    let (bounds, mut blurs) = clusters.remove(ix);
+                    cluster_bounds = cluster_bounds.union(&bounds);
+                    cluster_blurs.append(&mut blurs);
+                }
+            }
+
+            clusters.push((cluster_bounds, cluster_blurs));
+        }
+
+        clusters
+            .into_iter()
+            .map(|(_, mut blurs)| {
+                blurs.sort_by_key(|(ix, _)| *ix);
+                blurs.into_iter().map(|(_, blur)| blur).collect()
+            })
+            .collect()
     }
 
     fn max_backdrop_texture_size(

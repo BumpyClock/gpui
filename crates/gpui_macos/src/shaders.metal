@@ -79,6 +79,18 @@ struct BackdropBlurPassVertexOutput {
   float2 uv;
 };
 
+static inline float2 backdrop_blur_sample_coord(float2 uv,
+                                                float2 input_origin,
+                                                float2 input_size,
+                                                float2 texture_size) {
+  float2 sample_pixel =
+      input_origin + clamp(uv, float2(0.0), float2(1.0)) * input_size;
+  float2 min_pixel = input_origin + float2(0.5);
+  float2 max_pixel = input_origin + max(input_size - float2(0.5), float2(0.5));
+  return clamp(sample_pixel, min_pixel, max_pixel) /
+         max(texture_size, float2(1.0));
+}
+
 vertex BackdropBlurPassVertexOutput backdrop_blur_downsample_vertex(
     uint unit_vertex_id [[vertex_id]],
     constant float2 *unit_vertices [[buffer(BackdropBlurPassInputIndex_Vertices)]]) {
@@ -105,32 +117,36 @@ fragment float4 backdrop_blur_downsample_fragment(
     texture2d<float> source_texture [[texture(BackdropBlurPassInputIndex_SourceTexture)]]) {
   constexpr sampler blur_sampler(mag_filter::linear, min_filter::linear,
                                  address::clamp_to_edge);
+  float2 input_origin = float2(params->input_origin[0],
+                               params->input_origin[1]);
   float2 input_size = float2((float)params->input_size.width,
                              (float)params->input_size.height);
+  float2 texture_size = float2((float)params->texture_size.width,
+                               (float)params->texture_size.height);
   float2 texel = 1.0 / max(input_size, float2(1.0));
   float2 offset = texel * (params->offset + 0.5);
   float3 rgb_sum = float3(0.0);
   float alpha_sum = 0.0;
   float4 sample =
-      source_texture.sample(blur_sampler, input.uv + float2(-offset.x, -offset.y));
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(-offset.x, -offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
     rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
     alpha_sum += sample.a;
   }
   sample =
-      source_texture.sample(blur_sampler, input.uv + float2(offset.x, -offset.y));
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(offset.x, -offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
     rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
     alpha_sum += sample.a;
   }
   sample =
-      source_texture.sample(blur_sampler, input.uv + float2(-offset.x, offset.y));
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(-offset.x, offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
     rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
     alpha_sum += sample.a;
   }
   sample =
-      source_texture.sample(blur_sampler, input.uv + float2(offset.x, offset.y));
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(offset.x, offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
     rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
     alpha_sum += sample.a;
@@ -147,32 +163,36 @@ fragment float4 backdrop_blur_upsample_fragment(
     texture2d<float> source_texture [[texture(BackdropBlurPassInputIndex_SourceTexture)]]) {
   constexpr sampler blur_sampler(mag_filter::linear, min_filter::linear,
                                  address::clamp_to_edge);
+  float2 input_origin = float2(params->input_origin[0],
+                               params->input_origin[1]);
   float2 input_size = float2((float)params->input_size.width,
                              (float)params->input_size.height);
+  float2 texture_size = float2((float)params->texture_size.width,
+                               (float)params->texture_size.height);
   float2 texel = 1.0 / max(input_size, float2(1.0));
   float2 offset = texel * (params->offset + 0.5);
   float3 rgb_sum = float3(0.0);
   float alpha_sum = 0.0;
   float4 sample =
-      source_texture.sample(blur_sampler, input.uv + float2(-offset.x, -offset.y));
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(-offset.x, -offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
     rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
     alpha_sum += sample.a;
   }
   sample =
-      source_texture.sample(blur_sampler, input.uv + float2(offset.x, -offset.y));
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(offset.x, -offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
     rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
     alpha_sum += sample.a;
   }
   sample =
-      source_texture.sample(blur_sampler, input.uv + float2(-offset.x, offset.y));
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(-offset.x, offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
     rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
     alpha_sum += sample.a;
   }
   sample =
-      source_texture.sample(blur_sampler, input.uv + float2(offset.x, offset.y));
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(offset.x, offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
     rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
     alpha_sum += sample.a;

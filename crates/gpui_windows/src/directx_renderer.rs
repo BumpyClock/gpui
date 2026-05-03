@@ -32,6 +32,7 @@ const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const BACKDROP_BLUR_RADIUS_PER_LEVEL: f32 = 6.0;
 const MAX_BACKDROP_BLUR_LEVELS: usize = 4;
 const BACKDROP_BLUR_OFFSET: f32 = 1.0;
+const BACKDROP_TEXTURE_SIZE_QUANTUM: i32 = 64;
 const MAX_STRUCTURED_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 
 pub(crate) struct FontInfo {
@@ -464,6 +465,15 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
+        if !scene
+            .backdrop_blurs
+            .iter()
+            .any(|blur| Self::backdrop_source_bounds(blur, self.width, self.height).is_some())
+        {
+            if let Some(resources) = self.resources.as_mut() {
+                resources.discard_backdrop_resources();
+            }
+        }
         if self.update_clean_retained_layers(scene)? {
             return Ok(());
         }
@@ -482,55 +492,59 @@ impl DirectXRenderer {
                     if blurs.is_empty() {
                         Ok(())
                     } else {
-                        let Some(mut scratch_bounds) =
-                            Self::backdrop_scratch_bounds(blurs, self.width, self.height)
-                        else {
-                            continue;
-                        };
-                        {
-                            let devices = self.devices.as_ref().context("devices missing")?;
-                            if let Some(texture_size) = self
-                                .resources
-                                .as_mut()
-                                .context("resources missing")?
-                                .ensure_backdrop_resources(
-                                    devices,
-                                    scratch_bounds.texture_size,
-                                    Self::max_backdrop_texture_size(
-                                        scratch_bounds,
-                                        self.width,
-                                        self.height,
-                                    ),
-                                )?
+                        for blurs in Self::backdrop_blur_clusters(blurs, self.width, self.height) {
+                            let Some(mut scratch_bounds) =
+                                Self::backdrop_scratch_bounds(&blurs, self.width, self.height)
+                            else {
+                                continue;
+                            };
                             {
-                                scratch_bounds.texture_size = texture_size;
+                                let devices = self.devices.as_ref().context("devices missing")?;
+                                if let Some(texture_size) = self
+                                    .resources
+                                    .as_mut()
+                                    .context("resources missing")?
+                                    .ensure_backdrop_resources(
+                                        devices,
+                                        scratch_bounds.texture_size,
+                                        Self::max_backdrop_texture_size(
+                                            scratch_bounds,
+                                            self.width,
+                                            self.height,
+                                        ),
+                                    )?
+                                {
+                                    scratch_bounds.texture_size = texture_size;
+                                }
                             }
-                        }
-                        let prepared_blurs =
-                            Self::prepare_backdrop_blurs(blurs, scratch_bounds);
-                        self.copy_render_target_to_backdrop(scratch_bounds)?;
-                        let mut current_passes = None;
-                        let mut current_blur_srv = None;
-                        let mut start = 0;
-                        while start < blurs.len() {
-                            let passes =
-                                self.backdrop_blur_passes_for_radius(blurs[start].blur_radius.0);
-                            let mut end = start + 1;
-                            while end < blurs.len()
-                                && self.backdrop_blur_passes_for_radius(blurs[end].blur_radius.0)
-                                    == passes
-                            {
-                                end += 1;
+                            let prepared_blurs =
+                                Self::prepare_backdrop_blurs(&blurs, scratch_bounds);
+                            self.copy_render_target_to_backdrop(scratch_bounds)?;
+                            let mut current_passes = None;
+                            let mut current_blur_srv = None;
+                            let mut start = 0;
+                            while start < blurs.len() {
+                                let passes =
+                                    self.backdrop_blur_passes_for_radius(blurs[start].blur_radius.0);
+                                let mut end = start + 1;
+                                while end < blurs.len()
+                                    && self
+                                        .backdrop_blur_passes_for_radius(blurs[end].blur_radius.0)
+                                        == passes
+                                {
+                                    end += 1;
+                                }
+                                if current_passes != Some(passes) {
+                                    current_blur_srv =
+                                        self.run_backdrop_blur_passes_for_passes(passes)?;
+                                    current_passes = Some(passes);
+                                }
+                                self.draw_backdrop_blurs(
+                                    &prepared_blurs[start..end],
+                                    &current_blur_srv,
+                                )?;
+                                start = end;
                             }
-                            if current_passes != Some(passes) {
-                                current_blur_srv = self.run_backdrop_blur_passes_for_passes(passes)?;
-                                current_passes = Some(passes);
-                            }
-                            self.draw_backdrop_blurs(
-                                &prepared_blurs[start..end],
-                                &current_blur_srv,
-                            )?;
-                            start = end;
                         }
                         Ok(())
                     }
@@ -851,6 +865,71 @@ impl DirectXRenderer {
             ),
             bounds,
         })
+    }
+
+    fn backdrop_source_bounds(
+        blur: &BackdropBlur,
+        width: u32,
+        height: u32,
+    ) -> Option<Bounds<ScaledPixels>> {
+        let viewport_bounds = Bounds {
+            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(ScaledPixels(width as f32), ScaledPixels(height as f32)),
+        };
+        let bounds = blur
+            .bounds
+            .dilate(Self::backdrop_blur_padding(blur.blur_radius.0))
+            .intersect(&viewport_bounds);
+        if bounds.is_empty() {
+            return None;
+        }
+
+        let origin = bounds.origin.map(|component| component.floor());
+        let bottom_right = bounds.bottom_right().map(|component| component.ceil());
+        Some(Bounds::from_corners(origin, bottom_right))
+    }
+
+    fn backdrop_blur_clusters(
+        blurs: &[BackdropBlur],
+        width: u32,
+        height: u32,
+    ) -> Vec<Vec<BackdropBlur>> {
+        let mut clusters: Vec<(Bounds<ScaledPixels>, Vec<(usize, BackdropBlur)>)> = Vec::new();
+        for (blur_ix, blur) in blurs.iter().enumerate() {
+            let Some(mut cluster_bounds) = Self::backdrop_source_bounds(blur, width, height) else {
+                continue;
+            };
+            let mut cluster_blurs = vec![(blur_ix, blur.clone())];
+
+            loop {
+                let overlapping_cluster_ixs = clusters
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, (bounds, _))| {
+                        bounds.intersects(&cluster_bounds).then_some(ix)
+                    })
+                    .collect::<Vec<_>>();
+                if overlapping_cluster_ixs.is_empty() {
+                    break;
+                }
+
+                for ix in overlapping_cluster_ixs.into_iter().rev() {
+                    let (bounds, mut blurs) = clusters.remove(ix);
+                    cluster_bounds = cluster_bounds.union(&bounds);
+                    cluster_blurs.append(&mut blurs);
+                }
+            }
+
+            clusters.push((cluster_bounds, cluster_blurs));
+        }
+
+        clusters
+            .into_iter()
+            .map(|(_, mut blurs)| {
+                blurs.sort_by_key(|(ix, _)| *ix);
+                blurs.into_iter().map(|(_, blur)| blur).collect()
+            })
+            .collect()
     }
 
     fn max_backdrop_texture_size(
@@ -1538,6 +1617,7 @@ impl DirectXResources {
         size: Size<DevicePixels>,
         max_size: Size<DevicePixels>,
     ) -> Result<Option<Size<DevicePixels>>> {
+        let size = Self::quantize_backdrop_texture_size(size, max_size);
         if let Some(current_size) = self.backdrop_size
             && self.backdrop_texture.is_some()
         {
@@ -1560,6 +1640,27 @@ impl DirectXResources {
         self.create_backdrop_resources(devices, size)
     }
 
+    fn quantize_backdrop_texture_size(
+        size: Size<DevicePixels>,
+        max_size: Size<DevicePixels>,
+    ) -> Size<DevicePixels> {
+        fn quantize(value: DevicePixels, max_value: DevicePixels) -> DevicePixels {
+            if value.0 <= 0 {
+                return value;
+            }
+
+            let rounded = ((value.0 + BACKDROP_TEXTURE_SIZE_QUANTUM - 1)
+                / BACKDROP_TEXTURE_SIZE_QUANTUM)
+                * BACKDROP_TEXTURE_SIZE_QUANTUM;
+            DevicePixels(rounded.min(max_value.0.max(0)))
+        }
+
+        Size {
+            width: quantize(size.width, max_size.width),
+            height: quantize(size.height, max_size.height),
+        }
+    }
+
     fn create_backdrop_resources(
         &mut self,
         devices: &DirectXRendererDevices,
@@ -1570,6 +1671,7 @@ impl DirectXResources {
             return Ok(None);
         }
 
+        self.discard_backdrop_resources();
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
         let (backdrop_texture, backdrop_srv) =
