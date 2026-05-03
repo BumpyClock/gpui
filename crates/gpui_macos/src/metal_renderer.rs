@@ -22,7 +22,7 @@ use core_video::{
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    CAMetalLayer, CommandQueue, MTLPixelFormat, MTLResourceOptions, NSRange,
+    CAMetalLayer, CommandQueue, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions, NSRange,
     RenderPassColorAttachmentDescriptorRef,
 };
 use objc::{self, msg_send, sel, sel_impl};
@@ -198,6 +198,7 @@ pub(crate) struct MetalRenderer {
     backdrop_blur_upsample_textures: Vec<metal::Texture>,
     retained_layers: HashMap<RetainedLayerCacheKey, CachedRetainedLayer>,
     path_sample_count: u32,
+    is_apple_gpu: bool,
 }
 
 #[repr(C)]
@@ -424,6 +425,7 @@ impl MetalRenderer {
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone()));
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
+        let is_apple_gpu = device.supports_family(MTLGPUFamily::Apple1);
 
         Self {
             device,
@@ -456,6 +458,7 @@ impl MetalRenderer {
             backdrop_blur_upsample_textures: Vec::new(),
             retained_layers: HashMap::default(),
             path_sample_count: PATH_SAMPLE_COUNT,
+            is_apple_gpu,
         }
     }
 
@@ -550,7 +553,12 @@ impl MetalRenderer {
         if self.path_sample_count > 1 {
             let msaa_descriptor = texture_descriptor;
             msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
-            msaa_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            let storage_mode = if self.is_apple_gpu {
+                metal::MTLStorageMode::Memoryless
+            } else {
+                metal::MTLStorageMode::Private
+            };
+            msaa_descriptor.set_storage_mode(storage_mode);
             msaa_descriptor.set_sample_count(self.path_sample_count as _);
             self.path_intermediate_msaa_texture = Some(self.device.new_texture(&msaa_descriptor));
         } else {
@@ -568,12 +576,8 @@ impl MetalRenderer {
         if let Some(current_size) = self.backdrop_texture_size
             && self.backdrop_texture.is_some()
         {
-            if current_size.width >= size.width
-                && current_size.height >= size.height
-                && current_size.width <= max_size.width
-                && current_size.height <= max_size.height
-            {
-                return Some(current_size);
+            if current_size.width >= size.width && current_size.height >= size.height {
+                return Some(size);
             }
             return self.create_backdrop_textures(Size {
                 width: current_size.width.max(size.width).min(max_size.width),
@@ -618,23 +622,9 @@ impl MetalRenderer {
         self.backdrop_blur_downsample_textures.clear();
         self.backdrop_blur_upsample_textures.clear();
 
-        if size.width.0 <= 0 || size.height.0 <= 0 {
+        self.backdrop_blur_level_sizes = Self::backdrop_blur_level_sizes_for(size);
+        if self.backdrop_blur_level_sizes.is_empty() {
             return;
-        }
-
-        self.backdrop_blur_level_sizes.push(size);
-        let mut level_size = size;
-        for _ in 0..MAX_BACKDROP_BLUR_LEVELS {
-            let next_width = level_size.width.0 / 2;
-            let next_height = level_size.height.0 / 2;
-            if next_width < 2 || next_height < 2 {
-                break;
-            }
-            level_size = Size {
-                width: DevicePixels(next_width),
-                height: DevicePixels(next_height),
-            };
-            self.backdrop_blur_level_sizes.push(level_size);
         }
 
         let texture_descriptor = metal::TextureDescriptor::new();
@@ -656,6 +646,29 @@ impl MetalRenderer {
             self.backdrop_blur_upsample_textures
                 .push(self.device.new_texture(&texture_descriptor));
         }
+    }
+
+    fn backdrop_blur_level_sizes_for(size: Size<DevicePixels>) -> Vec<Size<DevicePixels>> {
+        let mut level_sizes = Vec::new();
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            return level_sizes;
+        }
+
+        level_sizes.push(size);
+        let mut level_size = size;
+        for _ in 0..MAX_BACKDROP_BLUR_LEVELS {
+            let next_width = level_size.width.0 / 2;
+            let next_height = level_size.height.0 / 2;
+            if next_width < 2 || next_height < 2 {
+                break;
+            }
+            level_size = Size {
+                width: DevicePixels(next_width),
+                height: DevicePixels(next_height),
+            };
+            level_sizes.push(level_size);
+        }
+        level_sizes
     }
 
     pub fn update_transparency(&self, transparent: bool) {
@@ -1298,6 +1311,8 @@ impl MetalRenderer {
                             scratch_bounds.texture_size = texture_size;
                         }
                         let prepared_blurs = Self::prepare_backdrop_blurs(blurs, scratch_bounds);
+                        let blur_level_sizes =
+                            Self::backdrop_blur_level_sizes_for(scratch_bounds.texture_size);
                         let did_copy = self.backdrop_texture.is_some()
                             && self.copy_texture_to_backdrop(
                                 command_buffer,
@@ -1310,12 +1325,16 @@ impl MetalRenderer {
                         let mut has_active_encoder = false;
                         let mut start = 0;
                         while start < blurs.len() {
-                            let passes =
-                                self.backdrop_blur_passes_for_radius(blurs[start].blur_radius.0);
+                            let passes = self.backdrop_blur_passes_for_radius(
+                                blurs[start].blur_radius.0,
+                                &blur_level_sizes,
+                            );
                             let mut end = start + 1;
                             while end < blurs.len()
-                                && self.backdrop_blur_passes_for_radius(blurs[end].blur_radius.0)
-                                    == passes
+                                && self.backdrop_blur_passes_for_radius(
+                                    blurs[end].blur_radius.0,
+                                    &blur_level_sizes,
+                                ) == passes
                             {
                                 end += 1;
                             }
@@ -1328,6 +1347,7 @@ impl MetalRenderer {
                                     self.render_backdrop_blur_texture_for_passes(
                                         command_buffer,
                                         passes,
+                                        &blur_level_sizes,
                                     )
                                 } else {
                                     None
@@ -1618,11 +1638,15 @@ impl MetalRenderer {
             .collect()
     }
 
-    fn backdrop_blur_passes_for_radius(&self, radius: f32) -> usize {
+    fn backdrop_blur_passes_for_radius(
+        &self,
+        radius: f32,
+        level_sizes: &[Size<DevicePixels>],
+    ) -> usize {
         if radius <= 0.0 {
             return 0;
         }
-        let max_levels = self.backdrop_blur_level_sizes.len().saturating_sub(1);
+        let max_levels = level_sizes.len().saturating_sub(1);
         if max_levels == 0 {
             return 0;
         }
@@ -1634,6 +1658,7 @@ impl MetalRenderer {
         &self,
         command_buffer: &metal::CommandBufferRef,
         passes: usize,
+        level_sizes: &[Size<DevicePixels>],
     ) -> Option<&metal::Texture> {
         let Some(backdrop_texture) = &self.backdrop_texture else {
             return None;
@@ -1651,8 +1676,8 @@ impl MetalRenderer {
         let mut input_texture: &metal::Texture = backdrop_texture;
         for level in 0..passes {
             let output_texture = &self.backdrop_blur_downsample_textures[level];
-            let input_size = self.backdrop_blur_level_sizes[level];
-            let output_size = self.backdrop_blur_level_sizes[level + 1];
+            let input_size = level_sizes[level];
+            let output_size = level_sizes[level + 1];
             self.draw_backdrop_blur_pass(
                 command_buffer,
                 &self.backdrop_blur_downsample_pipeline_state,
@@ -1667,8 +1692,8 @@ impl MetalRenderer {
         let mut input_texture = &self.backdrop_blur_downsample_textures[passes - 1];
         for level in (0..passes).rev() {
             let output_texture = &self.backdrop_blur_upsample_textures[level];
-            let input_size = self.backdrop_blur_level_sizes[level + 1];
-            let output_size = self.backdrop_blur_level_sizes[level];
+            let input_size = level_sizes[level + 1];
+            let output_size = level_sizes[level];
             self.draw_backdrop_blur_pass(
                 command_buffer,
                 &self.backdrop_blur_upsample_pipeline_state,

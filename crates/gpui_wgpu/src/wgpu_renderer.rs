@@ -1076,12 +1076,8 @@ impl WgpuRenderer {
         if let Some(current_size) = self.backdrop_size
             && self.backdrop_texture.is_some()
         {
-            if current_size.width >= size.width
-                && current_size.height >= size.height
-                && current_size.width <= max_size.width
-                && current_size.height <= max_size.height
-            {
-                return Some(current_size);
+            if current_size.width >= size.width && current_size.height >= size.height {
+                return Some(size);
             }
             return self.create_backdrop_resources(Size {
                 width: current_size.width.max(size.width).min(max_size.width),
@@ -1218,13 +1214,15 @@ impl WgpuRenderer {
         let mut prepared_retained_layers = self.prepare_retained_layers(scene);
         let retained_instance_bytes =
             prepared_retained_layers.len() * std::mem::size_of::<RetainedLayerSprite>();
-        let required_capacity = self.required_instance_buffer_size(scene)
-            + prepared_retained_layers
-                .iter()
-                .filter(|layer| layer.cache_valid)
-                .map(|layer| self.required_instance_buffer_size(&layer.scene))
-                .sum::<u64>()
-            + retained_instance_bytes as u64;
+        let main_capacity =
+            self.required_instance_buffer_size(scene) + retained_instance_bytes as u64;
+        let retained_capacity = prepared_retained_layers
+            .iter()
+            .filter(|layer| layer.cache_valid && layer.needs_render)
+            .map(|layer| self.required_instance_buffer_size(&layer.scene))
+            .max()
+            .unwrap_or(0);
+        let required_capacity = main_capacity.max(retained_capacity);
         self.ensure_instance_buffer_capacity(required_capacity);
 
         {
@@ -1378,7 +1376,17 @@ impl WgpuRenderer {
             .iter()
             .map(|layer| layer.cache_key.clone())
             .collect::<HashSet<_>>();
-        self.retained_layers.retain(|id, _| active_ids.contains(id));
+        let stale_ids = self
+            .retained_layers
+            .keys()
+            .filter(|id| !active_ids.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in stale_ids {
+            if let Some(layer) = self.retained_layers.remove(&id) {
+                layer.texture.destroy();
+            }
+        }
 
         prepared
     }
