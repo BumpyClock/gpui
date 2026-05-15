@@ -423,9 +423,14 @@ impl X11WindowState {
         supports_xinput_gestures: bool,
         is_bgr: bool,
     ) -> anyhow::Result<Self> {
-        let x_screen_index = params
-            .display_id
-            .map_or(x_main_screen_index, |did| u64::from(did) as usize);
+        let x_screen_index = params.display_id.map_or(Ok(x_main_screen_index), |did| {
+            let index =
+                usize::try_from(u64::from(did)).context("X11 display id does not fit in usize")?;
+            xcb.setup().roots.get(index).with_context(|| {
+                format!("no X11 screen found for display id {}", u64::from(did))
+            })?;
+            Ok(index)
+        })?;
 
         let visual_set = find_visuals(xcb, x_screen_index);
 

@@ -430,15 +430,14 @@ impl WaylandClientState {
     }
 
     fn restore_cursor_after_hide(&mut self) {
-        if self.cursor_hidden_window.take().is_none() {
+        if self.cursor_hidden_window.is_none() {
             return;
         }
-        let Some(style) = self.cursor_style else {
-            return;
-        };
+        let style = self.cursor_style.unwrap_or(CursorStyle::Arrow);
         let serial = self.serial_tracker.get(SerialKind::MouseEnter);
         if let Some(cursor_shape_device) = &self.cursor_shape_device {
             cursor_shape_device.set_shape(serial, to_shape(style));
+            self.cursor_hidden_window = None;
             return;
         }
         let Some(focused_window) = self.mouse_focused_window.clone() else {
@@ -462,6 +461,7 @@ impl WaylandClientState {
             cursor_style_to_icon_names(style),
             scale,
         );
+        self.cursor_hidden_window = None;
     }
 }
 

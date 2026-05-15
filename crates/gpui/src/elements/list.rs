@@ -395,7 +395,7 @@ impl ListState {
                         cursor
                             .item()
                             .and_then(|item| {
-                                item.size().map(|size| {
+                                item.size_hint().map(|size| {
                                     let fraction = if size.height.0 > 0.0 {
                                         (scroll_top.offset_in_item.0 / size.height.0)
                                             .clamp(0.0, 1.0)
@@ -409,7 +409,14 @@ impl ListState {
                                     })
                                 })
                             })
-                            .or_else(|| state.pending_scroll.clone())
+                            .or_else(|| match &state.pending_scroll {
+                                Some(PendingScroll::Proportional(pending_scroll))
+                                    if pending_scroll.item_ix == scroll_top.item_ix =>
+                                {
+                                    Some(PendingScroll::Proportional(pending_scroll.clone()))
+                                }
+                                _ => None,
+                            })
                     }
                 };
             }
@@ -1781,6 +1788,63 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 5);
         assert_eq!(offset.offset_in_item, px(40.));
+    }
+
+    #[gpui::test]
+    fn test_remeasure_uses_proportional_anchor_after_pending_item_remeasure(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+
+        let item_height = Rc::new(Cell::new(100usize));
+        let state = ListState::new(20, crate::ListAlignment::Top, px(10.));
+
+        struct TestView {
+            state: ListState,
+            item_height: Rc<Cell<usize>>,
+        }
+
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let height = self.item_height.get();
+                list(self.state.clone(), move |index, _, _| {
+                    let height = if index == 5 { height } else { 100 };
+                    div().h(px(height as f32)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let state_clone = state.clone();
+        let item_height_clone = item_height.clone();
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                state: state_clone,
+                item_height: item_height_clone,
+            })
+        });
+
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 5,
+            offset_in_item: px(40.),
+        });
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        state.remeasure_items(5..6);
+        item_height.set(50);
+        state.remeasure();
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.into_any_element()
+        });
+
+        let offset = state.logical_scroll_top();
+        assert_eq!(offset.item_ix, 5);
+        assert_eq!(offset.offset_in_item, px(20.));
     }
 
     #[gpui::test]

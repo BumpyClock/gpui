@@ -36,7 +36,8 @@ pub struct ForegroundExecutor {
 
 /// Extension trait for `Task<Result<T, E>>` that adds `detach_and_log_err` with an `&App` context.
 ///
-/// This trait is automatically implemented for all `Task<Result<T, E>>` types.
+/// This trait is implemented for `Task<Result<T, E>>` where `T: 'static` and
+/// `E: 'static + std::fmt::Display + std::fmt::Debug`.
 pub trait TaskExt<T, E> {
     /// Run the task to completion in the background and log any errors that occur.
     fn detach_and_log_err(self, cx: &App);

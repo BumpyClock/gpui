@@ -2009,13 +2009,13 @@ impl X11ClientState {
                 }
             }
             if errors.is_empty() {
+                Err(anyhow!("did not find cursor icons {:?}", cursor_icon_names))
+            } else {
                 Err(anyhow!(
                     "errors while loading cursor icons {:?}:\n{}",
                     cursor_icon_names,
                     errors
                 ))
-            } else {
-                Err(anyhow!("did not find cursor icons {:?}", cursor_icon_names))
             }
         };
 
