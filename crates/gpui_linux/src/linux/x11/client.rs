@@ -2086,7 +2086,7 @@ impl X11ClientState {
     }
 
     fn restore_cursor_after_hide(&mut self) {
-        let Some(hidden_window) = self.cursor_hidden_window.take() else {
+        let Some(hidden_window) = self.cursor_hidden_window else {
             return;
         };
         let style = self
@@ -2101,7 +2101,7 @@ impl X11ClientState {
             );
             return;
         };
-        check_reply(
+        let restore_result = check_reply(
             || "Failed to restore cursor style after hide",
             self.xcb_connection.change_window_attributes(
                 hidden_window,
@@ -2111,8 +2111,17 @@ impl X11ClientState {
                 },
             ),
         )
+        .and_then(|()| {
+            self.xcb_connection
+                .flush()
+                .map(|_| ())
+                .map_err(handle_connection_error)
+                .context("X11 flush failed")
+        })
         .log_err();
-        self.xcb_connection.flush().log_err();
+        if restore_result.is_some() {
+            self.cursor_hidden_window = None;
+        }
     }
 }
 
