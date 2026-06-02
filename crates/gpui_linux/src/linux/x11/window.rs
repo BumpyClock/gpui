@@ -1068,15 +1068,15 @@ impl X11WindowStatePtr {
             .chunks_exact(4)
             .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
 
-        state.active = false;
         state.fullscreen = false;
         state.maximized_vertical = false;
         state.maximized_horizontal = false;
         state.hidden = false;
 
+        let mut active = false;
         for atom in atoms {
             if atom == state.atoms._NET_WM_STATE_FOCUSED {
-                state.active = true;
+                active = true;
             } else if atom == state.atoms._NET_WM_STATE_FULLSCREEN {
                 state.fullscreen = true;
             } else if atom == state.atoms._NET_WM_STATE_MAXIMIZED_VERT {
@@ -1086,6 +1086,13 @@ impl X11WindowStatePtr {
             } else if atom == state.atoms._NET_WM_STATE_HIDDEN {
                 state.hidden = true;
             }
+        }
+
+        let active_changed = state.active != active;
+        drop(state);
+
+        if active_changed {
+            self.set_active(active);
         }
 
         Ok(())

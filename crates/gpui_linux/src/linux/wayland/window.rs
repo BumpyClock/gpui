@@ -441,6 +441,30 @@ impl WaylandWindowState {
             WindowDecorations::Client => self.client_inset.unwrap_or(px(0.0)),
         }
     }
+
+    fn update_accesskit_window_bounds(&mut self) {
+        let scale = self.scale;
+        let bounds = self.bounds.map_origin(|_| px(0.0));
+        let inner_bounds = bounds.inset(self.inset());
+
+        let outer = accesskit::Rect {
+            x0: f64::from(f32::from(bounds.origin.x) * scale),
+            y0: f64::from(f32::from(bounds.origin.y) * scale),
+            x1: f64::from(f32::from(bounds.origin.x + bounds.size.width) * scale),
+            y1: f64::from(f32::from(bounds.origin.y + bounds.size.height) * scale),
+        };
+
+        let inner = accesskit::Rect {
+            x0: f64::from(f32::from(inner_bounds.origin.x) * scale),
+            y0: f64::from(f32::from(inner_bounds.origin.y) * scale),
+            x1: f64::from(f32::from(inner_bounds.origin.x + inner_bounds.size.width) * scale),
+            y1: f64::from(f32::from(inner_bounds.origin.y + inner_bounds.size.height) * scale),
+        };
+
+        if let Some(adapter) = self.accesskit_adapter.as_mut() {
+            adapter.set_root_window_bounds(outer, inner);
+        }
+    }
 }
 
 pub(crate) struct WaylandWindow(pub WaylandWindowStatePtr);
@@ -958,6 +982,7 @@ impl WaylandWindowStatePtr {
             if let Some(scale) = scale {
                 state.scale = scale;
             }
+            state.update_accesskit_window_bounds();
             let device_bounds = state.bounds.to_device_pixels(state.scale);
             state.renderer.update_drawable_size(device_bounds.size);
             (state.bounds.size, state.scale)
@@ -1504,7 +1529,8 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn a11y_update_window_bounds(&self) {
-        // Wayland does not expose window position.
+        let mut state = self.borrow_mut();
+        state.update_accesskit_window_bounds();
     }
 }
 

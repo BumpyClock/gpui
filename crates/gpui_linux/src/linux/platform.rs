@@ -123,10 +123,8 @@ pub(crate) trait LinuxClient {
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>>;
     fn set_cursor_style(&self, style: CursorStyle);
-    fn hide_cursor_until_mouse_moves(&self) {}
-    fn is_cursor_visible(&self) -> bool {
-        true
-    }
+    fn hide_cursor_until_mouse_moves(&self);
+    fn is_cursor_visible(&self) -> bool;
     fn open_uri(&self, uri: &str);
     fn reveal_path(&self, path: PathBuf);
     fn write_to_primary(&self, item: ClipboardItem);

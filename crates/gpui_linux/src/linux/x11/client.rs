@@ -1692,7 +1692,14 @@ impl LinuxClient for X11Client {
 
     fn is_cursor_visible(&self) -> bool {
         let state = self.0.borrow();
-        is_cursor_visible(state.cursor_hidden_window, state.mouse_focused_window)
+        let focused_cursor_style = state
+            .mouse_focused_window
+            .and_then(|window| state.cursor_styles.get(&window).copied());
+        is_cursor_visible(
+            state.cursor_hidden_window,
+            state.mouse_focused_window,
+            focused_cursor_style,
+        )
     }
 
     fn open_uri(&self, uri: &str) {
@@ -2510,7 +2517,12 @@ fn make_scroll_wheel_event(
 fn is_cursor_visible(
     cursor_hidden_window: Option<xproto::Window>,
     mouse_focused_window: Option<xproto::Window>,
+    focused_cursor_style: Option<CursorStyle>,
 ) -> bool {
+    if focused_cursor_style == Some(CursorStyle::None) {
+        return false;
+    }
+
     !matches!(
         (cursor_hidden_window, mouse_focused_window),
         (Some(hidden_window), Some(focused_window)) if hidden_window == focused_window
@@ -2823,10 +2835,11 @@ mod tests {
 
     #[test]
     fn cursor_is_visible_unless_hidden_window_is_focused_window() {
-        assert!(is_cursor_visible(None, None));
-        assert!(is_cursor_visible(Some(1), None));
-        assert!(is_cursor_visible(None, Some(1)));
-        assert!(is_cursor_visible(Some(1), Some(2)));
-        assert!(!is_cursor_visible(Some(1), Some(1)));
+        assert!(is_cursor_visible(None, None, None));
+        assert!(is_cursor_visible(Some(1), None, None));
+        assert!(is_cursor_visible(None, Some(1), None));
+        assert!(is_cursor_visible(Some(1), Some(2), None));
+        assert!(!is_cursor_visible(Some(1), Some(1), None));
+        assert!(!is_cursor_visible(None, Some(1), Some(CursorStyle::None)));
     }
 }

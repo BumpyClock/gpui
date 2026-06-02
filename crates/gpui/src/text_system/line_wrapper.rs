@@ -681,6 +681,7 @@ fn update_runs_after_truncation(
                 } else {
                     run.len = truncate_at + ellipsis.len();
                     runs.splice(..run_index, std::iter::empty());
+                    runs.retain(|run| run.len > 0);
                     return;
                 }
             }
@@ -698,6 +699,7 @@ fn update_runs_after_truncation(
                 } else {
                     run.len = truncate_at + ellipsis.len();
                     runs.truncate(run_index + 1);
+                    runs.retain(|run| run.len > 0);
                     return;
                 }
             }
@@ -707,6 +709,7 @@ fn update_runs_after_truncation(
             }
         }
     }
+    runs.retain(|run| run.len > 0);
 }
 
 /// A fragment of a line that can be wrapped.
@@ -1272,6 +1275,23 @@ mod tests {
         // Runs res: Run0 { string: abcd, len: 4, ... }, Run1 { string: efgh, len:
         // 4, ... }, Run2 { string: …, len: 3, ... }
         perform_test("abcdefgh…", &[4, 4, 4], &[4, 4, 3]);
+    }
+
+    #[test]
+    fn test_update_runs_after_truncation_drops_empty_boundary_runs() {
+        let mut end_runs = generate_test_runs(&[4, 4, 4]);
+        update_runs_after_truncation("abcdefgh", "", &mut end_runs, TruncateFrom::End);
+        assert_eq!(
+            end_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![4, 4]
+        );
+
+        let mut start_runs = generate_test_runs(&[4, 4, 4]);
+        update_runs_after_truncation("efghijkl", "", &mut start_runs, TruncateFrom::Start);
+        assert_eq!(
+            start_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![4, 4]
+        );
     }
 
     #[test]

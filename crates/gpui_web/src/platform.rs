@@ -388,7 +388,7 @@ impl Platform for WebPlatform {
     }
 
     fn is_cursor_visible(&self) -> bool {
-        self.cursor_visible.get()
+        self.cursor_visible.get() && self.last_cursor_css.get() != "none"
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {

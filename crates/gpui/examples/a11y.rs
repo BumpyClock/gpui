@@ -68,7 +68,7 @@ impl Render for A11yDemo {
                             .focusable()
                             .tab_stop(true)
                             .role(Role::SpinButton)
-                            .aria_label(SharedString::from(format!("Counter: {}", self.count)))
+                            .aria_label("Counter")
                             .aria_numeric_value(self.count as f64)
                             .aria_min_numeric_value(0.0)
                             .on_a11y_action(AccessibleAction::Increment, {

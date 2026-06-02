@@ -660,8 +660,11 @@ impl ListState {
     /// been rendered.
     pub fn bounds_for_item(&self, ix: usize) -> Option<Bounds<Pixels>> {
         let state = &*self.0.borrow();
+        let scroll_top = state
+            .last_layout_scroll_top
+            .unwrap_or_else(|| state.logical_scroll_top());
 
-        state.bounds_for_item_at_scroll_top(ix, state.logical_scroll_top())
+        state.bounds_for_item_at_scroll_top(ix, scroll_top)
     }
 
     /// Call this method when the user starts dragging the scrollbar.
@@ -1737,6 +1740,28 @@ mod test {
 
         assert_eq!(state.item_is_above_viewport(1), Some(true));
         assert_eq!(state.item_is_below_viewport(1), Some(false));
+    }
+
+    #[gpui::test]
+    fn test_bounds_for_item_uses_last_layout_scroll_top(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(5, crate::ListAlignment::Top, px(0.)).measure_all();
+
+        state.scroll_to(gpui::ListOffset {
+            item_ix: 2,
+            offset_in_item: px(0.),
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(20.)), |_, cx| {
+            cx.new(|_| TestListView(state.clone())).into_any_element()
+        });
+
+        state.0.borrow_mut().logical_scroll_top = Some(gpui::ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.),
+        });
+
+        assert_eq!(state.bounds_for_item(2).unwrap().top(), px(0.));
     }
 
     #[gpui::test]

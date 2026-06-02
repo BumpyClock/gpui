@@ -148,7 +148,6 @@ impl A11yNodeBuilder {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn update_current_node_bounds(
         &mut self,
         id: NodeId,
@@ -159,17 +158,15 @@ impl A11yNodeBuilder {
             return false;
         };
 
-        let scale = scale_factor;
         node.set_bounds(accesskit::Rect {
-            x0: (bounds.origin.x.0 * scale) as f64,
-            y0: (bounds.origin.y.0 * scale) as f64,
-            x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
-            y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
+            x0: (bounds.origin.x.0 * scale_factor) as f64,
+            y0: (bounds.origin.y.0 * scale_factor) as f64,
+            x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale_factor) as f64,
+            y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale_factor) as f64,
         });
         true
     }
 
-    #[allow(dead_code)]
     pub(crate) fn suppress_current_node(&mut self, id: NodeId) -> bool {
         if self.ids_stack.len() <= 1 {
             debug_assert!(false, "cannot suppress the root a11y node");
@@ -193,12 +190,10 @@ impl A11yNodeBuilder {
         true
     }
 
-    #[allow(dead_code)]
     pub(crate) fn begin_suppressing_descendants(&mut self) {
         self.ambient_suppression_depth += 1;
     }
 
-    #[allow(dead_code)]
     pub(crate) fn end_suppressing_descendants(&mut self) {
         debug_assert!(
             self.ambient_suppression_depth > 0,
@@ -240,7 +235,6 @@ impl A11yNodeBuilder {
         Self::repair_tree_update(update)
     }
 
-    #[allow(dead_code)]
     fn current_node_mut(&mut self, id: NodeId) -> Option<&mut accesskit::Node> {
         if self.ids_stack.len() <= 1
             || self.ids_stack.last().copied() != Some(id)

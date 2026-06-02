@@ -259,13 +259,12 @@ impl CosmicTextSystemState {
                             .insert(fb_key.clone(), loaded.clone());
                         loaded
                     };
-                    let Some(&fb_id) = fb_ids.first() else {
-                        continue;
-                    };
-                    let db_id = self.loaded_fonts[fb_id.0].font.id();
-                    if let Some(face) = self.font_system.db().face(db_id) {
-                        if let Some(family) = face.families.first() {
-                            chain.push((fb_id, SharedString::from(family.0.clone())));
+                    for fb_id in fb_ids {
+                        let db_id = self.loaded_fonts[fb_id.0].font.id();
+                        if let Some(face) = self.font_system.db().face(db_id) {
+                            if let Some(family) = face.families.first() {
+                                chain.push((fb_id, SharedString::from(family.0.clone())));
+                            }
                         }
                     }
                 }
