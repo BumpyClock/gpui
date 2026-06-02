@@ -883,6 +883,35 @@ fn test_spawn_dedicated_inner_spawn_local() {
 }
 
 #[test]
+fn test_spawn_dedicated_thread_closure_panic_reaches_caller() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = spawn_dedicated_thread(
+            SessionId::new(1),
+            scheduler,
+            |_executor| -> future::Ready<()> {
+                panic!("dedicated root task constructor exploded");
+            },
+        );
+    }));
+
+    assert!(result.is_err(), "expected spawn_dedicated_thread to panic");
+    let panic_payload = result.unwrap_err();
+    let panic_message = panic_payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<unknown panic>");
+
+    assert!(
+        panic_message.contains("dedicated root task constructor exploded"),
+        "expected caller panic to include the dedicated closure panic, got: {}",
+        panic_message
+    );
+}
+
+#[test]
 fn test_spawn_dedicated_determinism_under_many() {
     use parking_lot::Mutex;
 

@@ -1065,7 +1065,8 @@ impl Platform for MacPlatform {
     }
 
     fn is_cursor_visible(&self) -> bool {
-        self.0.lock().cursor_visible.load(Ordering::Relaxed)
+        let state = self.0.lock();
+        !state.cursor_hidden_by_style && state.cursor_visible.load(Ordering::Relaxed)
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {

@@ -880,7 +880,8 @@ impl LinuxClient for WaylandClient {
     }
 
     fn is_cursor_visible(&self) -> bool {
-        self.0.borrow().cursor_hidden_window.is_none()
+        let state = self.0.borrow();
+        state.cursor_hidden_window.is_none() && state.cursor_style != Some(CursorStyle::None)
     }
 
     fn open_uri(&self, uri: &str) {

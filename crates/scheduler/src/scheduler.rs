@@ -13,7 +13,7 @@ use futures::channel::oneshot;
 use std::{
     any::Any,
     future::Future,
-    panic::Location,
+    panic::{self, AssertUnwindSafe, Location},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -137,7 +137,8 @@ where
     Fut::Output: Send + 'static,
 {
     let (runnable_sender, runnable_receiver) = flume::unbounded::<Runnable<RunnableMeta>>();
-    let (task_sender, task_receiver) = flume::bounded::<Task<Fut::Output>>(1);
+    let (task_sender, task_receiver) =
+        flume::bounded::<Result<Task<Fut::Output>, Box<dyn Any + Send>>>(1);
 
     thread::Builder::new()
         .name(format!("spawn_dedicated session {:?}", session_id))
@@ -146,8 +147,21 @@ where
                 let _ = runnable_sender.send(runnable);
             };
             let executor = LocalExecutor::new(session_id, scheduler, dispatch);
-            let root_task = executor.spawn(f(executor.clone()));
-            let _ = task_sender.send(root_task);
+            let root_task =
+                panic::catch_unwind(AssertUnwindSafe(|| executor.spawn(f(executor.clone()))));
+            let root_task = match root_task {
+                Ok(root_task) => root_task,
+                Err(error) => {
+                    if task_sender.send(Err(error)).is_err() {
+                        panic!("dedicated thread failed to send root task panic");
+                    }
+                    return;
+                }
+            };
+
+            if task_sender.send(Ok(root_task)).is_err() {
+                panic!("dedicated thread failed to send root task");
+            }
             // Close the dispatch sender so the dedicated thread exits after draining queued work.
             drop(executor);
 
@@ -157,9 +171,11 @@ where
         })
         .expect("failed to spawn dedicated thread");
 
-    task_receiver
-        .recv()
-        .expect("dedicated thread failed to produce root task")
+    match task_receiver.recv() {
+        Ok(Ok(root_task)) => root_task,
+        Ok(Err(error)) => panic::resume_unwind(error),
+        Err(error) => panic!("dedicated thread failed to produce root task: {}", error),
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
