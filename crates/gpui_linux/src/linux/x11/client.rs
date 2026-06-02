@@ -1686,7 +1686,8 @@ impl LinuxClient for X11Client {
     }
 
     fn is_cursor_visible(&self) -> bool {
-        self.0.borrow().cursor_hidden_window.is_none()
+        let state = self.0.borrow();
+        state.cursor_hidden_window != state.mouse_focused_window
     }
 
     fn open_uri(&self, uri: &str) {
