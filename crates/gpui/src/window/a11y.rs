@@ -24,6 +24,7 @@ pub(crate) struct A11y {
     active_flag: Arc<AtomicBool>,
     active_this_frame: bool,
     node_ids: FxHashMap<GlobalElementId, NodeId>,
+    visited_global_ids: FxHashSet<GlobalElementId>,
     next_node_id: u64,
     pub(crate) nodes: A11yNodeBuilder,
     pub(crate) focus_ids: FxHashMap<NodeId, FocusId>,
@@ -38,6 +39,7 @@ impl A11y {
             active_flag,
             active_this_frame: false,
             node_ids: FxHashMap::default(),
+            visited_global_ids: FxHashSet::default(),
             next_node_id: ROOT_NODE_ID.0 + 1,
             nodes: A11yNodeBuilder::new(),
             focus_ids: FxHashMap::default(),
@@ -65,10 +67,13 @@ impl A11y {
         self.focus_ids.clear();
         self.node_bounds.clear();
         self.action_listeners.clear();
+        self.visited_global_ids.clear();
         self.nodes.begin_frame();
     }
 
     pub(crate) fn node_id_for(&mut self, global_id: &GlobalElementId) -> NodeId {
+        self.visited_global_ids.insert(global_id.clone());
+
         if let Some(node_id) = self.node_ids.get(global_id) {
             return *node_id;
         }
@@ -85,13 +90,30 @@ impl A11y {
     }
 
     pub(crate) fn end_frame(&mut self) -> TreeUpdate {
-        self.nodes.finalize()
+        let update = self.nodes.finalize();
+        let live_node_ids = update
+            .nodes
+            .iter()
+            .map(|(node_id, _)| *node_id)
+            .collect::<FxHashSet<_>>();
+
+        self.node_ids
+            .retain(|global_id, _| self.visited_global_ids.contains(global_id));
+        self.focus_ids
+            .retain(|node_id, _| live_node_ids.contains(node_id));
+        self.node_bounds
+            .retain(|node_id, _| live_node_ids.contains(node_id));
+        self.action_listeners
+            .retain(|node_id, _| live_node_ids.contains(node_id));
+
+        update
     }
 
     pub(crate) fn prepaint_snapshot(&self) -> A11yPrepaintSnapshot {
         A11yPrepaintSnapshot {
             nodes: self.nodes.prepaint_snapshot(),
             node_ids: self.node_ids.clone(),
+            visited_global_ids: self.visited_global_ids.clone(),
             next_node_id: self.next_node_id,
             focus_ids: self.focus_ids.clone(),
             node_bounds: self.node_bounds.clone(),
@@ -101,6 +123,7 @@ impl A11y {
     pub(crate) fn restore_prepaint_snapshot(&mut self, snapshot: A11yPrepaintSnapshot) {
         self.nodes.restore_prepaint_snapshot(snapshot.nodes);
         self.node_ids = snapshot.node_ids;
+        self.visited_global_ids = snapshot.visited_global_ids;
         self.next_node_id = snapshot.next_node_id;
         self.focus_ids = snapshot.focus_ids;
         self.node_bounds = snapshot.node_bounds;
@@ -124,6 +147,7 @@ pub(crate) struct A11yNodeBuilder {
 pub(crate) struct A11yPrepaintSnapshot {
     nodes: A11yNodeBuilderPrepaintSnapshot,
     node_ids: FxHashMap<GlobalElementId, NodeId>,
+    visited_global_ids: FxHashSet<GlobalElementId>,
     next_node_id: u64,
     focus_ids: FxHashMap<NodeId, FocusId>,
     node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
@@ -293,9 +317,7 @@ impl A11yNodeBuilder {
         }
 
         *suppressed = true;
-        if let Some(id) = self.ids_stack.last() {
-            self.seen_ids.remove(id);
-        }
+        self.prune_emitted_subtree(id);
         true
     }
 
@@ -361,6 +383,62 @@ impl A11yNodeBuilder {
     fn is_suppressed(&self) -> bool {
         self.ambient_suppression_depth > 0
             || self.suppression_stack.last().copied().unwrap_or_default()
+    }
+
+    fn prune_emitted_subtree(&mut self, id: NodeId) {
+        let mut pruned_ids = FxHashSet::default();
+        pruned_ids.insert(id);
+
+        if let Some(current_node) = self.nodes_stack.last() {
+            let mut pending = current_node.children().to_vec();
+            while let Some(child_id) = pending.pop() {
+                if !pruned_ids.insert(child_id) {
+                    continue;
+                }
+
+                if let Some((_, child_node)) = self
+                    .all_nodes
+                    .iter()
+                    .find(|(node_id, _)| *node_id == child_id)
+                {
+                    pending.extend(child_node.children().iter().copied());
+                }
+            }
+        }
+
+        for node_id in &pruned_ids {
+            self.seen_ids.remove(node_id);
+        }
+
+        if pruned_ids.contains(&self.focus) {
+            self.focus = ROOT_NODE_ID;
+        }
+
+        self.all_nodes
+            .retain(|(node_id, _)| !pruned_ids.contains(node_id));
+
+        for (_, node) in &mut self.all_nodes {
+            Self::remove_child_refs(node, &pruned_ids);
+        }
+        for node in &mut self.nodes_stack {
+            Self::remove_child_refs(node, &pruned_ids);
+        }
+    }
+
+    fn remove_child_refs(node: &mut accesskit::Node, removed_ids: &FxHashSet<NodeId>) {
+        if node
+            .children()
+            .iter()
+            .any(|child_id| removed_ids.contains(child_id))
+        {
+            let children = node
+                .children()
+                .iter()
+                .copied()
+                .filter(|child_id| !removed_ids.contains(child_id))
+                .collect::<Vec<_>>();
+            node.set_children(children);
+        }
     }
 
     fn pop_any(&mut self) {
@@ -442,6 +520,10 @@ mod tests {
             .iter()
             .find_map(|(node_id, node)| (*node_id == id).then_some(node))
             .unwrap()
+    }
+
+    fn has_update_node(update: &TreeUpdate, id: NodeId) -> bool {
+        update.nodes.iter().any(|(node_id, _)| *node_id == id)
     }
 
     #[test]
@@ -588,6 +670,33 @@ mod tests {
     }
 
     #[test]
+    fn suppressing_current_node_prunes_already_emitted_descendants() {
+        let mut builder = A11yNodeBuilder::new();
+        builder.begin_frame();
+
+        assert!(builder.push(NodeId(1), accesskit::Node::new(accesskit::Role::Button)));
+        assert!(builder.push(NodeId(2), accesskit::Node::new(accesskit::Role::Label)));
+        assert!(builder.push(NodeId(3), accesskit::Node::new(accesskit::Role::TextInput)));
+        builder.set_focus(NodeId(3));
+        builder.pop();
+        builder.pop();
+
+        assert!(builder.suppress_current_node(NodeId(1)));
+        assert!(!builder.has_node(NodeId(1)));
+        assert!(!builder.has_node(NodeId(2)));
+        assert!(!builder.has_node(NodeId(3)));
+        builder.pop();
+
+        let update = builder.finalize();
+        assert_eq!(update.nodes.len(), 1);
+        assert_eq!(update.focus, ROOT_NODE_ID);
+        assert_eq!(node(&update, ROOT_NODE_ID).children(), &[]);
+        assert!(!has_update_node(&update, NodeId(1)));
+        assert!(!has_update_node(&update, NodeId(2)));
+        assert!(!has_update_node(&update, NodeId(3)));
+    }
+
+    #[test]
     fn parent_children_do_not_reference_suppressed_descendants() {
         let mut builder = A11yNodeBuilder::new();
         builder.begin_frame();
@@ -685,6 +794,65 @@ mod tests {
     }
 
     #[test]
+    fn retains_visited_suppressed_node_id_and_sweeps_omitted_node_id() {
+        let mut a11y = A11y::new(Arc::new(AtomicBool::new(false)), false);
+        let hidden_id = global_id("hidden");
+
+        a11y.begin_frame();
+        let hidden_node_id = a11y.node_id_for(&hidden_id);
+        assert!(a11y.nodes.push(
+            hidden_node_id,
+            accesskit::Node::new(accesskit::Role::Button)
+        ));
+        assert!(a11y.nodes.suppress_current_node(hidden_node_id));
+        a11y.nodes.pop();
+        let update = a11y.end_frame();
+
+        assert!(!has_update_node(&update, hidden_node_id));
+        assert_eq!(a11y.node_id_for_existing(&hidden_id), Some(hidden_node_id));
+
+        a11y.begin_frame();
+        a11y.end_frame();
+
+        assert_eq!(a11y.node_id_for_existing(&hidden_id), None);
+    }
+
+    #[test]
+    fn sweeps_per_node_maps_by_live_emitted_nodes_after_end_frame() {
+        let mut a11y = A11y::new(Arc::new(AtomicBool::new(false)), false);
+        let live_bounds = Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.)));
+        let stale_bounds = Bounds::new(point(px(5.), px(6.)), size(px(7.), px(8.)));
+        let live_focus = FocusId::from(KeyData::from_ffi(1));
+        let stale_focus = FocusId::from(KeyData::from_ffi(2));
+
+        a11y.begin_frame();
+        assert!(
+            a11y.nodes
+                .push(NodeId(1), accesskit::Node::new(accesskit::Role::Button))
+        );
+        a11y.nodes.pop();
+        a11y.focus_ids.insert(NodeId(1), live_focus);
+        a11y.focus_ids.insert(NodeId(2), stale_focus);
+        a11y.node_bounds.insert(NodeId(1), live_bounds);
+        a11y.node_bounds.insert(NodeId(2), stale_bounds);
+        a11y.action_listeners
+            .insert(NodeId(1), vec![(Action::Click, Box::new(|_, _, _| {}))]);
+        a11y.action_listeners
+            .insert(NodeId(2), vec![(Action::Focus, Box::new(|_, _, _| {}))]);
+
+        let update = a11y.end_frame();
+
+        assert!(has_update_node(&update, NodeId(1)));
+        assert!(!has_update_node(&update, NodeId(2)));
+        assert_eq!(a11y.focus_ids.len(), 1);
+        assert_eq!(a11y.focus_ids.get(&NodeId(1)), Some(&live_focus));
+        assert_eq!(a11y.node_bounds.len(), 1);
+        assert_eq!(a11y.node_bounds.get(&NodeId(1)), Some(&live_bounds));
+        assert_eq!(a11y.action_listeners.len(), 1);
+        assert!(a11y.action_listeners.contains_key(&NodeId(1)));
+    }
+
+    #[test]
     fn restores_prepaint_snapshot_for_node_id_allocator() {
         let mut a11y = A11y::new(Arc::new(AtomicBool::new(false)), false);
         let accepted_id = global_id("accepted");
@@ -704,5 +872,33 @@ mod tests {
         );
         assert_eq!(a11y.node_id_for_existing(&rejected_id), None);
         assert_eq!(next_node_id, rejected_node_id);
+    }
+
+    #[test]
+    fn restores_prepaint_snapshot_for_visited_globals() {
+        let mut a11y = A11y::new(Arc::new(AtomicBool::new(false)), false);
+        let accepted_id = global_id("accepted");
+        let rejected_id = global_id("rejected");
+
+        a11y.begin_frame();
+        let accepted_node_id = a11y.node_id_for(&accepted_id);
+        let snapshot = a11y.prepaint_snapshot();
+        let rejected_node_id = a11y.node_id_for(&rejected_id);
+        assert!(a11y.nodes.push(
+            accepted_node_id,
+            accesskit::Node::new(accesskit::Role::Button)
+        ));
+        a11y.nodes.pop();
+
+        a11y.restore_prepaint_snapshot(snapshot);
+        let update = a11y.end_frame();
+
+        assert!(!has_update_node(&update, accepted_node_id));
+        assert!(!has_update_node(&update, rejected_node_id));
+        assert_eq!(
+            a11y.node_id_for_existing(&accepted_id),
+            Some(accepted_node_id)
+        );
+        assert_eq!(a11y.node_id_for_existing(&rejected_id), None);
     }
 }
