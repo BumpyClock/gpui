@@ -61,6 +61,7 @@ impl std::fmt::Debug for ListState {
 
 struct StateInner {
     last_layout_bounds: Option<Bounds<Pixels>>,
+    last_layout_scroll_top: Option<ListOffset>,
     last_padding: Option<Edges<Pixels>>,
     items: SumTree<ListItem>,
     logical_scroll_top: Option<ListOffset>,
@@ -314,6 +315,7 @@ impl ListState {
     pub fn new(item_count: usize, alignment: ListAlignment, overdraw: Pixels) -> Self {
         let this = Self(Rc::new(RefCell::new(StateInner {
             last_layout_bounds: None,
+            last_layout_scroll_top: None,
             last_padding: None,
             items: SumTree::default(),
             logical_scroll_top: None,
@@ -347,6 +349,7 @@ impl ListState {
             state.reset = true;
             state.measuring_behavior.reset();
             state.logical_scroll_top = None;
+            state.last_layout_scroll_top = None;
             state.scrollbar_drag_start_height = None;
             state.items.summary().count
         };
@@ -439,6 +442,7 @@ impl ListState {
             new_items
         };
         state.items = new_items;
+        state.last_layout_scroll_top = None;
         state.measuring_behavior.reset();
     }
 
@@ -501,6 +505,7 @@ impl ListState {
         new_items.append(old_items.suffix(), ());
         drop(old_items);
         state.items = new_items;
+        state.last_layout_scroll_top = None;
 
         if let Some(ListOffset {
             item_ix,
@@ -557,6 +562,7 @@ impl ListState {
             item_ix: cursor.start().count,
             offset_in_item: new_pixel_offset - cursor.start().height,
         });
+        state.last_layout_scroll_top = None;
     }
 
     /// Scroll the list to the very end, past the last item.
@@ -570,6 +576,7 @@ impl ListState {
             }),
             ListAlignment::Bottom => None,
         };
+        state.last_layout_scroll_top = None;
     }
 
     /// Set whether the list should auto-follow the tail.
@@ -588,6 +595,7 @@ impl ListState {
                     }),
                     ListAlignment::Bottom => None,
                 };
+                state.last_layout_scroll_top = None;
             }
         }
     }
@@ -611,6 +619,7 @@ impl ListState {
         }
 
         state.logical_scroll_top = Some(scroll_top);
+        state.last_layout_scroll_top = None;
     }
 
     /// Scroll the list to the given item, such that the item is fully visible.
@@ -644,6 +653,7 @@ impl ListState {
         }
 
         state.logical_scroll_top = Some(scroll_top);
+        state.last_layout_scroll_top = None;
     }
 
     /// Get the bounds for the given item in window coordinates, if it's
@@ -651,29 +661,7 @@ impl ListState {
     pub fn bounds_for_item(&self, ix: usize) -> Option<Bounds<Pixels>> {
         let state = &*self.0.borrow();
 
-        let bounds = state.last_layout_bounds.unwrap_or_default();
-        let scroll_top = state.logical_scroll_top();
-        if ix < scroll_top.item_ix {
-            return None;
-        }
-
-        let mut cursor = state.items.cursor::<Dimensions<Count, Height>>(());
-        cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
-
-        let scroll_top = cursor.start().1.0 + scroll_top.offset_in_item;
-
-        cursor.seek_forward(&Count(ix), Bias::Right);
-        if let Some(&ListItem::Measured { size, .. }) = cursor.item() {
-            let &Dimensions(Count(count), Height(top), _) = cursor.start();
-            if count == ix {
-                let top = bounds.top() + top - scroll_top;
-                return Some(Bounds::from_corners(
-                    point(bounds.left(), top),
-                    point(bounds.right(), top + size.height),
-                ));
-            }
-        }
-        None
+        state.bounds_for_item_at_scroll_top(ix, state.logical_scroll_top())
     }
 
     /// Call this method when the user starts dragging the scrollbar.
@@ -743,43 +731,74 @@ impl ListState {
     /// Returns whether the item is entirely above the viewport, or `None` if
     /// the list has not measured enough layout to know.
     pub fn item_is_above_viewport(&self, ix: usize) -> Option<bool> {
-        let viewport_bounds = self.viewport_bounds();
+        let state = self.0.borrow();
+        let viewport_bounds = state.last_layout_bounds.unwrap_or_default();
         if viewport_bounds.size.height == px(0.0) {
             return None;
         }
 
-        let scroll_top = self.logical_scroll_top();
-        if scroll_top.item_ix < self.item_count() && ix < scroll_top.item_ix {
+        let scroll_top = state.last_layout_scroll_top?;
+        if scroll_top.item_ix < state.items.summary().count && ix < scroll_top.item_ix {
             // Rows before the logical scroll top have no item bounds, but
             // their position relative to the viewport is known from scroll state.
             return Some(true);
         }
 
-        let item_bounds = self.bounds_for_item(ix)?;
+        let item_bounds = state.bounds_for_item_at_scroll_top(ix, scroll_top)?;
         Some(item_bounds.bottom() <= viewport_bounds.top())
     }
 
     /// Returns whether the item is entirely below the viewport, or `None` if
     /// the list has not measured enough layout to know.
     pub fn item_is_below_viewport(&self, ix: usize) -> Option<bool> {
-        let viewport_bounds = self.viewport_bounds();
+        let state = self.0.borrow();
+        let viewport_bounds = state.last_layout_bounds.unwrap_or_default();
         if viewport_bounds.size.height == px(0.0) {
             return None;
         }
 
-        let scroll_top = self.logical_scroll_top();
-        if scroll_top.item_ix < self.item_count() && ix < scroll_top.item_ix {
+        let scroll_top = state.last_layout_scroll_top?;
+        if scroll_top.item_ix < state.items.summary().count && ix < scroll_top.item_ix {
             // Rows before the logical scroll top have no item bounds, but
             // their position relative to the viewport is known from scroll state.
             return Some(false);
         }
 
-        let item_bounds = self.bounds_for_item(ix)?;
+        let item_bounds = state.bounds_for_item_at_scroll_top(ix, scroll_top)?;
         Some(item_bounds.top() >= viewport_bounds.bottom())
     }
 }
 
 impl StateInner {
+    fn bounds_for_item_at_scroll_top(
+        &self,
+        ix: usize,
+        scroll_top: ListOffset,
+    ) -> Option<Bounds<Pixels>> {
+        let bounds = self.last_layout_bounds.unwrap_or_default();
+        if ix < scroll_top.item_ix {
+            return None;
+        }
+
+        let mut cursor = self.items.cursor::<Dimensions<Count, Height>>(());
+        cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
+
+        let scroll_top = cursor.start().1.0 + scroll_top.offset_in_item;
+
+        cursor.seek_forward(&Count(ix), Bias::Right);
+        if let Some(&ListItem::Measured { size, .. }) = cursor.item() {
+            let &Dimensions(Count(count), Height(top), _) = cursor.start();
+            if count == ix {
+                let top = bounds.top() + top - scroll_top;
+                return Some(Bounds::from_corners(
+                    point(bounds.left(), top),
+                    point(bounds.right(), top + size.height),
+                ));
+            }
+        }
+        None
+    }
+
     fn max_scroll_offset(&self) -> Pixels {
         let bounds = self.last_layout_bounds.unwrap_or_default();
         let height = self
@@ -835,6 +854,7 @@ impl StateInner {
                 offset_in_item,
             });
         }
+        self.last_layout_scroll_top = None;
 
         if delta.y > px(0.) {
             self.follow_state.stop_following();
@@ -1264,6 +1284,7 @@ impl StateInner {
                     offset_in_item: px(0.),
                 });
             }
+            self.last_layout_scroll_top = None;
             return;
         }
 
@@ -1283,6 +1304,7 @@ impl StateInner {
                 offset_in_item,
             });
         }
+        self.last_layout_scroll_top = None;
     }
 }
 
@@ -1440,6 +1462,7 @@ impl Element for List {
             };
 
         state.last_layout_bounds = Some(bounds);
+        state.last_layout_scroll_top = Some(layout.scroll_top);
         state.last_padding = Some(padding);
         ListPrepaintState { hitbox, layout }
     }
@@ -1784,6 +1807,39 @@ mod test {
         assert_eq!(state.logical_scroll_top().item_ix, state.item_count());
         assert_eq!(state.item_is_above_viewport(0), None);
         assert_eq!(state.item_is_below_viewport(0), None);
+    }
+
+    #[gpui::test]
+    fn test_item_viewport_queries_use_resolved_bottom_aligned_scroll_top(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        const ITEMS: usize = 10;
+        const ITEM_HEIGHT: f32 = 20.0;
+
+        let state = ListState::new(ITEMS, crate::ListAlignment::Bottom, px(0.)).measure_all();
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(ITEM_HEIGHT)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, cx| {
+            cx.new(|_| TestView(state.clone())).into_any_element()
+        });
+
+        assert_eq!(state.logical_scroll_top().item_ix, ITEMS);
+        assert_eq!(state.item_is_above_viewport(7), Some(true));
+        assert_eq!(state.item_is_below_viewport(7), Some(false));
+        assert_eq!(state.item_is_above_viewport(8), Some(false));
+        assert_eq!(state.item_is_below_viewport(8), Some(false));
+        assert_eq!(state.item_is_above_viewport(9), Some(false));
+        assert_eq!(state.item_is_below_viewport(9), Some(false));
     }
 
     #[gpui::test]

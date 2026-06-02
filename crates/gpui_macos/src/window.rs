@@ -2083,13 +2083,7 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
         if matches!(
             event,
-            PlatformInput::MouseMove(_)
-                | PlatformInput::MouseDown(_)
-                | PlatformInput::MouseUp(_)
-                | PlatformInput::MousePressure(_)
-                | PlatformInput::MouseExited(_)
-                | PlatformInput::ScrollWheel(_)
-                | PlatformInput::Pinch(_)
+            PlatformInput::MouseMove(_) | PlatformInput::MouseExited(_)
         ) {
             lock.cursor_visible.store(true, Ordering::Relaxed);
         }
