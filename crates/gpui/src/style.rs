@@ -357,6 +357,9 @@ pub struct BoxShadow {
     pub blur_radius: Pixels,
     /// How much should the shadow spread?
     pub spread_radius: Pixels,
+    /// Whether this is an inset shadow (drawn inside the element's bounds).
+    #[serde(default)]
+    pub inset: bool,
 }
 
 /// How to handle whitespace in text
@@ -671,7 +674,7 @@ impl Style {
             .to_pixels(rem_size)
             .clamp_radii_for_quad_size(bounds.size);
 
-        window.paint_shadows(bounds, corner_radii, &self.box_shadow);
+        window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
         if let Some(blur_radius) = self.backdrop_blur {
             window.paint_backdrop_blur(bounds, corner_radii, blur_radius);
         }
@@ -702,6 +705,8 @@ impl Style {
                 self.border_style,
             ));
         }
+
+        window.paint_inset_shadows(bounds, corner_radii, &self.box_shadow);
 
         continuation(window, cx);
 
@@ -1491,5 +1496,34 @@ mod tests {
             Some(FontWeight::SEMIBOLD),
             style.text_style().unwrap().font_weight
         );
+    }
+
+    #[test]
+    fn test_box_shadow_inset_deserialization_compatibility() {
+        let shadow = BoxShadow {
+            color: red(),
+            offset: Default::default(),
+            blur_radius: px(1.),
+            spread_radius: px(2.),
+            inset: true,
+        };
+
+        let legacy_json = {
+            let mut legacy = serde_json::to_value(&shadow).unwrap();
+            legacy.as_object_mut().unwrap().remove("inset");
+            legacy
+        };
+        let legacy_shadow: BoxShadow = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            legacy_shadow,
+            BoxShadow {
+                inset: false,
+                ..shadow.clone()
+            }
+        );
+
+        let roundtripped_shadow: BoxShadow =
+            serde_json::from_str(&serde_json::to_string(&shadow).unwrap()).unwrap();
+        assert_eq!(roundtripped_shadow, shadow);
     }
 }

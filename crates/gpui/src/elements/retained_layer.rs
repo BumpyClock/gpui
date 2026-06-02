@@ -178,6 +178,7 @@ impl<E: IntoElement + 'static> Element for RetainedLayerElement<E> {
                     state.content_revision != content_revision
                         || state.bounds != bounds
                         || state.content_mask != content_mask
+                        || window.a11y.is_active()
                 }
                 None => true,
             };

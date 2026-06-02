@@ -1,13 +1,14 @@
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
-    Attrs, AttrsList, Family, Font as CosmicTextFont, FontFeatures as CosmicFontFeatures,
-    FontSystem, ShapeBuffer, ShapeLine,
+    Attrs, AttrsList, Ellipsize, Family, Font as CosmicTextFont,
+    FontFeatures as CosmicFontFeatures, FontSystem, ShapeBuffer, ShapeLine,
 };
 use gpui::{
-    Bounds, DevicePixels, Font, FontFeatures, FontId, FontMetrics, FontRun, GlyphId, LineLayout,
-    Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode, point, size,
+    Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun, GlyphId,
+    LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode, point,
+    size,
 };
 
 use itertools::Itertools;
@@ -18,6 +19,7 @@ use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
     zeno::{Format, Vector},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 pub struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
 
@@ -25,11 +27,16 @@ pub struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
 struct FontKey {
     family: SharedString,
     features: FontFeatures,
+    fallbacks: Option<FontFallbacks>,
 }
 
 impl FontKey {
-    fn new(family: SharedString, features: FontFeatures) -> Self {
-        Self { family, features }
+    fn new(family: SharedString, features: FontFeatures, fallbacks: Option<FontFallbacks>) -> Self {
+        Self {
+            family,
+            features,
+            fallbacks,
+        }
     }
 }
 
@@ -49,6 +56,7 @@ struct LoadedFont {
     font: Arc<CosmicTextFont>,
     features: CosmicFontFeatures,
     is_known_emoji_font: bool,
+    user_fallback_chain: Arc<[(FontId, SharedString)]>,
 }
 
 impl CosmicTextSystem {
@@ -103,11 +111,16 @@ impl PlatformTextSystem for CosmicTextSystem {
 
     fn font_id(&self, font: &Font) -> Result<FontId> {
         let mut state = self.0.write();
-        let key = FontKey::new(font.family.clone(), font.features.clone());
+        let key = FontKey::new(
+            font.family.clone(),
+            font.features.clone(),
+            font.fallbacks.clone(),
+        );
         let candidates = if let Some(font_ids) = state.font_ids_by_family_cache.get(&key) {
             font_ids.as_slice()
         } else {
-            let font_ids = state.load_family(&font.family, &font.features)?;
+            let font_ids =
+                state.load_family(&font.family, &font.features, font.fallbacks.as_ref())?;
             state.font_ids_by_family_cache.insert(key.clone(), font_ids);
             state.font_ids_by_family_cache[&key].as_ref()
         };
@@ -227,7 +240,40 @@ impl CosmicTextSystemState {
         &mut self,
         name: &str,
         features: &FontFeatures,
+        fallbacks: Option<&FontFallbacks>,
     ) -> Result<SmallVec<[FontId; 4]>> {
+        let user_fallback_chain: Arc<[(FontId, SharedString)]> = match fallbacks {
+            Some(fallbacks) if !fallbacks.fallback_list().is_empty() => {
+                let mut chain: Vec<(FontId, SharedString)> = Vec::new();
+                for fallback_name in fallbacks.fallback_list() {
+                    let fb_key = FontKey::new(
+                        SharedString::from(fallback_name.clone()),
+                        features.clone(),
+                        None,
+                    );
+                    let fb_ids = if let Some(cached) = self.font_ids_by_family_cache.get(&fb_key) {
+                        cached.clone()
+                    } else {
+                        let loaded = self.load_family(fallback_name, features, None)?;
+                        self.font_ids_by_family_cache
+                            .insert(fb_key.clone(), loaded.clone());
+                        loaded
+                    };
+                    let Some(&fb_id) = fb_ids.first() else {
+                        continue;
+                    };
+                    let db_id = self.loaded_fonts[fb_id.0].font.id();
+                    if let Some(face) = self.font_system.db().face(db_id) {
+                        if let Some(family) = face.families.first() {
+                            chain.push((fb_id, SharedString::from(family.0.clone())));
+                        }
+                    }
+                }
+                Arc::from(chain)
+            }
+            _ => Arc::from(Vec::new()),
+        };
+
         let name = gpui::font_name_with_fallbacks(name, &self.system_font_fallback);
 
         let families = self
@@ -237,6 +283,8 @@ impl CosmicTextSystemState {
             .filter(|face| face.families.iter().any(|family| *name == family.0))
             .map(|face| (face.id, face.post_script_name.clone()))
             .collect::<SmallVec<[_; 4]>>();
+
+        let cosmic_features = cosmic_font_features(features)?;
 
         let mut loaded_font_ids = SmallVec::new();
         for (font_id, postscript_name) in families {
@@ -262,8 +310,9 @@ impl CosmicTextSystemState {
             loaded_font_ids.push(font_id);
             self.loaded_fonts.push(LoadedFont {
                 font,
-                features: cosmic_font_features(features)?,
+                features: cosmic_features.clone(),
                 is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
+                user_fallback_chain: Arc::clone(&user_fallback_chain),
             });
         }
 
@@ -404,6 +453,7 @@ impl CosmicTextSystemState {
                 font,
                 features: CosmicFontFeatures::new(),
                 is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name),
+                user_fallback_chain: Arc::from(Vec::new()),
             });
 
             Ok(font_id)
@@ -415,13 +465,15 @@ impl CosmicTextSystemState {
         let mut attrs_list = AttrsList::new(&Attrs::new());
         let mut offs = 0;
         for run in font_runs {
+            let run_end = offs + run.len;
+
             let loaded_font = self.loaded_font(run.font_id);
             let Some(face) = self.font_system.db().face(loaded_font.font.id()) else {
                 log::warn!(
                     "font face not found in database for font_id {:?}",
                     run.font_id
                 );
-                offs += run.len;
+                offs = run_end;
                 continue;
             };
             let Some(first_family) = face.families.first() else {
@@ -429,21 +481,60 @@ impl CosmicTextSystemState {
                     "font face has no family names for font_id {:?}",
                     run.font_id
                 );
-                offs += run.len;
+                offs = run_end;
                 continue;
             };
 
-            attrs_list.add_span(
-                offs..(offs + run.len),
-                &Attrs::new()
-                    .metadata(run.font_id.0)
-                    .family(Family::Name(&first_family.0))
-                    .stretch(face.stretch)
-                    .style(face.style)
-                    .weight(face.weight)
-                    .font_features(loaded_font.features.clone()),
-            );
-            offs += run.len;
+            let primary_family_name: SharedString = first_family.0.clone().into();
+            let primary_stretch = face.stretch;
+            let primary_style = face.style;
+            let primary_weight = face.weight;
+            let primary_features = loaded_font.features.clone();
+            let fallback_chain = Arc::clone(&loaded_font.user_fallback_chain);
+
+            let primary_attrs = Attrs::new()
+                .metadata(run.font_id.0)
+                .family(Family::Name(&primary_family_name))
+                .stretch(primary_stretch)
+                .style(primary_style)
+                .weight(primary_weight)
+                .font_features(primary_features.clone());
+            let fallback_attrs: SmallVec<[Attrs<'_>; 4]> = fallback_chain
+                .iter()
+                .map(|(fb_id, fb_name)| {
+                    Attrs::new()
+                        .metadata(fb_id.0)
+                        .family(Family::Name(fb_name))
+                        .stretch(primary_stretch)
+                        .style(primary_style)
+                        .weight(primary_weight)
+                        .font_features(primary_features.clone())
+                })
+                .collect();
+
+            let spans = if fallback_chain.is_empty() {
+                let mut spans = SmallVec::<[RunSpan; 4]>::new();
+                spans.push(RunSpan {
+                    start: offs,
+                    end: run_end,
+                    slot: None,
+                    font_id: run.font_id,
+                });
+                spans
+            } else {
+                let loaded_fonts = &self.loaded_fonts;
+                let covers = |id: FontId, ch: char| charmap_covers(loaded_fonts, id, ch);
+                compute_run_spans(text, offs, run.len, run.font_id, &fallback_chain, &covers)
+            };
+
+            for span in spans {
+                let attrs = match span.slot {
+                    None => &primary_attrs,
+                    Some(ix) => &fallback_attrs[ix],
+                };
+                attrs_list.add_span(span.start..span.end, attrs);
+            }
+            offs = run_end;
         }
 
         let line = ShapeLine::new(
@@ -459,6 +550,7 @@ impl CosmicTextSystemState {
             f32::from(font_size),
             None, // We do our own wrapping
             cosmic_text::Wrap::None,
+            Ellipsize::None,
             None,
             &mut layout_lines,
             None,
@@ -606,6 +698,115 @@ fn find_best_match(
     Ok(best_index)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunSpan {
+    start: usize,
+    end: usize,
+    slot: Option<usize>,
+    font_id: FontId,
+}
+
+fn compute_run_spans(
+    text: &str,
+    run_offset: usize,
+    run_len: usize,
+    primary: FontId,
+    fallback_chain: &[(FontId, SharedString)],
+    covers: &impl Fn(FontId, char) -> bool,
+) -> SmallVec<[RunSpan; 4]> {
+    let mut spans = SmallVec::new();
+    let run_end = run_offset + run_len;
+    if run_end <= run_offset {
+        return spans;
+    }
+    if fallback_chain.is_empty() {
+        spans.push(RunSpan {
+            start: run_offset,
+            end: run_end,
+            slot: None,
+            font_id: primary,
+        });
+        return spans;
+    }
+
+    let run_text = &text[run_offset..run_end];
+    let mut span_start = run_offset;
+    let mut span_slot: Option<usize> = None;
+    let mut span_font_id = primary;
+    for (grapheme_idx, grapheme) in run_text.grapheme_indices(true) {
+        let abs = run_offset + grapheme_idx;
+        let next_slot = pick_covering_slot(grapheme, primary, fallback_chain, covers);
+        if next_slot == span_slot {
+            continue;
+        }
+        if abs > span_start {
+            spans.push(RunSpan {
+                start: span_start,
+                end: abs,
+                slot: span_slot,
+                font_id: span_font_id,
+            });
+        }
+        span_start = abs;
+        span_slot = next_slot;
+        span_font_id = slot_font_id(next_slot, primary, fallback_chain);
+    }
+    if span_start < run_end {
+        spans.push(RunSpan {
+            start: span_start,
+            end: run_end,
+            slot: span_slot,
+            font_id: span_font_id,
+        });
+    }
+    spans
+}
+
+fn slot_font_id(
+    slot: Option<usize>,
+    primary: FontId,
+    fallback_chain: &[(FontId, SharedString)],
+) -> FontId {
+    match slot {
+        None => primary,
+        Some(ix) => fallback_chain[ix].0,
+    }
+}
+
+fn pick_covering_slot(
+    grapheme: &str,
+    primary: FontId,
+    fallback_chain: &[(FontId, SharedString)],
+    covers: &impl Fn(FontId, char) -> bool,
+) -> Option<usize> {
+    if grapheme.is_ascii() {
+        return None;
+    }
+    if slot_covers_grapheme(primary, grapheme, covers) {
+        return None;
+    }
+    for (ix, (fb_id, _)) in fallback_chain.iter().enumerate() {
+        if slot_covers_grapheme(*fb_id, grapheme, covers) {
+            return Some(ix);
+        }
+    }
+    None
+}
+
+fn slot_covers_grapheme(
+    font_id: FontId,
+    grapheme: &str,
+    covers: &impl Fn(FontId, char) -> bool,
+) -> bool {
+    grapheme.chars().all(|ch| covers(font_id, ch))
+}
+
+fn charmap_covers(loaded_fonts: &[LoadedFont], id: FontId, ch: char) -> bool {
+    loaded_fonts
+        .get(id.0)
+        .is_some_and(|loaded| loaded.font.as_swash().charmap().map(ch) != 0)
+}
+
 fn cosmic_font_features(features: &FontFeatures) -> Result<CosmicFontFeatures> {
     let mut result = CosmicFontFeatures::new();
     for feature in features.0.iter() {
@@ -669,6 +870,230 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
 mod tests {
     use super::*;
     use gpui::font;
+
+    fn fid(i: usize) -> FontId {
+        FontId(i)
+    }
+
+    fn chain(ids: &[usize]) -> SmallVec<[(FontId, SharedString); 4]> {
+        ids.iter()
+            .map(|&i| (fid(i), SharedString::from(format!("fb{i}"))))
+            .collect()
+    }
+
+    fn span(start: usize, end: usize, slot: Option<usize>, font_id: FontId) -> RunSpan {
+        RunSpan {
+            start,
+            end,
+            slot,
+            font_id,
+        }
+    }
+
+    #[test]
+    fn primary_preferred_over_fallback_when_both_cover() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1]);
+        let covers = |_: FontId, _: char| true;
+
+        assert_eq!(
+            pick_covering_slot("a", primary, &fallback_chain, &covers),
+            None
+        );
+    }
+
+    #[test]
+    fn primary_wins_over_fallback_when_primary_covers() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1, 2]);
+        let covers = |id: FontId, _: char| id == fid(0) || id == fid(1);
+
+        assert_eq!(
+            pick_covering_slot("a", primary, &fallback_chain, &covers),
+            None
+        );
+    }
+
+    #[test]
+    fn fallback_chain_is_checked_in_order() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1, 2, 3]);
+        let covers = |id: FontId, _: char| id == fid(2);
+
+        assert_eq!(
+            pick_covering_slot("字", primary, &fallback_chain, &covers),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn fallback_must_cover_every_codepoint_in_grapheme() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1, 2]);
+        let covers = |id: FontId, ch: char| match id.0 {
+            0 | 1 => ch == 'e',
+            2 => ch == 'e' || ch == '\u{0301}',
+            _ => false,
+        };
+
+        assert_eq!(
+            pick_covering_slot("e\u{0301}", primary, &fallback_chain, &covers),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn no_coverage_returns_primary_for_cosmic_text_fallback() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1, 2]);
+        let covers = |_: FontId, _: char| false;
+
+        assert_eq!(
+            pick_covering_slot("\u{1F600}", primary, &fallback_chain, &covers),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_chain_always_returns_primary() {
+        let primary = fid(0);
+        let fallback_chain: SmallVec<[(FontId, SharedString); 4]> = SmallVec::new();
+        let covers = |_: FontId, _: char| false;
+
+        assert_eq!(
+            pick_covering_slot("a", primary, &fallback_chain, &covers),
+            None
+        );
+    }
+
+    #[test]
+    fn slot_font_id_resolution() {
+        let primary = fid(7);
+        let fallback_chain = chain(&[10, 20]);
+
+        assert_eq!(slot_font_id(None, primary, &fallback_chain), fid(7));
+        assert_eq!(slot_font_id(Some(0), primary, &fallback_chain), fid(10));
+        assert_eq!(slot_font_id(Some(1), primary, &fallback_chain), fid(20));
+    }
+
+    #[test]
+    fn run_spans_with_no_chain_emit_one_primary_span() {
+        let primary = fid(0);
+        let fallback_chain: SmallVec<[(FontId, SharedString); 4]> = SmallVec::new();
+        let covers = |_: FontId, _: char| false;
+        let text = "hello";
+
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fallback_chain, &covers);
+
+        assert_eq!(spans.as_slice(), &[span(0, text.len(), None, primary)]);
+    }
+
+    #[test]
+    fn run_spans_use_byte_offsets_for_multibyte_chars() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1]);
+        let covers = |id: FontId, ch: char| {
+            if id == primary {
+                ch.is_ascii()
+            } else {
+                !ch.is_ascii()
+            }
+        };
+        let text = "a字b";
+
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fallback_chain, &covers);
+
+        assert_eq!(
+            spans.as_slice(),
+            &[
+                span(0, 1, None, primary),
+                span(1, 4, Some(0), fid(1)),
+                span(4, 5, None, primary),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_spans_respect_run_offset() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1]);
+        let covers = |id: FontId, ch: char| {
+            if id == primary {
+                ch.is_ascii()
+            } else {
+                !ch.is_ascii()
+            }
+        };
+        let text = "xx字y";
+        let run_offset = 2;
+        let run_len = text.len() - run_offset;
+
+        let spans = compute_run_spans(text, run_offset, run_len, primary, &fallback_chain, &covers);
+
+        assert_eq!(
+            spans.as_slice(),
+            &[span(2, 5, Some(0), fid(1)), span(5, 6, None, primary)]
+        );
+    }
+
+    #[test]
+    fn run_spans_do_not_use_fallback_for_partially_covered_grapheme() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1]);
+        let covers = |id: FontId, ch: char| {
+            if id == primary {
+                ch.is_ascii()
+            } else {
+                ch == '\u{0905}'
+            }
+        };
+        let text = "\u{0905}\u{0902}";
+
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fallback_chain, &covers);
+
+        assert_eq!(spans.as_slice(), &[span(0, text.len(), None, primary)]);
+    }
+
+    #[test]
+    fn run_spans_do_not_use_fallback_for_partially_covered_zwj_cluster() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1]);
+        let covers = |id: FontId, ch: char| id == fid(1) && ch != '\u{200D}';
+        let text = "\u{1F469}\u{200D}\u{1F467}";
+
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fallback_chain, &covers);
+
+        assert_eq!(spans.as_slice(), &[span(0, text.len(), None, primary)]);
+    }
+
+    #[test]
+    fn run_spans_collapse_adjacent_same_slot() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1]);
+        let covers = |id: FontId, ch: char| {
+            if id == primary {
+                ch.is_ascii()
+            } else {
+                !ch.is_ascii()
+            }
+        };
+        let text = "字字字";
+
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fallback_chain, &covers);
+
+        assert_eq!(spans.as_slice(), &[span(0, text.len(), Some(0), fid(1))]);
+    }
+
+    #[test]
+    fn run_spans_empty_run_returns_no_spans() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1]);
+        let covers = |_: FontId, _: char| true;
+
+        let spans = compute_run_spans("anything", 3, 0, primary, &fallback_chain, &covers);
+
+        assert!(spans.is_empty());
+    }
 
     #[test]
     fn typographic_bounds_use_glyph_outline_bounds() {

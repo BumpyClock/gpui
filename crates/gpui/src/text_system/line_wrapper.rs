@@ -196,21 +196,312 @@ impl LineWrapper {
         if let Some(truncate_ix) =
             self.should_truncate_line(&line, truncate_width, truncation_affix, truncate_from)
         {
-            let result = match truncate_from {
-                TruncateFrom::Start => SharedString::from(format!(
-                    "{truncation_affix}{}",
-                    &line[line.ceil_char_boundary(truncate_ix + 1)..]
-                )),
-                TruncateFrom::End => {
-                    SharedString::from(format!("{}{truncation_affix}", &line[..truncate_ix]))
-                }
-            };
+            let result = truncated_line_text(&line, truncate_ix, truncation_affix, truncate_from);
             let mut runs = runs.to_vec();
             update_runs_after_truncation(&result, truncation_affix, &mut runs, truncate_from);
             (result, Cow::Owned(runs))
         } else {
             (line, Cow::Borrowed(runs))
         }
+    }
+
+    /// Truncate text to fit within a given number of wrapped lines.
+    pub fn truncate_wrapped_line<'a>(
+        &mut self,
+        text: SharedString,
+        wrap_width: Pixels,
+        max_lines: usize,
+        truncation_affix: &str,
+        runs: &'a [TextRun],
+        truncate_from: TruncateFrom,
+    ) -> (SharedString, Cow<'a, [TextRun]>) {
+        if max_lines <= 1 {
+            return self.truncate_single_wrapped_line(
+                text,
+                wrap_width * max_lines,
+                truncation_affix,
+                runs,
+                truncate_from,
+            );
+        }
+
+        if truncate_from == TruncateFrom::Start {
+            return self.truncate_wrapped_line_start(
+                text,
+                wrap_width,
+                max_lines,
+                truncation_affix,
+                runs,
+            );
+        }
+
+        let affix_width = truncation_affix
+            .chars()
+            .map(|c| self.width_for_char(c))
+            .fold(px(0.), |width, char_width| width + char_width);
+
+        let mut width = px(0.);
+        let mut line = 0;
+        let mut first_non_whitespace_ix = None;
+        let mut indent = None;
+        let mut last_candidate_ix = 0;
+        let mut last_candidate_width = px(0.);
+        let mut last_wrap_ix = 0;
+        let mut prev_c = '\0';
+        let mut truncate_ix = 0;
+
+        for (ix, c) in text.char_indices() {
+            if c == '\n' {
+                if line >= max_lines - 1 && !text[ix + 1..].trim().is_empty() {
+                    let result = SharedString::from(format!(
+                        "{}{truncation_affix}",
+                        trim_end_before_truncation_affix(&text[..truncate_ix], truncation_affix)
+                    ));
+                    let mut runs = runs.to_vec();
+                    update_runs_after_truncation(
+                        &result,
+                        truncation_affix,
+                        &mut runs,
+                        TruncateFrom::End,
+                    );
+                    return (result, Cow::Owned(runs));
+                }
+
+                line += 1;
+                width = px(0.);
+                first_non_whitespace_ix = None;
+                indent = None;
+                last_candidate_ix = 0;
+                last_candidate_width = px(0.);
+                last_wrap_ix = ix + 1;
+                prev_c = '\0';
+                truncate_ix = ix + 1;
+                continue;
+            }
+
+            let char_width = self.width_for_char(c);
+
+            if Self::is_word_char(c) {
+                if prev_c == ' ' && c != ' ' && first_non_whitespace_ix.is_some() {
+                    last_candidate_ix = ix;
+                    last_candidate_width = width;
+                }
+            } else if c != ' ' && first_non_whitespace_ix.is_some() {
+                last_candidate_ix = ix;
+                last_candidate_width = width;
+            }
+
+            if c != ' ' && first_non_whitespace_ix.is_none() {
+                first_non_whitespace_ix = Some(ix);
+            }
+
+            width += char_width;
+
+            if line < max_lines - 1 {
+                if width > wrap_width && ix > last_wrap_ix {
+                    if let (None, Some(first_non_whitespace_ix)) = (indent, first_non_whitespace_ix)
+                    {
+                        indent = Some(
+                            Self::MAX_INDENT.min((first_non_whitespace_ix - last_wrap_ix) as u32),
+                        );
+                    }
+
+                    if last_candidate_ix > 0 {
+                        last_wrap_ix = last_candidate_ix;
+                        width -= last_candidate_width;
+                        last_candidate_ix = 0;
+                    } else {
+                        last_wrap_ix = ix;
+                        width = char_width;
+                    }
+
+                    if let Some(indent) = indent {
+                        width += self.width_for_char(' ') * indent as f32;
+                    }
+
+                    line += 1;
+                    truncate_ix = last_wrap_ix;
+                }
+            } else {
+                if width + affix_width <= wrap_width {
+                    truncate_ix = ix + c.len_utf8();
+                }
+
+                if width > wrap_width {
+                    let result = SharedString::from(format!(
+                        "{}{truncation_affix}",
+                        trim_end_before_truncation_affix(&text[..truncate_ix], truncation_affix)
+                    ));
+                    let mut runs = runs.to_vec();
+                    update_runs_after_truncation(
+                        &result,
+                        truncation_affix,
+                        &mut runs,
+                        TruncateFrom::End,
+                    );
+                    return (result, Cow::Owned(runs));
+                }
+            }
+
+            prev_c = c;
+        }
+
+        (text, Cow::Borrowed(runs))
+    }
+
+    fn truncate_single_wrapped_line<'a>(
+        &mut self,
+        text: SharedString,
+        truncate_width: Pixels,
+        truncation_affix: &str,
+        runs: &'a [TextRun],
+        truncate_from: TruncateFrom,
+    ) -> (SharedString, Cow<'a, [TextRun]>) {
+        let Some(newline_ix) = text.find('\n') else {
+            return self.truncate_line(text, truncate_width, truncation_affix, runs, truncate_from);
+        };
+
+        let first_line = &text[..newline_ix];
+        let (result, affix_inserted) = if !text[newline_ix + 1..].trim().is_empty() {
+            (
+                self.truncate_line_with_forced_affix(
+                    first_line,
+                    truncate_width,
+                    truncation_affix,
+                    truncate_from,
+                ),
+                !truncation_affix.is_empty(),
+            )
+        } else if let Some(truncate_ix) =
+            self.should_truncate_line(first_line, truncate_width, truncation_affix, truncate_from)
+        {
+            (
+                truncated_line_text(first_line, truncate_ix, truncation_affix, truncate_from),
+                !truncation_affix.is_empty(),
+            )
+        } else {
+            (SharedString::from(first_line), false)
+        };
+
+        let mut result_runs = runs_for_prefix(runs, newline_ix);
+        if affix_inserted || result.len() < first_line.len() {
+            let affix = if affix_inserted { truncation_affix } else { "" };
+            update_runs_after_truncation(&result, affix, &mut result_runs, truncate_from);
+            result_runs.retain(|run| run.len > 0);
+        }
+
+        if result_runs.is_empty()
+            && !result.is_empty()
+            && let Some(mut run) = runs.first().cloned()
+        {
+            run.len = result.len();
+            result_runs.push(run);
+        }
+
+        (result, Cow::Owned(result_runs))
+    }
+
+    fn truncate_line_with_forced_affix(
+        &mut self,
+        line: &str,
+        truncate_width: Pixels,
+        truncation_affix: &str,
+        truncate_from: TruncateFrom,
+    ) -> SharedString {
+        if truncation_affix.is_empty() {
+            if let Some(truncate_ix) =
+                self.should_truncate_line(line, truncate_width, truncation_affix, truncate_from)
+            {
+                truncated_line_text(line, truncate_ix, truncation_affix, truncate_from)
+            } else {
+                SharedString::from(line)
+            }
+        } else {
+            let affix_width = truncation_affix
+                .chars()
+                .map(|c| self.width_for_char(c))
+                .fold(px(0.), |width, char_width| width + char_width);
+
+            match truncate_from {
+                TruncateFrom::Start => {
+                    let mut width = px(0.);
+                    let mut truncate_ix = line.len();
+                    for (ix, c) in line.char_indices().rev() {
+                        let char_width = self.width_for_char(c);
+                        if width + char_width + affix_width <= truncate_width {
+                            width += char_width;
+                            truncate_ix = ix;
+                        } else {
+                            break;
+                        }
+                    }
+                    SharedString::from(format!("{truncation_affix}{}", &line[truncate_ix..]))
+                }
+                TruncateFrom::End => {
+                    let mut width = px(0.);
+                    let mut truncate_ix = 0;
+                    for (ix, c) in line.char_indices() {
+                        let char_width = self.width_for_char(c);
+                        if width + char_width + affix_width <= truncate_width {
+                            width += char_width;
+                            truncate_ix = ix + c.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                    SharedString::from(format!(
+                        "{}{truncation_affix}",
+                        trim_end_before_truncation_affix(&line[..truncate_ix], truncation_affix)
+                    ))
+                }
+            }
+        }
+    }
+
+    fn truncate_wrapped_line_start<'a>(
+        &mut self,
+        text: SharedString,
+        wrap_width: Pixels,
+        max_lines: usize,
+        truncation_affix: &str,
+        runs: &'a [TextRun],
+    ) -> (SharedString, Cow<'a, [TextRun]>) {
+        if self.wrapped_line_count(&text, wrap_width) <= max_lines {
+            return (text, Cow::Borrowed(runs));
+        }
+
+        let mut candidates = text.char_indices().map(|(ix, _)| ix).collect::<Vec<_>>();
+        candidates.push(text.len());
+
+        let mut low = 0;
+        let mut high = candidates.len() - 1;
+        while low < high {
+            let mid = (low + high) / 2;
+            let candidate = candidates[mid];
+            let result = format!("{truncation_affix}{}", &text[candidate..]);
+
+            if self.wrapped_line_count(&result, wrap_width) <= max_lines {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        let result = SharedString::from(format!("{truncation_affix}{}", &text[candidates[low]..]));
+        let mut runs = runs.to_vec();
+        update_runs_after_truncation(&result, truncation_affix, &mut runs, TruncateFrom::Start);
+        runs.retain(|run| run.len > 0);
+        (result, Cow::Owned(runs))
+    }
+
+    fn wrapped_line_count(&mut self, text: &str, wrap_width: Pixels) -> usize {
+        text.split('\n')
+            .map(|line| {
+                self.wrap_line(&[LineFragment::text(line)], wrap_width)
+                    .count()
+                    + 1
+            })
+            .sum()
     }
 
     /// Any character in this list should be treated as a word character,
@@ -272,6 +563,55 @@ impl LineWrapper {
     }
 }
 
+fn truncated_line_text(
+    line: &str,
+    truncate_ix: usize,
+    truncation_affix: &str,
+    truncate_from: TruncateFrom,
+) -> SharedString {
+    match truncate_from {
+        TruncateFrom::Start => SharedString::from(format!(
+            "{truncation_affix}{}",
+            &line[line.ceil_char_boundary(truncate_ix + 1)..]
+        )),
+        TruncateFrom::End => SharedString::from(format!(
+            "{}{truncation_affix}",
+            trim_end_before_truncation_affix(&line[..truncate_ix], truncation_affix)
+        )),
+    }
+}
+
+fn trim_end_before_truncation_affix<'a>(text: &'a str, truncation_affix: &str) -> &'a str {
+    if truncation_affix.is_empty() {
+        text
+    } else {
+        text.trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+    }
+}
+
+fn runs_for_prefix(runs: &[TextRun], prefix_len: usize) -> Vec<TextRun> {
+    let mut prefix_runs = Vec::new();
+    let mut remaining_len = prefix_len;
+
+    for run in runs {
+        if remaining_len == 0 {
+            break;
+        }
+
+        let mut run = run.clone();
+        if run.len > remaining_len {
+            run.len = remaining_len;
+            prefix_runs.push(run);
+            break;
+        }
+
+        remaining_len -= run.len;
+        prefix_runs.push(run);
+    }
+
+    prefix_runs
+}
+
 fn update_runs_after_truncation(
     result: &str,
     ellipsis: &str,
@@ -281,25 +621,37 @@ fn update_runs_after_truncation(
     let mut truncate_at = result.len() - ellipsis.len();
     match truncate_from {
         TruncateFrom::Start => {
+            let mut first_retained_run_ix = None;
             for (run_index, run) in runs.iter_mut().enumerate().rev() {
                 if run.len <= truncate_at {
                     truncate_at -= run.len;
+                    first_retained_run_ix = Some(run_index);
                 } else {
                     run.len = truncate_at + ellipsis.len();
                     runs.splice(..run_index, std::iter::empty());
-                    break;
+                    return;
                 }
+            }
+            if let Some(run_index) = first_retained_run_ix {
+                runs[run_index].len += ellipsis.len();
+                runs.splice(..run_index, std::iter::empty());
             }
         }
         TruncateFrom::End => {
+            let mut last_retained_run_ix = None;
             for (run_index, run) in runs.iter_mut().enumerate() {
                 if run.len <= truncate_at {
                     truncate_at -= run.len;
+                    last_retained_run_ix = Some(run_index);
                 } else {
                     run.len = truncate_at + ellipsis.len();
                     runs.truncate(run_index + 1);
-                    break;
+                    return;
                 }
+            }
+            if let Some(run_index) = last_retained_run_ix {
+                runs[run_index].len += ellipsis.len();
+                runs.truncate(run_index + 1);
             }
         }
     }
@@ -408,6 +760,17 @@ mod tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    fn wrapped_line_count(wrapper: &mut LineWrapper, text: &str, wrap_width: Pixels) -> usize {
+        text.split('\n')
+            .map(|line| {
+                wrapper
+                    .wrap_line(&[LineFragment::text(line)], wrap_width)
+                    .count()
+                    + 1
+            })
+            .sum()
     }
 
     #[test]
@@ -557,12 +920,13 @@ mod tests {
             text: &'static str,
             expected: &'static str,
             ellipsis: &str,
+            line_width: Pixels,
         ) {
             let dummy_run_lens = vec![text.len()];
             let dummy_runs = generate_test_runs(&dummy_run_lens);
             let (result, dummy_runs) = wrapper.truncate_line(
                 text.into(),
-                px(220.),
+                line_width,
                 ellipsis,
                 &dummy_runs,
                 TruncateFrom::End,
@@ -576,25 +940,32 @@ mod tests {
             "aa bbb cccc ddddd eeee ffff gggg",
             "aa bbb cccc ddddd eeee",
             "",
+            px(220.),
         );
         perform_test(
             &mut wrapper,
             "aa bbb cccc ddddd eeee ffff gggg",
             "aa bbb cccc ddddd eee…",
             "…",
+            px(220.),
         );
         perform_test(
             &mut wrapper,
             "aa bbb cccc ddddd eeee ffff gggg",
             "aa bbb cccc dddd......",
             "......",
+            px(220.),
         );
         perform_test(
             &mut wrapper,
             "aa bbb cccc 🦀🦀🦀🦀🦀 eeee ffff gggg",
             "aa bbb cccc 🦀🦀🦀🦀…",
             "…",
+            px(220.),
         );
+        perform_test(&mut wrapper, "hello world", "hello…", "…", px(70.));
+        perform_test(&mut wrapper, "hello, world", "hello…", "…", px(70.));
+        perform_test(&mut wrapper, "hello, world", "hello, ", "", px(70.));
     }
 
     #[test]
@@ -803,6 +1174,220 @@ mod tests {
         // Runs res: Run0 { string: abcd, len: 4, ... }, Run1 { string: efgh, len:
         // 4, ... }, Run2 { string: …, len: 3, ... }
         perform_test("abcdefgh…", &[4, 4, 4], &[4, 4, 3]);
+    }
+
+    #[test]
+    fn test_multiline_truncation_fits_within_wrapped_lines() {
+        let mut wrapper = build_wrapper();
+        let text = "aa bbbbbb cccccc dddddd eeee ffff";
+        let wrap_width = px(72.);
+        let max_lines = 2;
+        let runs = generate_test_runs(&[text.len()]);
+
+        let (truncated, _) = wrapper.truncate_wrapped_line(
+            text.into(),
+            wrap_width,
+            max_lines,
+            "…",
+            &runs,
+            TruncateFrom::End,
+        );
+
+        let wrapped_line_count = wrapper
+            .wrap_line(&[LineFragment::text(&truncated)], wrap_width)
+            .count()
+            + 1;
+        assert!(
+            wrapped_line_count <= max_lines,
+            "{truncated:?} wrapped into {wrapped_line_count} lines"
+        );
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn test_multiline_truncation_no_truncation_needed() {
+        let mut wrapper = build_wrapper();
+        let text = "aa bbb cccccc";
+        let runs = generate_test_runs(&[text.len()]);
+
+        let (result, _) =
+            wrapper.truncate_wrapped_line(text.into(), px(72.), 2, "…", &runs, TruncateFrom::End);
+
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn test_multiline_truncation_three_lines() {
+        let mut wrapper = build_wrapper();
+        let text = "aa bbb cccc ddddd eeee ffff gggg hhhh iiii jjjj";
+        let wrap_width = px(72.);
+        let max_lines = 3;
+        let runs = generate_test_runs(&[text.len()]);
+
+        let (truncated, _) = wrapper.truncate_wrapped_line(
+            text.into(),
+            wrap_width,
+            max_lines,
+            "…",
+            &runs,
+            TruncateFrom::End,
+        );
+
+        let wrapped_line_count = wrapper
+            .wrap_line(&[LineFragment::text(&truncated)], wrap_width)
+            .count()
+            + 1;
+        assert!(
+            wrapped_line_count <= max_lines,
+            "{truncated:?} wrapped into {wrapped_line_count} lines"
+        );
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn test_multiline_truncation_with_newlines() {
+        let mut wrapper = build_wrapper();
+        let text = "hello\nworld foo bar baz";
+        let wrap_width = px(72.);
+        let runs = generate_test_runs(&[text.len()]);
+
+        let (truncated, _) = wrapper.truncate_wrapped_line(
+            text.into(),
+            wrap_width,
+            2,
+            "…",
+            &runs,
+            TruncateFrom::End,
+        );
+
+        let mut lines = truncated.splitn(2, '\n');
+        assert_eq!(lines.next(), Some("hello"));
+        let second_line = lines.next().expect("newline should be preserved");
+        let second_line_width = second_line
+            .chars()
+            .map(|c| wrapper.width_for_char(c))
+            .fold(px(0.), |width, char_width| width + char_width);
+        assert!(second_line_width <= wrap_width);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn test_multiline_truncation_newline_on_last_line() {
+        let mut wrapper = build_wrapper();
+        let text = "hello\nworld\nmore";
+        let runs = generate_test_runs(&[text.len()]);
+
+        let (truncated, _) =
+            wrapper.truncate_wrapped_line(text.into(), px(72.), 2, "…", &runs, TruncateFrom::End);
+
+        assert_eq!(truncated.split('\n').next(), Some("hello"));
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn test_multiline_truncation_trailing_newline() {
+        let mut wrapper = build_wrapper();
+        let text = "hello\nworld\n";
+        let runs = generate_test_runs(&[text.len()]);
+
+        let (result, _) =
+            wrapper.truncate_wrapped_line(text.into(), px(72.), 2, "…", &runs, TruncateFrom::End);
+
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn test_multiline_start_truncation_fits_within_wrapped_lines() {
+        let mut wrapper = build_wrapper();
+        let text = "aa bbbbbb cccccc dddddd eeee ffff";
+        let wrap_width = px(72.);
+        let max_lines = 2;
+        let runs = generate_test_runs(&[text.len()]);
+
+        let (truncated, _) = wrapper.truncate_wrapped_line(
+            text.into(),
+            wrap_width,
+            max_lines,
+            "…",
+            &runs,
+            TruncateFrom::Start,
+        );
+
+        assert!(truncated.starts_with('…'));
+        let line_count = wrapped_line_count(&mut wrapper, &truncated, wrap_width);
+        assert!(
+            line_count <= max_lines,
+            "{truncated:?} wrapped into {line_count} lines"
+        );
+    }
+
+    #[test]
+    fn test_multiline_start_truncation_no_truncation_needed() {
+        let mut wrapper = build_wrapper();
+        let text = "aa bbb cccccc";
+        let runs = generate_test_runs(&[text.len()]);
+
+        let (result, result_runs) =
+            wrapper.truncate_wrapped_line(text.into(), px(72.), 2, "…", &runs, TruncateFrom::Start);
+
+        assert_eq!(result, text);
+        assert!(matches!(result_runs, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_multiline_start_truncation_updates_runs() {
+        let mut wrapper = build_wrapper();
+        let text = "abcdefghijklmnopqrst";
+        let runs = generate_test_runs(&[5, 5, 5, 5]);
+
+        let (result, result_runs) =
+            wrapper.truncate_wrapped_line(text.into(), px(72.), 2, "…", &runs, TruncateFrom::Start);
+
+        assert_eq!(result, "…hijklmnopqrst");
+        let result_runs = result_runs.into_owned();
+        assert_eq!(
+            result_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![6, 5, 5]
+        );
+        assert_eq!(
+            result_runs.iter().map(|run| run.len).sum::<usize>(),
+            result.len()
+        );
+        assert!(result_runs.iter().all(|run| run.len > 0));
+    }
+
+    #[test]
+    fn test_one_line_wrapped_truncation_stops_at_hard_newline() {
+        let mut wrapper = build_wrapper();
+        let text = "hello\nworld";
+        let runs = generate_test_runs(&[5, 1, 5]);
+
+        let (result, result_runs) =
+            wrapper.truncate_wrapped_line(text.into(), px(500.), 1, "…", &runs, TruncateFrom::End);
+
+        assert_eq!(result, "hello…");
+        assert_eq!(
+            result_runs.iter().map(|run| run.len).sum::<usize>(),
+            result.len()
+        );
+        assert!(result_runs.iter().all(|run| run.len > 0));
+    }
+
+    #[test]
+    fn test_one_line_wrapped_truncation_leading_newline_covers_affix_run() {
+        let mut wrapper = build_wrapper();
+        let text = "\nworld";
+        let runs = generate_test_runs(&[1, 5]);
+
+        let (result, result_runs) =
+            wrapper.truncate_wrapped_line(text.into(), px(500.), 1, "…", &runs, TruncateFrom::End);
+
+        assert_eq!(result, "…");
+        assert_eq!(
+            result_runs.iter().map(|run| run.len).sum::<usize>(),
+            result.len()
+        );
+        assert!(result_runs.iter().all(|run| run.len > 0));
     }
 
     #[test]

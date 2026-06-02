@@ -49,14 +49,18 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Weak,
-        atomic::{AtomicUsize, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
     },
     time::{Duration, Instant},
 };
 use uuid::Uuid;
 
+pub(crate) mod a11y;
 mod prompts;
 
+use self::a11y::A11y;
+#[cfg(not(target_family = "wasm"))]
+use self::a11y::ROOT_NODE_ID;
 use crate::util::atomic_incr_if_not_zero;
 pub use prompts::*;
 
@@ -1031,6 +1035,7 @@ pub struct Window {
     captured_hitbox: Option<HitboxId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
+    pub(crate) a11y: A11y,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1249,6 +1254,81 @@ impl Window {
             WindowBounds::Fullscreen(_) => platform_window.toggle_fullscreen(),
             WindowBounds::Maximized(_) => platform_window.zoom(),
             WindowBounds::Windowed(_) => {}
+        }
+
+        let accessibility_force_disabled = cx.accessibility_force_disabled;
+        let a11y_active_flag = Arc::new(AtomicBool::new(false));
+
+        #[cfg(not(target_family = "wasm"))]
+        if !accessibility_force_disabled {
+            let initial_tree = accesskit::TreeUpdate {
+                nodes: vec![(ROOT_NODE_ID, accesskit::Node::new(accesskit::Role::Window))],
+                tree: Some(accesskit::Tree::new(ROOT_NODE_ID)),
+                tree_id: accesskit::TreeId::ROOT,
+                focus: ROOT_NODE_ID,
+            };
+            let (activation_sender, activation_receiver) = async_channel::unbounded::<()>();
+            let (deactivation_sender, deactivation_receiver) = async_channel::unbounded::<()>();
+            let (action_sender, action_receiver) =
+                async_channel::unbounded::<accesskit::ActionRequest>();
+
+            platform_window.a11y_init(crate::A11yCallbacks {
+                activation: {
+                    let active_flag = a11y_active_flag.clone();
+                    Box::new(move || {
+                        log::info!("Accessibility activated");
+                        active_flag.store(true, SeqCst);
+                        activation_sender.send_blocking(()).log_err();
+                        Some(initial_tree.clone())
+                    })
+                },
+                action: Box::new(move |request| {
+                    action_sender.send_blocking(request).log_err();
+                }),
+                deactivation: {
+                    let active_flag = a11y_active_flag.clone();
+                    Box::new(move || {
+                        log::info!("Accessibility deactivated");
+                        active_flag.store(false, SeqCst);
+                        deactivation_sender.send_blocking(()).log_err();
+                    })
+                },
+            });
+
+            let mut async_cx = cx.to_async();
+            cx.foreground_executor()
+                .spawn(async move {
+                    while activation_receiver.recv().await.is_ok() {
+                        handle
+                            .update(&mut async_cx, |_, window, _| window.refresh())
+                            .log_err();
+                    }
+                })
+                .detach();
+
+            let mut async_cx = cx.to_async();
+            cx.foreground_executor()
+                .spawn(async move {
+                    while deactivation_receiver.recv().await.is_ok() {
+                        handle
+                            .update(&mut async_cx, |_, window, _| window.refresh())
+                            .log_err();
+                    }
+                })
+                .detach();
+
+            let mut async_cx = cx.to_async();
+            cx.foreground_executor()
+                .spawn(async move {
+                    while let Ok(request) = action_receiver.recv().await {
+                        handle
+                            .update(&mut async_cx, |_, window, cx| {
+                                window.handle_a11y_action(request, cx);
+                            })
+                            .log_err();
+                    }
+                })
+                .detach();
         }
 
         platform_window.on_close(Box::new({
@@ -1542,6 +1622,7 @@ impl Window {
             captured_hitbox: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
+            a11y: A11y::new(a11y_active_flag, accessibility_force_disabled),
         })
     }
 
@@ -2472,6 +2553,11 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
+        self.a11y.sync_active_flag();
+        if self.a11y.is_active() {
+            self.a11y.begin_frame();
+        }
+
         let _inspector_width: Pixels = rems(30.0).to_pixels(self.rem_size());
         let root_size = {
             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -2538,6 +2624,22 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        let a11y_active_start_of_frame = self.a11y.is_active();
+        self.a11y.sync_active_flag();
+        let a11y_active_end_of_frame = self.a11y.is_active();
+
+        if a11y_active_start_of_frame {
+            let tree_update = self.a11y.end_frame();
+
+            if a11y_active_end_of_frame {
+                log::debug!(
+                    "Sending a11y tree update: {} nodes",
+                    tree_update.nodes.len()
+                );
+                self.platform_window.a11y_tree_update(tree_update);
+            }
+        }
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
@@ -2653,7 +2755,13 @@ impl Window {
                         });
                     })
                 } else {
-                    self.reuse_prepaint(deferred_draw.prepaint_range.clone());
+                    debug_assert!(
+                        !self.a11y.is_active(),
+                        "cached deferred prepaint reuse reached while a11y is active"
+                    );
+                    if !self.a11y.is_active() {
+                        self.reuse_prepaint(deferred_draw.prepaint_range.clone());
+                    }
                 }
                 let prepaint_end = self.prepaint_index();
                 deferred_draw.prepaint_range = prepaint_start..prepaint_end;
@@ -2697,7 +2805,13 @@ impl Window {
                     })
                 })
             } else {
-                self.reuse_paint(deferred_draw.paint_range.clone());
+                debug_assert!(
+                    !self.a11y.is_active(),
+                    "cached deferred paint reuse reached while a11y is active"
+                );
+                if !self.a11y.is_active() {
+                    self.reuse_paint(deferred_draw.paint_range.clone());
+                }
             }
             let paint_end = self.paint_index();
             deferred_draw.paint_range = paint_start..paint_end;
@@ -2958,6 +3072,7 @@ impl Window {
     pub fn transact<T, U>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, U>) -> Result<T, U> {
         self.invalidator.debug_assert_prepaint();
         let index = self.prepaint_index();
+        let a11y_snapshot = self.a11y.is_active().then(|| self.a11y.prepaint_snapshot());
         let result = f(self);
         if result.is_err() {
             self.next_frame.hitboxes.truncate(index.hitboxes_index);
@@ -2974,6 +3089,9 @@ impl Window {
                 .accessed_element_states
                 .truncate(index.accessed_element_states_index);
             self.text_system.truncate_layouts(index.line_layout_index);
+            if let Some(a11y_snapshot) = a11y_snapshot {
+                self.a11y.restore_prepaint_snapshot(a11y_snapshot);
+            }
         }
         result
     }
@@ -3296,10 +3414,12 @@ impl Window {
         result
     }
 
-    /// Paint one or more drop shadows into the scene for the next frame at the current z-index.
+    /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
+    /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
+    /// after the element's background so they layer on top of the fill.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    pub fn paint_shadows(
+    pub fn paint_drop_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
@@ -3310,7 +3430,12 @@ impl Window {
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
+        let element_bounds = bounds.scale(scale_factor);
+        let element_corner_radii = corner_radii.scale(scale_factor);
         for shadow in shadows {
+            if shadow.inset {
+                continue;
+            }
             let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
@@ -3319,6 +3444,53 @@ impl Window {
                 content_mask: content_mask.scale(scale_factor),
                 corner_radii: corner_radii.scale(scale_factor),
                 color: shadow.color.opacity(opacity),
+                element_bounds,
+                element_corner_radii,
+                inset: 0,
+                pad: 0,
+            });
+        }
+    }
+
+    /// Paint the inset shadows from `shadows` into the scene at the current z-index. Should
+    /// be called after the element's background so the shadow layers on top of the fill.
+    /// Drop shadows are skipped; paint those with [`Self::paint_drop_shadows`] before the background.
+    pub fn paint_inset_shadows(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        shadows: &[BoxShadow],
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+        let element_bounds = bounds.scale(scale_factor);
+        let element_corner_radii = corner_radii.scale(scale_factor);
+        for shadow in shadows {
+            if !shadow.inset {
+                continue;
+            }
+            let hole = (bounds + shadow.offset).dilate(-shadow.spread_radius);
+            let zero = Pixels::ZERO;
+            let hole_corner_radii = Corners {
+                top_left: (corner_radii.top_left - shadow.spread_radius).max(zero),
+                top_right: (corner_radii.top_right - shadow.spread_radius).max(zero),
+                bottom_right: (corner_radii.bottom_right - shadow.spread_radius).max(zero),
+                bottom_left: (corner_radii.bottom_left - shadow.spread_radius).max(zero),
+            };
+            self.next_frame.scene.insert_primitive(Shadow {
+                order: 0,
+                blur_radius: shadow.blur_radius.scale(scale_factor),
+                bounds: hole.scale(scale_factor),
+                content_mask: content_mask.scale(scale_factor),
+                corner_radii: hole_corner_radii.scale(scale_factor),
+                color: shadow.color.opacity(opacity),
+                element_bounds,
+                element_corner_radii,
+                inset: 1,
+                pad: 0,
             });
         }
     }
@@ -5201,6 +5373,80 @@ impl Window {
     /// with the window, for others it's just a simple global function call.
     pub fn play_system_bell(&self) {
         self.platform_window.play_system_bell()
+    }
+
+    /// Register a listener for an accessibility action on a specific node.
+    pub fn on_a11y_action(
+        &mut self,
+        node_id: accesskit::NodeId,
+        action: accesskit::Action,
+        listener: impl FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
+    ) {
+        self.a11y
+            .action_listeners
+            .entry(node_id)
+            .or_default()
+            .push((action, Box::new(listener)));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn handle_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
+        if let Some(mut listeners) = self.a11y.action_listeners.remove(&request.target_node) {
+            let extra_data = request.data.as_ref();
+            let mut matched = false;
+            for (action, listener) in &mut listeners {
+                if *action == request.action {
+                    listener(extra_data, self, cx);
+                    matched = true;
+                }
+            }
+            self.a11y
+                .action_listeners
+                .insert(request.target_node, listeners);
+            if matched {
+                return;
+            }
+        }
+
+        match request.action {
+            accesskit::Action::Click => {
+                if let Some(bounds) = self.a11y.node_bounds.get(&request.target_node).copied() {
+                    let center = bounds.center();
+                    let mouse_down = PlatformInput::MouseDown(crate::MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: center,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    });
+                    let mouse_up = PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: center,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                    });
+                    self.dispatch_event(mouse_down, cx);
+                    self.dispatch_event(mouse_up, cx);
+                }
+            }
+            accesskit::Action::Focus => {
+                if let Some(focus_id) = self.a11y.focus_ids.get(&request.target_node).copied()
+                    && let Some(handle) = FocusHandle::for_id(focus_id, &cx.focus_handles)
+                {
+                    self.focus(&handle, cx);
+                }
+            }
+            accesskit::Action::Blur => {
+                self.blur();
+            }
+            _ => {
+                log::debug!(
+                    "Unhandled a11y action: {:?} on {:?}",
+                    request.action,
+                    request.target_node
+                );
+            }
+        }
     }
 
     /// Toggles the inspector mode on this window.

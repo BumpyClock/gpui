@@ -106,6 +106,13 @@ struct BackdropScratchBounds {
 pub struct WgpuSurfaceConfig {
     pub size: Size<DevicePixels>,
     pub transparent: bool,
+    /// Preferred presentation mode. When `Some`, the renderer will use this
+    /// mode if supported by the surface, falling back to `Fifo`.
+    /// When `None`, defaults to `Fifo` (VSync).
+    ///
+    /// Mobile platforms may prefer `Mailbox` (triple-buffering) to avoid
+    /// blocking in `get_current_texture()` during lifecycle transitions.
+    pub preferred_present_mode: Option<wgpu::PresentMode>,
 }
 
 struct WgpuPipelines {
@@ -304,12 +311,18 @@ impl WgpuRenderer {
             opaque_alpha_mode
         };
 
+        let present_mode = config
+            .preferred_present_mode
+            .filter(|mode| surface_caps.present_modes.contains(mode))
+            .unwrap_or(wgpu::PresentMode::Fifo);
+
         Self::new_with_surface(
             context,
             surface,
             surface_format,
             surface_caps.usages,
             alpha_mode,
+            present_mode,
             transparent_alpha_mode,
             opaque_alpha_mode,
             config,
@@ -322,6 +335,7 @@ impl WgpuRenderer {
         surface_format: wgpu::TextureFormat,
         surface_usages: wgpu::TextureUsages,
         alpha_mode: wgpu::CompositeAlphaMode,
+        present_mode: wgpu::PresentMode,
         transparent_alpha_mode: wgpu::CompositeAlphaMode,
         opaque_alpha_mode: wgpu::CompositeAlphaMode,
         config: WgpuSurfaceConfig,
@@ -355,7 +369,7 @@ impl WgpuRenderer {
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],

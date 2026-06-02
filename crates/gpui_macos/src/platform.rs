@@ -67,7 +67,7 @@ const MAC_PLATFORM_IVAR: &str = "platform";
 static mut APP_CLASS: *const Class = ptr::null();
 static mut APP_DELEGATE_CLASS: *const Class = ptr::null();
 
-#[ctor]
+#[ctor(unsafe)]
 unsafe fn build_classes() {
     unsafe {
         APP_CLASS = {
@@ -622,8 +622,10 @@ impl Platform for MacPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        let renderer_context = self.0.lock().renderer_context.clone();
-        let cursor_visible = self.0.lock().cursor_visible.clone();
+        let (renderer_context, cursor_visible) = {
+            let state = self.0.lock();
+            (state.renderer_context.clone(), state.cursor_visible.clone())
+        };
         Ok(Box::new(MacWindow::open(
             handle,
             options,

@@ -445,6 +445,7 @@ impl WaylandClientState {
                 "wayland: no focused surface to restore cursor style {:?} after hide; cursor may stay invisible",
                 style
             );
+            self.cursor_hidden_window = None;
             return;
         };
         let Some(wl_pointer) = self.wl_pointer.clone() else {
@@ -452,6 +453,7 @@ impl WaylandClientState {
                 "wayland: no wl_pointer to restore cursor style {:?} after hide; cursor may stay invisible",
                 style
             );
+            self.cursor_hidden_window = None;
             return;
         };
         let scale = focused_window.primary_output_scale();
@@ -925,7 +927,7 @@ impl LinuxClient for WaylandClient {
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
             state.clipboard.set_primary(item);
-            let serial = state.serial_tracker.get(SerialKind::KeyPress);
+            let serial = state.serial_tracker.get_latest();
             let data_source = primary_selection_manager.create_source(&state.globals.qh, ());
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
@@ -945,7 +947,7 @@ impl LinuxClient for WaylandClient {
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
             state.clipboard.set(item);
-            let serial = state.serial_tracker.get(SerialKind::KeyPress);
+            let serial = state.serial_tracker.get_latest();
             let data_source = data_device_manager.create_data_source(&state.globals.qh, ());
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());

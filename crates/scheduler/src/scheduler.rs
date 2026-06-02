@@ -11,11 +11,13 @@ pub use test_scheduler::*;
 use async_task::Runnable;
 use futures::channel::oneshot;
 use std::{
+    any::Any,
     future::Future,
     panic::Location,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    thread,
     time::Duration,
 };
 
@@ -82,7 +84,8 @@ pub trait Scheduler: Send + Sync {
         timeout: Option<Duration>,
     ) -> bool;
 
-    fn schedule_foreground(&self, session_id: SessionId, runnable: Runnable<RunnableMeta>);
+    /// Schedule a runnable on the local (session-pinned) queue for `session_id`.
+    fn schedule_local(&self, session_id: SessionId, runnable: Runnable<RunnableMeta>);
 
     /// Schedule a background task with the given priority.
     fn schedule_background_with_priority(
@@ -103,9 +106,60 @@ pub trait Scheduler: Send + Sync {
     fn timer(&self, timeout: Duration) -> Timer;
     fn clock(&self) -> Arc<dyn Clock>;
 
+    /// Spawn a closure on a fresh session pinned to its own [`LocalExecutor`].
+    fn spawn_dedicated(
+        self: Arc<Self>,
+        f: Box<
+            dyn FnOnce(
+                    LocalExecutor,
+                )
+                    -> Pin<Box<dyn Future<Output = Box<dyn Any + Send + Sync>> + 'static>>
+                + Send
+                + 'static,
+        >,
+    ) -> Task<Box<dyn Any + Send + Sync>>;
+
     fn as_test(&self) -> Option<&TestScheduler> {
         None
     }
+}
+
+/// Spawn work on a fresh OS thread that's exclusive to the returned task and
+/// anything spawned on the executor it provides.
+pub fn spawn_dedicated_thread<F, Fut>(
+    session_id: SessionId,
+    scheduler: Arc<dyn Scheduler>,
+    f: F,
+) -> Task<Fut::Output>
+where
+    F: FnOnce(LocalExecutor) -> Fut + Send + 'static,
+    Fut: Future + 'static,
+    Fut::Output: Send + 'static,
+{
+    let (runnable_sender, runnable_receiver) = flume::unbounded::<Runnable<RunnableMeta>>();
+    let (task_sender, task_receiver) = flume::bounded::<Task<Fut::Output>>(1);
+
+    thread::Builder::new()
+        .name(format!("spawn_dedicated session {:?}", session_id))
+        .spawn(move || {
+            let dispatch = move |runnable: Runnable<RunnableMeta>| {
+                let _ = runnable_sender.send(runnable);
+            };
+            let executor = LocalExecutor::new(session_id, scheduler, dispatch);
+            let root_task = executor.spawn(f(executor.clone()));
+            let _ = task_sender.send(root_task);
+            // Close the dispatch sender so the dedicated thread exits after draining queued work.
+            drop(executor);
+
+            while let Ok(runnable) = runnable_receiver.recv() {
+                runnable.run();
+            }
+        })
+        .expect("failed to spawn dedicated thread");
+
+    task_receiver
+        .recv()
+        .expect("dedicated thread failed to produce root task")
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]

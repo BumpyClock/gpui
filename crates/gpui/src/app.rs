@@ -141,6 +141,18 @@ impl Application {
         ))
     }
 
+    /// Builds an app with accessibility (AccessKit) integration forcibly
+    /// disabled.
+    ///
+    /// In this mode, accessibility APIs (for example
+    /// [`div().role()`][crate::StatefulInteractiveElement::role]) silently
+    /// no-op.
+    pub fn new_inaccessible(platform: Rc<dyn Platform>) -> Self {
+        let this = Self::with_platform(platform);
+        this.0.borrow_mut().accessibility_force_disabled = true;
+        this
+    }
+
     /// Assigns the source of assets for the application.
     pub fn with_assets(self, asset_source: impl AssetSource) -> Self {
         let mut context_lock = self.0.borrow_mut();
@@ -656,6 +668,8 @@ pub struct App {
     pub(crate) window_update_stack: Vec<WindowId>,
     pub(crate) mode: GpuiMode,
     pub(crate) cursor_hide_mode: CursorHideMode,
+    /// Whether the app was created by [`Application::new_inaccessible`].
+    pub(crate) accessibility_force_disabled: bool,
     flushing_effects: bool,
     pending_updates: usize,
     quit_mode: QuitMode,
@@ -745,6 +759,7 @@ impl App {
                 quit_mode: QuitMode::default(),
                 quitting: false,
                 cursor_hide_mode: CursorHideMode::default(),
+                accessibility_force_disabled: false,
 
                 #[cfg(any(test, feature = "test-support", debug_assertions))]
                 name: None,
