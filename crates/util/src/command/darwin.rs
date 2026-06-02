@@ -15,6 +15,9 @@ use std::process::{ExitStatus, Output};
 use std::ptr;
 use std::sync::{Mutex, MutexGuard};
 
+// Coordinates this module's `pipe()` + FIOCLEX setup with its `posix_spawn`
+// path. Darwin lacks `pipe2(O_CLOEXEC)`, so unrelated spawners that do not take
+// this lock can still inherit pipe fds in the small pre-FIOCLEX window.
 static FD_SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 fn fd_spawn_lock() -> MutexGuard<'static, ()> {
@@ -545,7 +548,7 @@ fn create_pipe_locked() -> io::Result<(libc::c_int, libc::c_int)> {
 
         // Set close-on-exec on both ends of the pipe.
         //
-        // Without this, unrelated spawns elsewhere in the process (e.g.
+        // Once set, this prevents unrelated spawns elsewhere in the process (e.g.
         // `smol::process` or `async_process`, which on Apple platforms use
         // `posix_spawn` *without* `POSIX_SPAWN_CLOEXEC_DEFAULT`) would inherit
         // these file descriptors and keep the pipes open even after we drop our

@@ -223,7 +223,7 @@ impl LineWrapper {
         if max_lines <= 1 {
             return self.truncate_single_wrapped_line(
                 text,
-                wrap_width * max_lines,
+                wrap_width,
                 truncation_affix,
                 runs,
                 truncate_from,
@@ -257,7 +257,11 @@ impl LineWrapper {
 
         for (ix, c) in text.char_indices() {
             if c == '\n' {
-                if line >= max_lines - 1 && !text[ix + 1..].trim().is_empty() {
+                if line >= max_lines - 1
+                    && text
+                        .get(ix + 1..)
+                        .is_some_and(|suffix| !suffix.trim().is_empty())
+                {
                     let result = SharedString::from(format!(
                         "{}{truncation_affix}",
                         trim_end_before_truncation_affix(&text[..truncate_ix], truncation_affix)

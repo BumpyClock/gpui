@@ -792,7 +792,16 @@ fn slot_font_id(
 ) -> FontId {
     match slot {
         None => primary,
-        Some(ix) => fallback_chain[ix].0,
+        Some(ix) => fallback_chain.get(ix).map_or_else(
+            || {
+                debug_assert!(
+                    false,
+                    "fallback slot {ix} must be present in the fallback chain"
+                );
+                primary
+            },
+            |(font_id, _)| *font_id,
+        ),
     }
 }
 

@@ -362,6 +362,9 @@ impl AsyncWindowContext {
 }
 
 impl AppContext for AsyncWindowContext {
+    /// Create a new entity using the bound window's context.
+    ///
+    /// Panics if the bound window has been closed before the entity can be created.
     fn new<T>(&mut self, build_entity: impl FnOnce(&mut Context<T>) -> T) -> Entity<T>
     where
         T: 'static,
@@ -385,6 +388,9 @@ impl AppContext for AsyncWindowContext {
         self.app.reserve_entity()
     }
 
+    /// Insert a reserved entity using the bound window's context.
+    ///
+    /// Panics if the bound window has been closed before the entity can be inserted.
     fn insert_entity<T: 'static>(
         &mut self,
         reservation: Reservation<T>,

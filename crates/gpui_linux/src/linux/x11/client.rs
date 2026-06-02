@@ -1687,7 +1687,7 @@ impl LinuxClient for X11Client {
 
     fn is_cursor_visible(&self) -> bool {
         let state = self.0.borrow();
-        state.cursor_hidden_window != state.mouse_focused_window
+        is_cursor_visible(state.cursor_hidden_window, state.mouse_focused_window)
     }
 
     fn open_uri(&self, uri: &str) {
@@ -2053,7 +2053,8 @@ impl X11ClientState {
         if let Some(cursor) = self.invisible_cursor_cache {
             return Some(cursor);
         }
-        let cursor = create_invisible_cursor(&self.xcb_connection)
+        let root = self.xcb_connection.setup().roots[self.x_root_index].root;
+        let cursor = create_invisible_cursor(&self.xcb_connection, root)
             .context("X11: error while creating invisible cursor")
             .log_err()?;
         self.invisible_cursor_cache = Some(cursor);
@@ -2497,11 +2498,21 @@ fn make_scroll_wheel_event(
     }
 }
 
+fn is_cursor_visible(
+    cursor_hidden_window: Option<xproto::Window>,
+    mouse_focused_window: Option<xproto::Window>,
+) -> bool {
+    !matches!(
+        (cursor_hidden_window, mouse_focused_window),
+        (Some(hidden_window), Some(focused_window)) if hidden_window == focused_window
+    )
+}
+
 fn create_invisible_cursor(
     connection: &XCBConnection,
+    root: xproto::Window,
 ) -> anyhow::Result<crate::linux::x11::client::xproto::Cursor> {
     let empty_pixmap = connection.generate_id()?;
-    let root = connection.setup().roots[0].root;
     connection.create_pixmap(1, empty_pixmap, root, 1, 1)?;
 
     let cursor = connection.generate_id()?;
@@ -2795,4 +2806,18 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
     );
 
     key_event_state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_is_visible_unless_hidden_window_is_focused_window() {
+        assert!(is_cursor_visible(None, None));
+        assert!(is_cursor_visible(Some(1), None));
+        assert!(is_cursor_visible(None, Some(1)));
+        assert!(is_cursor_visible(Some(1), Some(2)));
+        assert!(!is_cursor_visible(Some(1), Some(1)));
+    }
 }

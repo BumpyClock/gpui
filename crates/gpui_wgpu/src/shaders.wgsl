@@ -1039,7 +1039,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     if (shadow.inset != 0u) {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
-        alpha = 1.0 - alpha;
+        alpha = saturate(1.0 - alpha);
         let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
                                         shadow.element_corner_radii);
         alpha *= saturate(0.5 - element_distance);
