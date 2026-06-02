@@ -1264,6 +1264,7 @@ impl X11WindowStatePtr {
     }
 
     pub fn set_active(&self, focus: bool) {
+        self.state.borrow_mut().active = focus;
         if let Some(ref mut fun) = self.callbacks.borrow_mut().active_status_change {
             fun(focus);
         }
@@ -1881,8 +1882,9 @@ impl PlatformWindow for X11Window {
             callback: callbacks.deactivation,
         };
 
-        let adapter =
+        let mut adapter =
             accesskit_unix::Adapter::new(activation_handler, action_handler, deactivation_handler);
+        adapter.update_window_focus_state(self.0.state.borrow().active);
 
         self.0.state.borrow_mut().accesskit_adapter = Some(adapter);
     }

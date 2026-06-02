@@ -545,7 +545,7 @@ fn create_pipe() -> io::Result<(libc::c_int, libc::c_int)> {
 }
 
 fn open_dev_null(flags: libc::c_int) -> io::Result<libc::c_int> {
-    // Set close-on-exec for this pipe, for the same reason as in `create_pipe`.
+    // Set close-on-exec for this file descriptor, for the same reason as in `create_pipe`.
     let fd = unsafe {
         libc::open(
             c"/dev/null".as_ptr() as *const libc::c_char,

@@ -1087,7 +1087,12 @@ impl WindowsWindowInner {
         });
 
         if had_cursor != self.state.current_cursor.get().is_some() {
-            unsafe { SetCursor(self.state.current_cursor.get()) };
+            let cursor = if self.state.cursor_visible.load(Ordering::Relaxed) {
+                self.state.current_cursor.get()
+            } else {
+                None
+            };
+            unsafe { SetCursor(cursor) };
         }
 
         Some(0)

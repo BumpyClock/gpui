@@ -21,6 +21,20 @@ const INITIAL_INSTANCE_BUFFER_SIZE: u64 = 2 * 1024 * 1024;
 const INSTANCE_BUFFER_SIZE_BUCKET: u64 = 1024 * 1024;
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
+fn select_present_mode(
+    preferred: Option<wgpu::PresentMode>,
+    supported: &[wgpu::PresentMode],
+) -> wgpu::PresentMode {
+    preferred
+        .filter(|mode| {
+            matches!(
+                mode,
+                wgpu::PresentMode::AutoVsync | wgpu::PresentMode::AutoNoVsync
+            ) || supported.contains(mode)
+        })
+        .unwrap_or(wgpu::PresentMode::Fifo)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GlobalParams {
@@ -311,10 +325,8 @@ impl WgpuRenderer {
             opaque_alpha_mode
         };
 
-        let present_mode = config
-            .preferred_present_mode
-            .filter(|mode| surface_caps.present_modes.contains(mode))
-            .unwrap_or(wgpu::PresentMode::Fifo);
+        let present_mode =
+            select_present_mode(config.preferred_present_mode, &surface_caps.present_modes);
 
         Self::new_with_surface(
             context,
@@ -2653,6 +2665,37 @@ impl WgpuRenderer {
     /// Returns true if the GPU device was lost and recovery is needed.
     pub fn device_lost(&self) -> bool {
         self.device_lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_present_mode_accepts_auto_modes_without_surface_advertising_them() {
+        assert_eq!(
+            select_present_mode(
+                Some(wgpu::PresentMode::AutoVsync),
+                &[wgpu::PresentMode::Fifo]
+            ),
+            wgpu::PresentMode::AutoVsync
+        );
+        assert_eq!(
+            select_present_mode(
+                Some(wgpu::PresentMode::AutoNoVsync),
+                &[wgpu::PresentMode::Fifo]
+            ),
+            wgpu::PresentMode::AutoNoVsync
+        );
+    }
+
+    #[test]
+    fn select_present_mode_falls_back_to_fifo_for_unsupported_explicit_mode() {
+        assert_eq!(
+            select_present_mode(Some(wgpu::PresentMode::Mailbox), &[wgpu::PresentMode::Fifo]),
+            wgpu::PresentMode::Fifo
+        );
     }
 }
 

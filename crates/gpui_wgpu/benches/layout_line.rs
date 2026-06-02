@@ -45,6 +45,10 @@ fn code_text() -> String {
     .repeat(8) // 7,928 chars
 }
 
+fn mixed_fallback_text() -> String {
+    code_text().replace("compute_run_spans", "compute_run_spans_\u{FB01}")
+}
+
 fn bench_layout_line(c: &mut Criterion) {
     let system = CosmicTextSystem::new_without_system_fonts("Lilex");
     system
@@ -60,6 +64,7 @@ fn bench_layout_line(c: &mut Criterion) {
     };
 
     let text = code_text();
+    let mixed_text = mixed_fallback_text();
 
     let runs_no_fallback = vec![FontRun {
         len: text.len(),
@@ -67,6 +72,10 @@ fn bench_layout_line(c: &mut Criterion) {
     }];
     let runs_with_fallback = vec![FontRun {
         len: text.len(),
+        font_id: font_id_with_fallback,
+    }];
+    let runs_with_mixed_fallback = vec![FontRun {
+        len: mixed_text.len(),
         font_id: font_id_with_fallback,
     }];
 
@@ -78,6 +87,10 @@ fn bench_layout_line(c: &mut Criterion) {
 
     group.bench_function("fallback_chain_ascii_text", |b| {
         b.iter(|| system.layout_line(&text, px(14.0), &runs_with_fallback))
+    });
+
+    group.bench_function("fallback_chain_mixed_text", |b| {
+        b.iter(|| system.layout_line(&mixed_text, px(14.0), &runs_with_mixed_fallback))
     });
 
     group.finish();

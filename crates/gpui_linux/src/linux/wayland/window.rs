@@ -1487,8 +1487,9 @@ impl PlatformWindow for WaylandWindow {
             callback: callbacks.deactivation,
         };
 
-        let adapter =
+        let mut adapter =
             accesskit_unix::Adapter::new(activation_handler, action_handler, deactivation_handler);
+        adapter.update_window_focus_state(self.borrow().active);
 
         self.borrow_mut().accesskit_adapter = Some(adapter);
     }

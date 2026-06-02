@@ -445,7 +445,6 @@ impl WaylandClientState {
                 "wayland: no focused surface to restore cursor style {:?} after hide; cursor may stay invisible",
                 style
             );
-            self.cursor_hidden_window = None;
             return;
         };
         let Some(wl_pointer) = self.wl_pointer.clone() else {
@@ -453,7 +452,6 @@ impl WaylandClientState {
                 "wayland: no wl_pointer to restore cursor style {:?} after hide; cursor may stay invisible",
                 style
             );
-            self.cursor_hidden_window = None;
             return;
         };
         let scale = focused_window.primary_output_scale();
@@ -788,14 +786,22 @@ impl LinuxClient for WaylandClient {
 
         let parent = state.keyboard_focused_window.clone();
 
-        let target_output = params.display_id.and_then(|display_id| {
-            let target_protocol_id: u64 = display_id.into();
-            state
-                .wl_outputs
-                .iter()
-                .find(|(id, _)| id.protocol_id() as u64 == target_protocol_id)
-                .map(|(_, output)| output.clone())
-        });
+        let target_output = match params.display_id {
+            Some(display_id) => {
+                let target_protocol_id: u64 = display_id.into();
+                Some(
+                    state
+                        .wl_outputs
+                        .iter()
+                        .find(|(id, _)| id.protocol_id() as u64 == target_protocol_id)
+                        .map(|(_, output)| output.clone())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("no Wayland output found for display {:?}", display_id)
+                        })?,
+                )
+            }
+            None => None,
+        };
 
         let (window, surface_id) = WaylandWindow::new(
             handle,

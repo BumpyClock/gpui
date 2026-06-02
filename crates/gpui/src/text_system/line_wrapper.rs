@@ -479,9 +479,10 @@ impl LineWrapper {
         while low < high {
             let mid = (low + high) / 2;
             let candidate = candidates[mid];
-            let result = format!("{truncation_affix}{}", &text[candidate..]);
 
-            if self.wrapped_line_count(&result, wrap_width) <= max_lines {
+            if self.wrapped_line_count_with_prefix(truncation_affix, &text[candidate..], wrap_width)
+                <= max_lines
+            {
                 high = mid;
             } else {
                 low = mid + 1;
@@ -503,6 +504,35 @@ impl LineWrapper {
                     + 1
             })
             .sum()
+    }
+
+    fn wrapped_line_count_with_prefix(
+        &mut self,
+        prefix: &str,
+        text: &str,
+        wrap_width: Pixels,
+    ) -> usize {
+        let mut lines = text.split('\n');
+        let Some(first_line) = lines.next() else {
+            return 0;
+        };
+
+        let first_line_count = self
+            .wrap_line(
+                &[LineFragment::text(prefix), LineFragment::text(first_line)],
+                wrap_width,
+            )
+            .count()
+            + 1;
+
+        first_line_count
+            + lines
+                .map(|line| {
+                    self.wrap_line(&[LineFragment::text(line)], wrap_width)
+                        .count()
+                        + 1
+                })
+                .sum::<usize>()
     }
 
     /// Any character in this list should be treated as a word character,

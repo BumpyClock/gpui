@@ -730,6 +730,29 @@ fn compute_run_spans(
     }
 
     let run_text = &text[run_offset..run_end];
+    if run_text.chars().all(|ch| covers(primary, ch)) {
+        spans.push(RunSpan {
+            start: run_offset,
+            end: run_end,
+            slot: None,
+            font_id: primary,
+        });
+        return spans;
+    }
+
+    let fallback_covers_any_missing_primary_char = run_text.chars().any(|ch| {
+        !covers(primary, ch) && fallback_chain.iter().any(|(fb_id, _)| covers(*fb_id, ch))
+    });
+    if !fallback_covers_any_missing_primary_char {
+        spans.push(RunSpan {
+            start: run_offset,
+            end: run_end,
+            slot: None,
+            font_id: primary,
+        });
+        return spans;
+    }
+
     let mut span_start = run_offset;
     let mut span_slot: Option<usize> = None;
     let mut span_font_id = primary;
@@ -1060,6 +1083,44 @@ mod tests {
         let fallback_chain = chain(&[1]);
         let covers = |id: FontId, ch: char| id == fid(1) && ch != '\u{200D}';
         let text = "\u{1F469}\u{200D}\u{1F467}";
+
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fallback_chain, &covers);
+
+        assert_eq!(spans.as_slice(), &[span(0, text.len(), None, primary)]);
+    }
+
+    #[test]
+    fn run_spans_use_primary_span_when_primary_covers_all_chars() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1]);
+        let covers = |id: FontId, _: char| id == primary;
+        let text = "a字\u{0301}";
+
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fallback_chain, &covers);
+
+        assert_eq!(spans.as_slice(), &[span(0, text.len(), None, primary)]);
+    }
+
+    #[test]
+    fn run_spans_use_primary_span_when_no_fallback_covers_missing_primary_chars() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1, 2]);
+        let covers = |id: FontId, ch: char| id == primary && ch.is_ascii();
+        let text = "a字b";
+
+        let spans = compute_run_spans(text, 0, text.len(), primary, &fallback_chain, &covers);
+
+        assert_eq!(spans.as_slice(), &[span(0, text.len(), None, primary)]);
+    }
+
+    #[test]
+    fn run_spans_keep_ascii_graphemes_on_primary_even_when_fallback_covers() {
+        let primary = fid(0);
+        let fallback_chain = chain(&[1]);
+        let covers = |id: FontId, ch: char| {
+            if id == primary { ch == 'a' } else { ch == 'b' }
+        };
+        let text = "ab";
 
         let spans = compute_run_spans(text, 0, text.len(), primary, &fallback_chain, &covers);
 
