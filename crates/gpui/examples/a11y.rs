@@ -3,8 +3,8 @@
 //! Run with: `cargo run -p gpui --example a11y`.
 
 use gpui::{
-    AccessibleAction, App, Context, FocusHandle, KeyBinding, Role, SharedString, Toggled, Window,
-    WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size, text,
+    AccessibleAction, App, Context, FocusHandle, KeyBinding, Role, SharedString, Text, Toggled,
+    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size, text,
 };
 use gpui_platform::application;
 
@@ -30,6 +30,9 @@ impl A11yDemo {
 
 impl Render for A11yDemo {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tasks = ["Write code", "Run tests", "Ship it"];
+        let task_count = tasks.len();
+
         div()
             .id("root")
             .role(Role::Application)
@@ -52,7 +55,7 @@ impl Render for A11yDemo {
                     .aria_label("Accessibility Demo")
                     .text_xl()
                     .font_weight(gpui::FontWeight::BOLD)
-                    .child(text!("Accessibility Demo")),
+                    .child(Text::new_inaccessible("Accessibility Demo".into())),
             )
             .child(
                 div()
@@ -166,22 +169,17 @@ impl Render for A11yDemo {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .children(
-                        ["Write code", "Run tests", "Ship it"]
-                            .iter()
-                            .enumerate()
-                            .map(|(i, label)| {
-                                div()
-                                    .id(("task", i))
-                                    .role(Role::ListItem)
-                                    .aria_label(SharedString::from(*label))
-                                    .aria_position_in_set(i + 1)
-                                    .aria_size_of_set(3)
-                                    .py_1()
-                                    .px_2()
-                                    .child(text!(format!("{}. {}", i + 1, label)))
-                            }),
-                    ),
+                    .children(tasks.into_iter().enumerate().map(|(i, label)| {
+                        div()
+                            .id(("task", i))
+                            .role(Role::ListItem)
+                            .aria_label(SharedString::from(label))
+                            .aria_position_in_set(i + 1)
+                            .aria_size_of_set(task_count)
+                            .py_1()
+                            .px_2()
+                            .child(text!(format!("{}. {}", i + 1, label)))
+                    })),
             )
     }
 }

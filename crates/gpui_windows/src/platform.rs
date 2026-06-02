@@ -684,7 +684,7 @@ impl Platform for WindowsPlatform {
             .inner
             .state
             .cursor_visible
-            .swap(false, Ordering::Relaxed)
+            .swap(false, Ordering::AcqRel)
         {
             return;
         }
@@ -701,7 +701,7 @@ impl Platform for WindowsPlatform {
     }
 
     fn is_cursor_visible(&self) -> bool {
-        self.inner.state.cursor_visible.load(Ordering::Relaxed)
+        self.inner.state.cursor_visible.load(Ordering::Acquire)
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {

@@ -182,6 +182,7 @@ pub(crate) struct MacPlatformState {
     keyboard_mapper: Rc<MacKeyboardMapper>,
     /// Mirrors `[NSCursor setHiddenUntilMouseMoves:]` state, which AppKit doesn't expose.
     cursor_visible: Arc<AtomicBool>,
+    cursor_hidden_by_style: bool,
 }
 
 impl MacPlatform {
@@ -219,6 +220,7 @@ impl MacPlatform {
             menus: None,
             keyboard_mapper,
             cursor_visible: Arc::new(AtomicBool::new(true)),
+            cursor_hidden_by_style: false,
         }))
     }
 
@@ -985,7 +987,29 @@ impl Platform for MacPlatform {
     /// Match cursor style to one of the styles available
     /// in macOS's [NSCursor](https://developer.apple.com/documentation/appkit/nscursor).
     fn set_cursor_style(&self, style: CursorStyle) {
+        let cursor_was_hidden_by_style = {
+            let mut state = self.0.lock();
+            if style == CursorStyle::None {
+                if state.cursor_hidden_by_style {
+                    return;
+                }
+                state.cursor_hidden_by_style = true;
+                false
+            } else {
+                std::mem::replace(&mut state.cursor_hidden_by_style, false)
+            }
+        };
+
         unsafe {
+            if style == CursorStyle::None {
+                let _: () = msg_send![class!(NSCursor), hide];
+                return;
+            }
+
+            if cursor_was_hidden_by_style {
+                let _: () = msg_send![class!(NSCursor), unhide];
+            }
+
             let new_cursor: id = match style {
                 CursorStyle::Arrow => msg_send![class!(NSCursor), arrowCursor],
                 CursorStyle::IBeam => msg_send![class!(NSCursor), IBeamCursor],
@@ -1020,6 +1044,7 @@ impl Platform for MacPlatform {
                 CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
                 CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
                 CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+                CursorStyle::None => unreachable!(),
             };
 
             let old_cursor: id = msg_send![class!(NSCursor), currentCursor];

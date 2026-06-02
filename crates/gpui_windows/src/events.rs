@@ -335,7 +335,7 @@ impl WindowsWindowInner {
         self.state.hovered.set(false);
         // The next window's `WM_SETCURSOR` picks its own cursor, so we just clear
         // the flag for tight `is_cursor_visible()` semantics.
-        self.state.cursor_visible.store(true, Ordering::Relaxed);
+        self.state.cursor_visible.store(true, Ordering::Release);
         if let Some(mut callback) = self.state.callbacks.hovered_status_change.take() {
             callback(false);
             self.state
@@ -744,7 +744,7 @@ impl WindowsWindowInner {
         let this = self.clone();
 
         if !activated {
-            this.state.cursor_visible.store(true, Ordering::Relaxed);
+            this.state.cursor_visible.store(true, Ordering::Release);
         }
 
         self.executor
@@ -774,7 +774,7 @@ impl WindowsWindowInner {
 
     fn handle_wm_getobject(&self, wparam: WPARAM, lparam: LPARAM) -> Option<isize> {
         let result = {
-            let mut a11y = self.state.a11y.borrow_mut();
+            let mut a11y = self.state.a11y.try_borrow_mut().ok()?;
             let a11y = a11y.as_mut()?;
             a11y.adapter.handle_wm_getobject(
                 accesskit_windows::WPARAM(wparam.0),
@@ -1087,7 +1087,7 @@ impl WindowsWindowInner {
         });
 
         if had_cursor != self.state.current_cursor.get().is_some() {
-            let cursor = if self.state.cursor_visible.load(Ordering::Relaxed) {
+            let cursor = if self.state.cursor_visible.load(Ordering::Acquire) {
                 self.state.current_cursor.get()
             } else {
                 None
@@ -1114,7 +1114,7 @@ impl WindowsWindowInner {
         {
             return None;
         }
-        let cursor = if self.state.cursor_visible.load(Ordering::Relaxed) {
+        let cursor = if self.state.cursor_visible.load(Ordering::Acquire) {
             self.state.current_cursor.get()
         } else {
             None
@@ -1275,7 +1275,7 @@ impl WindowsWindowInner {
 
     /// Clear the hidden flag and restore the cursor immediately
     fn restore_cursor_after_hide(&self) {
-        if !self.state.cursor_visible.swap(true, Ordering::Relaxed) {
+        if !self.state.cursor_visible.swap(true, Ordering::AcqRel) {
             unsafe {
                 SetCursor(self.state.current_cursor.get());
             }

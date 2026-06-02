@@ -99,6 +99,12 @@ impl LinuxClient for HeadlessClient {
 
     fn set_cursor_style(&self, _style: CursorStyle) {}
 
+    fn hide_cursor_until_mouse_moves(&self) {}
+
+    fn is_cursor_visible(&self) -> bool {
+        false
+    }
+
     fn open_uri(&self, _uri: &str) {}
 
     fn reveal_path(&self, _path: std::path::PathBuf) {}

@@ -1882,7 +1882,9 @@ impl PlatformWindow for X11Window {
         let activation_handler = TrivialActivationHandler {
             callback: callbacks.activation,
         };
-        let action_handler = TrivialActionHandler(callbacks.action);
+        let action_handler = TrivialActionHandler {
+            callback: callbacks.action,
+        };
         let deactivation_handler = TrivialDeactivationHandler {
             callback: callbacks.deactivation,
         };

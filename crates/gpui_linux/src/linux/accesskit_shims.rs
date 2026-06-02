@@ -8,13 +8,13 @@ impl accesskit::ActivationHandler for TrivialActivationHandler {
     }
 }
 
-pub(crate) struct TrivialActionHandler(
-    pub(crate) Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>,
-);
+pub(crate) struct TrivialActionHandler {
+    pub(crate) callback: Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>,
+}
 
 impl accesskit::ActionHandler for TrivialActionHandler {
     fn do_action(&mut self, request: accesskit::ActionRequest) {
-        (self.0)(request);
+        (self.callback)(request);
     }
 }
 

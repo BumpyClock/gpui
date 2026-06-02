@@ -412,6 +412,16 @@ impl WaylandClientStatePtr {
 }
 
 impl WaylandClientState {
+    fn hide_cursor(&self) -> bool {
+        let Some(wl_pointer) = self.wl_pointer.clone() else {
+            // Seat lost its pointer capability; nothing to hide.
+            return false;
+        };
+        let serial = self.serial_tracker.get(SerialKind::MouseEnter);
+        wl_pointer.set_cursor(serial, None, 0, 0);
+        true
+    }
+
     fn hide_cursor_until_mouse_moves(&mut self) {
         if self.cursor_hidden_window.is_some() {
             return;
@@ -420,13 +430,9 @@ impl WaylandClientState {
             // No surface to apply the hidden cursor to.
             return;
         };
-        let Some(wl_pointer) = self.wl_pointer.clone() else {
-            // Seat lost its pointer capability; nothing to hide.
-            return;
-        };
-        let serial = self.serial_tracker.get(SerialKind::MouseEnter);
-        wl_pointer.set_cursor(serial, None, 0, 0);
-        self.cursor_hidden_window = Some(focused_window);
+        if self.hide_cursor() {
+            self.cursor_hidden_window = Some(focused_window);
+        }
     }
 
     fn restore_cursor_after_hide(&mut self) {
@@ -434,6 +440,10 @@ impl WaylandClientState {
             return;
         }
         let style = self.cursor_style.unwrap_or(CursorStyle::Arrow);
+        if style == CursorStyle::None {
+            self.cursor_hidden_window = None;
+            return;
+        }
         let serial = self.serial_tracker.get(SerialKind::MouseEnter);
         if let Some(cursor_shape_device) = &self.cursor_shape_device {
             cursor_shape_device.set_shape(serial, to_shape(style));
@@ -445,6 +455,7 @@ impl WaylandClientState {
                 "wayland: no focused surface to restore cursor style {:?} after hide; cursor may stay invisible",
                 style
             );
+            self.cursor_hidden_window = None;
             return;
         };
         let Some(wl_pointer) = self.wl_pointer.clone() else {
@@ -452,6 +463,7 @@ impl WaylandClientState {
                 "wayland: no wl_pointer to restore cursor style {:?} after hide; cursor may stay invisible",
                 style
             );
+            self.cursor_hidden_window = None;
             return;
         };
         let scale = focused_window.primary_output_scale();
@@ -833,6 +845,11 @@ impl LinuxClient for WaylandClient {
         }
 
         state.cursor_style = Some(style);
+
+        if style == CursorStyle::None {
+            state.hide_cursor();
+            return;
+        }
 
         // Don't clobber the invisible cursor; restore reads back from `cursor_style`.
         if state.cursor_hidden_window.is_some() {
@@ -1777,7 +1794,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     }
                     state.restore_cursor_after_hide();
                     if let Some(style) = state.cursor_style {
-                        if let Some(cursor_shape_device) = &state.cursor_shape_device {
+                        if style == CursorStyle::None {
+                            wl_pointer.set_cursor(serial, None, 0, 0);
+                        } else if let Some(cursor_shape_device) = &state.cursor_shape_device {
                             cursor_shape_device.set_shape(serial, to_shape(style));
                         } else {
                             let scale = window.primary_output_scale();

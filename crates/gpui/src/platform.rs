@@ -350,7 +350,7 @@ impl From<DisplayId> for u64 {
 impl TryFrom<DisplayId> for u32 {
     type Error = std::num::TryFromIntError;
 
-    fn try_from(id: DisplayId) -> Result<Self, Self::Error> {
+    fn try_from(id: DisplayId) -> std::result::Result<Self, Self::Error> {
         Self::try_from(id.0)
     }
 }
@@ -1795,6 +1795,10 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
+
+    /// Hide the cursor
+    /// corresponds to the CSS cursor value `none`
+    None,
 }
 
 /// A clipboard item that should be copied to the clipboard

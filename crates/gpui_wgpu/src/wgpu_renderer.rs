@@ -1548,6 +1548,7 @@ impl WgpuRenderer {
         }
         for shadow in &mut scene.shadows {
             shadow.bounds = shadow.bounds - origin;
+            shadow.element_bounds = shadow.element_bounds - origin;
             shadow.content_mask.bounds = shadow.content_mask.bounds - origin;
         }
         for blur in &mut scene.backdrop_blurs {

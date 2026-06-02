@@ -1663,7 +1663,12 @@ impl LinuxClient for X11Client {
             return;
         }
 
-        let Some(cursor) = state.get_cursor_icon(style) else {
+        let cursor = if style == CursorStyle::None {
+            state.get_or_create_invisible_cursor()
+        } else {
+            state.get_cursor_icon(style)
+        };
+        let Some(cursor) = cursor else {
             return;
         };
 
@@ -2104,6 +2109,10 @@ impl X11ClientState {
             .get(&hidden_window)
             .copied()
             .unwrap_or(CursorStyle::Arrow);
+        if style == CursorStyle::None {
+            self.cursor_hidden_window = None;
+            return;
+        }
         let Some(cursor) = self.get_cursor_icon(style) else {
             log::warn!(
                 "X11: no cursor icon available to restore {:?} after hide; cursor may stay invisible",

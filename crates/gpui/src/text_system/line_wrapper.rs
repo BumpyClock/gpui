@@ -505,7 +505,7 @@ impl LineWrapper {
     }
 
     fn wrapped_line_count(&mut self, text: &str, wrap_width: Pixels) -> usize {
-        text.split('\n')
+        text.split_terminator('\n')
             .map(|line| {
                 self.wrap_line(&[LineFragment::text(line)], wrap_width)
                     .count()
@@ -520,7 +520,7 @@ impl LineWrapper {
         text: &str,
         wrap_width: Pixels,
     ) -> usize {
-        let mut lines = text.split('\n');
+        let mut lines = text.split_terminator('\n');
         let Some(first_line) = lines.next() else {
             return 0;
         };
@@ -815,7 +815,7 @@ mod tests {
     }
 
     fn wrapped_line_count(wrapper: &mut LineWrapper, text: &str, wrap_width: Pixels) -> usize {
-        text.split('\n')
+        text.split_terminator('\n')
             .map(|line| {
                 wrapper
                     .wrap_line(&[LineFragment::text(line)], wrap_width)
@@ -1440,6 +1440,25 @@ mod tests {
 
         let (result, result_runs) =
             wrapper.truncate_wrapped_line(text.into(), px(72.), 2, "…", &runs, TruncateFrom::Start);
+
+        assert_eq!(result, text);
+        assert!(matches!(result_runs, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_multiline_start_truncation_trailing_newline() {
+        let mut wrapper = build_wrapper();
+        let text = "hello\nworld\n";
+        let runs = generate_test_runs(&[text.len()]);
+
+        let (result, result_runs) = wrapper.truncate_wrapped_line(
+            text.into(),
+            px(500.),
+            2,
+            "…",
+            &runs,
+            TruncateFrom::Start,
+        );
 
         assert_eq!(result, text);
         assert!(matches!(result_runs, Cow::Borrowed(_)));

@@ -247,22 +247,38 @@ fn test_foreground_task_can_hold_mut_borrow_across_await() {
     TestScheduler::once(async |scheduler| {
         let foreground = scheduler.foreground();
         let (sender, mut receiver) = mpsc::unbounded::<()>();
-        let (completion_sender, completion_receiver) = oneshot::channel::<()>();
+        let (completion_sender, completion_receiver) = oneshot::channel::<i32>();
+        let state = Rc::new(RefCell::new(1));
 
         foreground
-            .spawn(async move {
-                receiver.next().await;
-                completion_sender.send(()).ok();
+            .spawn({
+                let state = state.clone();
+                async move {
+                    let mut state = state.borrow_mut();
+                    *state += 1;
+
+                    receiver.next().await;
+
+                    *state += 1;
+                    completion_sender.send(*state).ok();
+                }
             })
             .detach();
 
         scheduler.run();
+        assert!(
+            state.try_borrow_mut().is_err(),
+            "foreground task should hold the mutable borrow while suspended"
+        );
+
         sender.unbounded_send(()).unwrap();
         scheduler.run();
-        assert!(
-            matches!(completion_receiver.now_or_never(), Some(Ok(()))),
+        assert_eq!(
+            completion_receiver.now_or_never(),
+            Some(Ok(3)),
             "foreground task should resume after receiving from the channel"
         );
+        assert_eq!(*state.borrow(), 3);
     });
 }
 

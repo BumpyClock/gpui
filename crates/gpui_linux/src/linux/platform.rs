@@ -824,6 +824,12 @@ pub(super) fn cursor_style_to_icon_names(style: CursorStyle) -> &'static [&'stat
         CursorStyle::DragLink => &["alias"],
         CursorStyle::DragCopy => &["copy"],
         CursorStyle::ContextualMenu => &["context-menu"],
+        CursorStyle::None => {
+            #[cfg(debug_assertions)]
+            panic!("CursorStyle::None should be handled separately in the client");
+            #[cfg(not(debug_assertions))]
+            &[DEFAULT_CURSOR_ICON_NAME]
+        }
     }
 }
 

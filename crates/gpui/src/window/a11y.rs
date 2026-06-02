@@ -391,17 +391,20 @@ impl A11yNodeBuilder {
 
         if let Some(current_node) = self.nodes_stack.last() {
             let mut pending = current_node.children().to_vec();
-            while let Some(child_id) = pending.pop() {
-                if !pruned_ids.insert(child_id) {
-                    continue;
-                }
-
-                if let Some((_, child_node)) = self
+            if !pending.is_empty() {
+                let emitted_nodes_by_id = self
                     .all_nodes
                     .iter()
-                    .find(|(node_id, _)| *node_id == child_id)
-                {
-                    pending.extend(child_node.children().iter().copied());
+                    .map(|(node_id, node)| (*node_id, node))
+                    .collect::<FxHashMap<_, _>>();
+                while let Some(child_id) = pending.pop() {
+                    if !pruned_ids.insert(child_id) {
+                        continue;
+                    }
+
+                    if let Some(child_node) = emitted_nodes_by_id.get(&child_id) {
+                        pending.extend(child_node.children().iter().copied());
+                    }
                 }
             }
         }
