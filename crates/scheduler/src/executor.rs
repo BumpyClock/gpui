@@ -123,7 +123,7 @@ impl LocalExecutor {
     where
         F: FnOnce(LocalExecutor) -> Fut + Send + 'static,
         Fut: Future + 'static,
-        Fut::Output: Send + Sync + 'static,
+        Fut::Output: Send + 'static,
     {
         self.scheduler
             .clone()
@@ -135,17 +135,17 @@ impl LocalExecutor {
 fn box_dedicated<F, Fut>(
     f: F,
 ) -> Box<
-    dyn FnOnce(LocalExecutor) -> Pin<Box<dyn Future<Output = Box<dyn Any + Send + Sync>> + 'static>>
+    dyn FnOnce(LocalExecutor) -> Pin<Box<dyn Future<Output = Box<dyn Any + Send>> + 'static>>
         + Send
         + 'static,
 >
 where
     F: FnOnce(LocalExecutor) -> Fut + Send + 'static,
     Fut: Future + 'static,
-    Fut::Output: Send + Sync + 'static,
+    Fut::Output: Send + 'static,
 {
     Box::new(move |executor| {
-        Box::pin(async move { Box::new(f(executor).await) as Box<dyn Any + Send + Sync> })
+        Box::pin(async move { Box::new(f(executor).await) as Box<dyn Any + Send> })
     })
 }
 
@@ -237,7 +237,7 @@ impl BackgroundExecutor {
     where
         F: FnOnce(LocalExecutor) -> Fut + Send + 'static,
         Fut: Future + 'static,
-        Fut::Output: Send + Sync + 'static,
+        Fut::Output: Send + 'static,
     {
         self.scheduler
             .clone()
@@ -262,9 +262,9 @@ enum TaskState<T> {
     /// A task that is currently running.
     Spawned(async_task::Task<T, RunnableMeta>),
 
-    /// A typed view of a [`Task<Box<dyn Any + Send + Sync>>`].
+    /// A typed view of a [`Task<Box<dyn Any + Send>>`].
     Downcast {
-        inner: Box<Task<Box<dyn Any + Send + Sync>>>,
+        inner: Box<Task<Box<dyn Any + Send>>>,
         marker: PhantomData<fn() -> T>,
     },
 }
@@ -310,9 +310,9 @@ impl<T> Task<T> {
     }
 }
 
-impl Task<Box<dyn Any + Send + Sync>> {
+impl Task<Box<dyn Any + Send>> {
     /// Reinterprets the boxed output as a concrete `T` via downcast on completion.
-    pub fn downcast<T: Send + Sync + 'static>(self) -> Task<T> {
+    pub fn downcast<T: Send + 'static>(self) -> Task<T> {
         Task(TaskState::Downcast {
             inner: Box::new(self),
             marker: PhantomData,
@@ -345,7 +345,7 @@ enum FallibleTaskState<T> {
 
     /// Mirror of [`TaskState::Downcast`] for fallible tasks.
     Downcast {
-        inner: Box<FallibleTask<Box<dyn Any + Send + Sync>>>,
+        inner: Box<FallibleTask<Box<dyn Any + Send>>>,
         marker: PhantomData<fn() -> T>,
     },
 }

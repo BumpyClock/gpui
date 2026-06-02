@@ -8,7 +8,7 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeSet, HashSet},
     pin::Pin,
     rc::Rc,
@@ -736,6 +736,17 @@ fn test_spawn_dedicated_not_send_future() {
             .await
     });
     assert_eq!(result, 5);
+}
+
+#[test]
+fn test_spawn_dedicated_output_only_needs_send() {
+    let result = TestScheduler::once(async |scheduler| {
+        scheduler
+            .background()
+            .spawn_dedicated(|_executor| async { Cell::new(7_u32) })
+            .await
+    });
+    assert_eq!(result.get(), 7);
 }
 
 #[test]

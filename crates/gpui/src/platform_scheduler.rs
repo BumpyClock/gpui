@@ -142,11 +142,11 @@ impl Scheduler for PlatformScheduler {
             dyn FnOnce(
                     LocalExecutor,
                 )
-                    -> Pin<Box<dyn Future<Output = Box<dyn Any + Send + Sync>> + 'static>>
+                    -> Pin<Box<dyn Future<Output = Box<dyn Any + Send>> + 'static>>
                 + Send
                 + 'static,
         >,
-    ) -> Task<Box<dyn Any + Send + Sync>> {
+    ) -> Task<Box<dyn Any + Send>> {
         let session_id = self.next_session_id();
         spawn_dedicated_thread(session_id, self, move |executor| f(executor))
     }

@@ -113,11 +113,11 @@ pub trait Scheduler: Send + Sync {
             dyn FnOnce(
                     LocalExecutor,
                 )
-                    -> Pin<Box<dyn Future<Output = Box<dyn Any + Send + Sync>> + 'static>>
+                    -> Pin<Box<dyn Future<Output = Box<dyn Any + Send>> + 'static>>
                 + Send
                 + 'static,
         >,
-    ) -> Task<Box<dyn Any + Send + Sync>>;
+    ) -> Task<Box<dyn Any + Send>>;
 
     fn as_test(&self) -> Option<&TestScheduler> {
         None

@@ -503,4 +503,15 @@ mod test {
             "Task should run normally when app is alive"
         );
     }
+
+    #[test]
+    fn task_ext_remains_available_from_gpui_prelude() {
+        use crate::prelude::*;
+
+        let (dispatcher, _background_executor, app) = create_test_app();
+        let task: Task<anyhow::Result<()>> = Task::ready(Ok(()));
+
+        task.detach_and_log_err(&app.borrow());
+        dispatcher.run_until_parked();
+    }
 }

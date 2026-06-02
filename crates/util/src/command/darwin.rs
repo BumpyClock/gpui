@@ -13,6 +13,15 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output};
 use std::ptr;
+use std::sync::{Mutex, MutexGuard};
+
+static FD_SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+fn fd_spawn_lock() -> MutexGuard<'static, ()> {
+    FD_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Stdio {
@@ -376,145 +385,156 @@ fn spawn_posix_spawn(
         .collect();
     envp_ptrs.push(ptr::null_mut());
 
-    let (stdin_read, stdin_write) = match stdin_cfg {
-        Stdio::Piped => {
-            let (r, w) = create_pipe()?;
-            (Some(r), Some(w))
-        }
-        Stdio::Null => {
-            let fd = open_dev_null(libc::O_RDONLY)?;
-            (Some(fd), None)
-        }
-        Stdio::Inherit => (None, None),
-    };
+    let (pid, stdin, stdout, stderr) = {
+        let _lock = fd_spawn_lock();
 
-    let (stdout_read, stdout_write) = match stdout_cfg {
-        Stdio::Piped => {
-            let (r, w) = create_pipe()?;
-            (Some(r), Some(w))
-        }
-        Stdio::Null => {
-            let fd = open_dev_null(libc::O_WRONLY)?;
-            (None, Some(fd))
-        }
-        Stdio::Inherit => (None, None),
-    };
+        let (stdin_read, stdin_write) = match stdin_cfg {
+            Stdio::Piped => {
+                let (r, w) = create_pipe_locked()?;
+                (Some(FdGuard::new(r)), Some(FdGuard::new(w)))
+            }
+            Stdio::Null => {
+                let fd = open_dev_null(libc::O_RDONLY)?;
+                (Some(FdGuard::new(fd)), None)
+            }
+            Stdio::Inherit => (None, None),
+        };
 
-    let (stderr_read, stderr_write) = match stderr_cfg {
-        Stdio::Piped => {
-            let (r, w) = create_pipe()?;
-            (Some(r), Some(w))
-        }
-        Stdio::Null => {
-            let fd = open_dev_null(libc::O_WRONLY)?;
-            (None, Some(fd))
-        }
-        Stdio::Inherit => (None, None),
-    };
+        let (stdout_read, stdout_write) = match stdout_cfg {
+            Stdio::Piped => {
+                let (r, w) = create_pipe_locked()?;
+                (Some(FdGuard::new(r)), Some(FdGuard::new(w)))
+            }
+            Stdio::Null => {
+                let fd = open_dev_null(libc::O_WRONLY)?;
+                (None, Some(FdGuard::new(fd)))
+            }
+            Stdio::Inherit => (None, None),
+        };
 
-    let mut attr: libc::posix_spawnattr_t = ptr::null_mut();
-    let mut file_actions: libc::posix_spawn_file_actions_t = ptr::null_mut();
+        let (stderr_read, stderr_write) = match stderr_cfg {
+            Stdio::Piped => {
+                let (r, w) = create_pipe_locked()?;
+                (Some(FdGuard::new(r)), Some(FdGuard::new(w)))
+            }
+            Stdio::Null => {
+                let fd = open_dev_null(libc::O_WRONLY)?;
+                (None, Some(FdGuard::new(fd)))
+            }
+            Stdio::Inherit => (None, None),
+        };
 
-    unsafe {
-        cvt_nz(libc::posix_spawnattr_init(&mut attr))?;
-        cvt_nz(libc::posix_spawn_file_actions_init(&mut file_actions))?;
+        let mut attr = SpawnAttr::init()?;
+        let mut file_actions = SpawnFileActions::init()?;
 
-        cvt_nz(libc::posix_spawnattr_setflags(
-            &mut attr,
-            libc::POSIX_SPAWN_CLOEXEC_DEFAULT as libc::c_short,
-        ))?;
-
-        cvt_nz(posix_spawnattr_setexceptionports_np(
-            &mut attr,
-            EXC_MASK_ALL,
-            MACH_PORT_NULL,
-            EXCEPTION_DEFAULT as exception_behavior_t,
-            THREAD_STATE_NONE,
-        ))?;
-
-        cvt_nz(posix_spawn_file_actions_addchdir_np(
-            &mut file_actions,
-            current_dir_cstr.as_ptr(),
-        ))?;
-
-        if let Some(fd) = stdin_read {
-            cvt_nz(libc::posix_spawn_file_actions_adddup2(
-                &mut file_actions,
-                fd,
-                libc::STDIN_FILENO,
+        unsafe {
+            cvt_nz(libc::posix_spawnattr_setflags(
+                attr.as_mut_ptr(),
+                libc::POSIX_SPAWN_CLOEXEC_DEFAULT as libc::c_short,
             ))?;
-            cvt_nz(posix_spawn_file_actions_addinherit_np(
-                &mut file_actions,
-                libc::STDIN_FILENO,
-            ))?;
-        }
 
-        if let Some(fd) = stdout_write {
-            cvt_nz(libc::posix_spawn_file_actions_adddup2(
-                &mut file_actions,
-                fd,
-                libc::STDOUT_FILENO,
+            cvt_nz(posix_spawnattr_setexceptionports_np(
+                attr.as_mut_ptr(),
+                EXC_MASK_ALL,
+                MACH_PORT_NULL,
+                EXCEPTION_DEFAULT as exception_behavior_t,
+                THREAD_STATE_NONE,
             ))?;
-            cvt_nz(posix_spawn_file_actions_addinherit_np(
-                &mut file_actions,
-                libc::STDOUT_FILENO,
-            ))?;
-        }
 
-        if let Some(fd) = stderr_write {
-            cvt_nz(libc::posix_spawn_file_actions_adddup2(
-                &mut file_actions,
-                fd,
-                libc::STDERR_FILENO,
+            cvt_nz(posix_spawn_file_actions_addchdir_np(
+                file_actions.as_mut_ptr(),
+                current_dir_cstr.as_ptr(),
             ))?;
-            cvt_nz(posix_spawn_file_actions_addinherit_np(
-                &mut file_actions,
-                libc::STDERR_FILENO,
-            ))?;
+
+            if let Some(fd) = &stdin_read {
+                cvt_nz(libc::posix_spawn_file_actions_adddup2(
+                    file_actions.as_mut_ptr(),
+                    fd.raw(),
+                    libc::STDIN_FILENO,
+                ))?;
+                cvt_nz(posix_spawn_file_actions_addinherit_np(
+                    file_actions.as_mut_ptr(),
+                    libc::STDIN_FILENO,
+                ))?;
+            }
+
+            if let Some(fd) = &stdout_write {
+                cvt_nz(libc::posix_spawn_file_actions_adddup2(
+                    file_actions.as_mut_ptr(),
+                    fd.raw(),
+                    libc::STDOUT_FILENO,
+                ))?;
+                cvt_nz(posix_spawn_file_actions_addinherit_np(
+                    file_actions.as_mut_ptr(),
+                    libc::STDOUT_FILENO,
+                ))?;
+            }
+
+            if let Some(fd) = &stderr_write {
+                cvt_nz(libc::posix_spawn_file_actions_adddup2(
+                    file_actions.as_mut_ptr(),
+                    fd.raw(),
+                    libc::STDERR_FILENO,
+                ))?;
+                cvt_nz(posix_spawn_file_actions_addinherit_np(
+                    file_actions.as_mut_ptr(),
+                    libc::STDERR_FILENO,
+                ))?;
+            }
         }
 
         let mut pid: libc::pid_t = 0;
 
-        let spawn_result = libc::posix_spawnp(
-            &mut pid,
-            program_cstr.as_ptr(),
-            &file_actions,
-            &attr,
-            argv_ptrs.as_ptr(),
-            if envs.is_some() {
-                envp_ptrs.as_ptr()
-            } else {
-                environ
-            },
-        );
+        let spawn_result = unsafe {
+            libc::posix_spawnp(
+                &mut pid,
+                program_cstr.as_ptr(),
+                file_actions.as_ptr(),
+                attr.as_ptr(),
+                argv_ptrs.as_ptr(),
+                if envs.is_some() {
+                    envp_ptrs.as_ptr()
+                } else {
+                    environ
+                },
+            )
+        };
 
-        libc::posix_spawnattr_destroy(&mut attr);
-        libc::posix_spawn_file_actions_destroy(&mut file_actions);
-
-        if let Some(fd) = stdin_read {
-            libc::close(fd);
-        }
-        if let Some(fd) = stdout_write {
-            libc::close(fd);
-        }
-        if let Some(fd) = stderr_write {
-            libc::close(fd);
-        }
-
+        drop(file_actions);
+        drop(attr);
         cvt_nz(spawn_result)?;
 
+        drop(stdin_read);
+        drop(stdout_write);
+        drop(stderr_write);
+
+        (
+            pid,
+            stdin_write.map(FdGuard::into_raw),
+            stdout_read.map(FdGuard::into_raw),
+            stderr_read.map(FdGuard::into_raw),
+        )
+    };
+
+    unsafe {
         Ok(Child {
             pid,
-            stdin: stdin_write.map(|fd| Unblock::new(std::fs::File::from_raw_fd(fd))),
-            stdout: stdout_read.map(|fd| Unblock::new(std::fs::File::from_raw_fd(fd))),
-            stderr: stderr_read.map(|fd| Unblock::new(std::fs::File::from_raw_fd(fd))),
+            stdin: stdin.map(|fd| Unblock::new(std::fs::File::from_raw_fd(fd))),
+            stdout: stdout.map(|fd| Unblock::new(std::fs::File::from_raw_fd(fd))),
+            stderr: stderr.map(|fd| Unblock::new(std::fs::File::from_raw_fd(fd))),
             kill_on_drop,
             status: None,
         })
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn create_pipe() -> io::Result<(libc::c_int, libc::c_int)> {
+    let _lock = fd_spawn_lock();
+    create_pipe_locked()
+}
+
+fn create_pipe_locked() -> io::Result<(libc::c_int, libc::c_int)> {
     let mut fds: [libc::c_int; 2] = [0; 2];
     unsafe {
         let result = libc::pipe(fds.as_mut_ptr());
@@ -541,6 +561,96 @@ fn create_pipe() -> io::Result<(libc::c_int, libc::c_int)> {
         }
 
         Ok((fds[0], fds[1]))
+    }
+}
+
+struct FdGuard {
+    fd: libc::c_int,
+}
+
+impl FdGuard {
+    fn new(fd: libc::c_int) -> Self {
+        Self { fd }
+    }
+
+    fn raw(&self) -> libc::c_int {
+        self.fd
+    }
+
+    fn into_raw(mut self) -> libc::c_int {
+        let fd = self.fd;
+        self.fd = -1;
+        fd
+    }
+}
+
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        if self.fd != -1 {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+}
+
+struct SpawnAttr {
+    raw: libc::posix_spawnattr_t,
+}
+
+impl SpawnAttr {
+    fn init() -> io::Result<Self> {
+        let mut raw = ptr::null_mut();
+        unsafe {
+            cvt_nz(libc::posix_spawnattr_init(&mut raw))?;
+        }
+        Ok(Self { raw })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut libc::posix_spawnattr_t {
+        &mut self.raw
+    }
+
+    fn as_ptr(&self) -> *const libc::posix_spawnattr_t {
+        &self.raw
+    }
+}
+
+impl Drop for SpawnAttr {
+    fn drop(&mut self) {
+        unsafe {
+            libc::posix_spawnattr_destroy(&mut self.raw);
+        }
+    }
+}
+
+struct SpawnFileActions {
+    raw: libc::posix_spawn_file_actions_t,
+}
+
+impl SpawnFileActions {
+    fn init() -> io::Result<Self> {
+        let mut raw = ptr::null_mut();
+        unsafe {
+            cvt_nz(libc::posix_spawn_file_actions_init(&mut raw))?;
+        }
+        Ok(Self { raw })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut libc::posix_spawn_file_actions_t {
+        &mut self.raw
+    }
+
+    fn as_ptr(&self) -> *const libc::posix_spawn_file_actions_t {
+        &self.raw
+    }
+}
+
+impl Drop for SpawnFileActions {
+    fn drop(&mut self) {
+        unsafe {
+            libc::posix_spawn_file_actions_destroy(&mut self.raw);
+        }
     }
 }
 
@@ -579,14 +689,16 @@ fn invalid_input_error() -> io::Error {
 mod tests {
     use super::*;
     use futures_lite::AsyncWriteExt;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     // Verifies that pipes returned by `create_pipe` aren't visible to unrelated
     // child processes spawned via `std::process::Command`. On macOS, `std`
     // uses `posix_spawn` without `POSIX_SPAWN_CLOEXEC_DEFAULT`, so any
-    // non-CLOEXEC fd in the parent leaks into the child. Without
-    // `FD_CLOEXEC` on our pipe fds, an unrelated spawn (a terminal, the crash
-    // handler, etc.) running concurrently with a piped git child would hold
-    // git's stdin write end open and deadlock the git child on `read()`.
+    // non-CLOEXEC fd in the parent leaks into the child. This verifies the
+    // post-`create_pipe` invariant; the module lock covers the earlier
+    // pipe-to-FIOCLEX window for participating spawns.
     #[test]
     fn test_create_pipe_not_inherited_by_unrelated_spawn() {
         let (read_fd, write_fd) = create_pipe().expect("create_pipe failed");
@@ -621,6 +733,78 @@ mod tests {
             stdout,
             format!("{read_fd} WAS NOT INHERITED\n{write_fd} WAS NOT INHERITED\nDONE\n")
         );
+    }
+
+    #[test]
+    fn test_participating_spawn_waits_for_fd_lock() {
+        let guard = fd_spawn_lock();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            started_tx.send(()).expect("failed to signal worker start");
+            let output =
+                smol::block_on(async { Command::new("/bin/echo").arg("ready").output().await });
+            done_tx.send(output).expect("failed to send command output");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker did not start");
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "participating spawn completed while fd lock was held"
+        );
+
+        drop(guard);
+
+        let output = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker did not complete after fd lock was released")
+            .expect("failed to run command");
+        worker.join().expect("worker thread panicked");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready\n");
+    }
+
+    #[test]
+    fn test_concurrent_piped_commands_complete_without_fd_inheritance_deadlock() {
+        let mut threads = Vec::new();
+
+        for thread_index in 0..4 {
+            threads.push(thread::spawn(move || {
+                for iteration in 0..20 {
+                    smol::block_on(async move {
+                        let input = format!("thread {thread_index} iteration {iteration}\n");
+                        let mut child = Command::new("/bin/cat")
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .spawn()
+                            .expect("failed to spawn cat");
+
+                        let mut stdin = child.stdin.take().expect("stdin should be piped");
+                        stdin
+                            .write_all(input.as_bytes())
+                            .await
+                            .expect("failed to write to stdin");
+                        stdin.close().await.expect("failed to close stdin");
+                        drop(stdin);
+
+                        let output = child.output().await.expect("failed to read output");
+                        assert!(output.status.success());
+                        assert_eq!(output.stdout, input.as_bytes());
+                    });
+                }
+            }));
+        }
+
+        for thread in threads {
+            thread.join().expect("worker thread panicked");
+        }
     }
 
     #[test]
