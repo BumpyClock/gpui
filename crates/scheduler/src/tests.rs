@@ -73,6 +73,82 @@ fn test_scheduler_drops_with_stalled_detached_background_task() {
 }
 
 #[test]
+fn test_scheduler_drops_with_queued_detached_foreground_task() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let weak_scheduler = Arc::downgrade(&scheduler);
+
+    scheduler.foreground().spawn(async {}).detach();
+
+    drop(scheduler);
+    assert!(weak_scheduler.upgrade().is_none());
+}
+
+#[test]
+fn test_scheduler_drops_with_queued_detached_background_task() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let weak_scheduler = Arc::downgrade(&scheduler);
+
+    scheduler.background().spawn(async {}).detach();
+
+    drop(scheduler);
+    assert!(weak_scheduler.upgrade().is_none());
+}
+
+#[test]
+fn test_detached_foreground_task_wakes_after_executor_handle_drop() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let completed = Rc::new(Cell::new(false));
+    let (sender, receiver) = oneshot::channel::<()>();
+
+    let foreground = scheduler.foreground();
+    foreground
+        .spawn({
+            let completed = completed.clone();
+            async move {
+                receiver.await.ok();
+                completed.set(true);
+            }
+        })
+        .detach();
+    drop(foreground);
+
+    scheduler.run();
+    assert!(!completed.get());
+
+    sender.send(()).unwrap();
+    scheduler.run();
+    assert!(completed.get());
+}
+
+#[test]
+fn test_detached_background_task_wakes_after_executor_handle_drop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let completed = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = oneshot::channel::<()>();
+
+    let background = scheduler.background();
+    background
+        .spawn({
+            let completed = completed.clone();
+            async move {
+                receiver.await.ok();
+                completed.store(true, Ordering::SeqCst);
+            }
+        })
+        .detach();
+    drop(background);
+
+    scheduler.run();
+    assert!(!completed.load(Ordering::SeqCst));
+
+    sender.send(()).unwrap();
+    scheduler.run();
+    assert!(completed.load(Ordering::SeqCst));
+}
+
+#[test]
 fn test_foreground_ordering() {
     let mut traces = HashSet::new();
 
@@ -924,5 +1000,68 @@ fn test_spawn_dedicated_detached_child_runs_after_root_completes() {
     assert!(
         child_ran,
         "detached child must complete after the root, not be cancelled with it"
+    );
+}
+
+#[test]
+fn test_scheduler_drops_with_stalled_spawn_dedicated_detached_child() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let weak_scheduler = Arc::downgrade(&scheduler);
+    let (sender, receiver) = oneshot::channel::<()>();
+
+    let task = scheduler
+        .background()
+        .spawn_dedicated(move |executor| async move {
+            executor
+                .spawn(async move {
+                    receiver.await.ok();
+                })
+                .detach();
+        });
+
+    scheduler.run();
+    assert!(task.is_ready());
+    drop(task);
+
+    drop(scheduler);
+    assert!(weak_scheduler.upgrade().is_none());
+    drop(sender);
+}
+
+#[test]
+fn test_spawn_dedicated_detached_child_wakes_after_root_task_completes() {
+    use parking_lot::Mutex;
+
+    let child_ran = TestScheduler::once(async |scheduler| {
+        let child_ran = Arc::new(Mutex::new(false));
+        let (resume_tx, resume_rx) = oneshot::channel::<()>();
+
+        let task = {
+            let child_ran = child_ran.clone();
+            scheduler
+                .background()
+                .spawn_dedicated(move |executor| async move {
+                    executor
+                        .spawn(async move {
+                            let _ = resume_rx.await;
+                            *child_ran.lock() = true;
+                        })
+                        .detach();
+                })
+        };
+
+        task.await;
+        scheduler.run();
+        assert!(!*child_ran.lock());
+
+        let _ = resume_tx.send(());
+        scheduler.run();
+
+        *child_ran.lock()
+    });
+
+    assert!(
+        child_ran,
+        "detached dedicated child must wake after the root task has completed"
     );
 }

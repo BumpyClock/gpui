@@ -161,6 +161,8 @@ impl TestScheduler {
     /// Create a local executor for this scheduler.
     pub fn foreground(self: &Arc<Self>) -> LocalExecutor {
         let session_id = self.allocate_session_id();
+        // Detached local tasks can leave runnables or wakers behind; scheduling
+        // must not keep this test scheduler alive after callers drop it.
         let scheduler = Arc::downgrade(self);
         LocalExecutor::new(session_id, self.clone(), move |runnable| {
             if let Some(scheduler) = scheduler.upgrade() {
@@ -653,6 +655,8 @@ impl Scheduler for TestScheduler {
         >,
     ) -> Task<Box<dyn Any + Send>> {
         let session_id = self.allocate_session_id();
+        // Dedicated local tasks use the same weak scheduling contract as
+        // foreground tasks so detached children cannot retain the scheduler.
         let scheduler = Arc::downgrade(&self);
         let executor = LocalExecutor::new(session_id, self, move |runnable| {
             if let Some(scheduler) = scheduler.upgrade() {

@@ -44,6 +44,8 @@ impl PlatformScheduler {
 
     pub fn foreground_executor(self: &Arc<Self>) -> LocalExecutor {
         let session_id = self.next_session_id();
+        // Detached local tasks can leave runnables or wakers behind; scheduling
+        // must not keep the platform scheduler alive after callers drop it.
         let scheduler = Arc::downgrade(self);
         LocalExecutor::new(session_id, self.clone(), move |runnable| {
             if let Some(scheduler) = scheduler.upgrade() {

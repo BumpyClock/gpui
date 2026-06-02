@@ -174,6 +174,9 @@ impl BackgroundExecutor {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        // Keep the schedule callback from retaining the scheduler through
+        // detached tasks, queued runnables, or pending wakers after callers
+        // intentionally drop the scheduler.
         let scheduler = Arc::downgrade(&self.scheduler);
         let location = Location::caller();
         let (runnable, task) = async_task::Builder::new()
