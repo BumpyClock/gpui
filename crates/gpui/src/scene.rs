@@ -339,7 +339,7 @@ pub enum Primitive {
 impl Primitive {
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
-            Primitive::Shadow(shadow) if shadow.inset == 1 => &shadow.element_bounds,
+            Primitive::Shadow(shadow) if shadow.inset != 0 => &shadow.element_bounds,
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::BackdropBlur(blur) => &blur.bounds,
             Primitive::Quad(quad) => &quad.bounds,
@@ -1188,5 +1188,28 @@ mod tests {
 
         assert_eq!(next_scene.paint_operations.len(), 2);
         assert_eq!(next_scene.retained_layers[0].paint_range, 1..2);
+    }
+
+    #[test]
+    fn shadow_bounds_treats_any_nonzero_inset_as_inset() {
+        let bounds = test_bounds();
+        let element_bounds = Bounds::new(
+            point(ScaledPixels(1.0), ScaledPixels(1.0)),
+            size(ScaledPixels(2.0), ScaledPixels(2.0)),
+        );
+        let shadow = Primitive::Shadow(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.0),
+            bounds,
+            corner_radii: Corners::all(ScaledPixels(0.0)),
+            content_mask: ContentMask { bounds },
+            color: Hsla::default(),
+            element_bounds,
+            element_corner_radii: Corners::all(ScaledPixels(0.0)),
+            inset: 2,
+            pad: 0,
+        });
+
+        assert_eq!(shadow.bounds(), &element_bounds);
     }
 }

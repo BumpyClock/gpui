@@ -2070,7 +2070,7 @@ impl X11ClientState {
         let Some(invisible_cursor) = self.get_or_create_invisible_cursor() else {
             return;
         };
-        check_reply(
+        let hide_result = check_reply(
             || "Failed to hide cursor",
             self.xcb_connection.change_window_attributes(
                 focused_window,
@@ -2080,9 +2080,17 @@ impl X11ClientState {
                 },
             ),
         )
+        .and_then(|()| {
+            self.xcb_connection
+                .flush()
+                .map(|_| ())
+                .map_err(handle_connection_error)
+                .context("X11 flush failed")
+        })
         .log_err();
-        self.xcb_connection.flush().log_err();
-        self.cursor_hidden_window = Some(focused_window);
+        if hide_result.is_some() {
+            self.cursor_hidden_window = Some(focused_window);
+        }
     }
 
     fn restore_cursor_after_hide(&mut self) {

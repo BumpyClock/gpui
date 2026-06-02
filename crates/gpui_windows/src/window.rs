@@ -1113,6 +1113,11 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        if self.state.a11y.borrow().is_some() {
+            log::warn!("Windows accessibility adapter already initialized for window");
+            return;
+        }
+
         let action_handler = A11yActionHandler(callbacks.action);
         let is_focused = unsafe { GetForegroundWindow() } == self.0.hwnd;
 

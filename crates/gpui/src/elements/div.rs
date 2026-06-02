@@ -1944,17 +1944,6 @@ impl Interactivity {
 
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
             window.set_focus_handle(focus_handle, cx);
-
-            if window.a11y.is_active() {
-                if let Some(node_id) = current_a11y_node_id {
-                    if has_current_a11y_node {
-                        window.a11y.focus_ids.insert(node_id, focus_handle.id);
-                        if focus_handle.is_focused(window) {
-                            window.a11y.nodes.set_focus(node_id);
-                        }
-                    }
-                }
-            }
         }
 
         window.with_optional_element_state::<InteractiveElementState, _>(
@@ -2006,6 +1995,12 @@ impl Interactivity {
                         );
                         if updated_bounds {
                             window.a11y.node_bounds.insert(node_id, translated_bounds);
+                        }
+                        if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
+                            window.a11y.focus_ids.insert(node_id, focus_handle.id);
+                            if focus_handle.is_focused(window) {
+                                window.a11y.nodes.set_focus(node_id);
+                            }
                         }
                     }
                 }
@@ -4085,6 +4080,7 @@ mod tests {
     fn a11y_display_none_role_div_is_absent_from_tree(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
         let focus_handle = cx.update(|_, cx| cx.focus_handle());
+        cx.update(|window, cx| focus_handle.focus(window, cx));
 
         let update = draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
             let focus_handle = focus_handle.clone();
@@ -4102,6 +4098,7 @@ mod tests {
         assert!(node_with_role(&update, accesskit::Role::Button).is_none());
         assert!(node_with_role(&update, accesskit::Role::Label).is_none());
         assert_eq!(root_node(&update).children(), &[]);
+        assert_eq!(update.focus, crate::window::a11y::ROOT_NODE_ID);
         assert_tree_has_no_missing_children(&update);
 
         cx.update(|window, _| {

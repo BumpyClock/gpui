@@ -344,7 +344,12 @@ impl rwh::HasDisplayHandle for X11Window {
         };
         let screen_id = {
             let state = self.0.state.borrow();
-            u64::from(state.display.id()) as i32
+            let display_id = u64::from(state.display.id());
+            let Ok(screen_id) = i32::try_from(display_id) else {
+                log::error!("X11 display id {display_id} cannot fit into XCB screen id");
+                return Err(rwh::HandleError::Unavailable);
+            };
+            screen_id
         };
         let handle = rwh::XcbDisplayHandle::new(Some(non_zero), screen_id);
         Ok(unsafe { rwh::DisplayHandle::borrow_raw(handle.into()) })

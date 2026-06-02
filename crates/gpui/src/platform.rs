@@ -335,9 +335,23 @@ impl From<u64> for DisplayId {
     }
 }
 
+impl From<u32> for DisplayId {
+    fn from(id: u32) -> Self {
+        Self(u64::from(id))
+    }
+}
+
 impl From<DisplayId> for u64 {
     fn from(id: DisplayId) -> Self {
         id.0
+    }
+}
+
+impl TryFrom<DisplayId> for u32 {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(id: DisplayId) -> Result<Self, Self::Error> {
+        Self::try_from(id.0)
     }
 }
 

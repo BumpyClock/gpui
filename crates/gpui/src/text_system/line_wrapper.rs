@@ -216,6 +216,10 @@ impl LineWrapper {
         runs: &'a [TextRun],
         truncate_from: TruncateFrom,
     ) -> (SharedString, Cow<'a, [TextRun]>) {
+        if max_lines == 0 {
+            return (SharedString::from(""), Cow::Owned(Vec::new()));
+        }
+
         if max_lines <= 1 {
             return self.truncate_single_wrapped_line(
                 text,
@@ -1292,6 +1296,19 @@ mod tests {
             "{truncated:?} wrapped into {wrapped_line_count} lines"
         );
         assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn test_wrapped_truncation_zero_lines_returns_empty_text_and_runs() {
+        let mut wrapper = build_wrapper();
+        let text = "aa bbbbbb cccccc";
+        let runs = generate_test_runs(&[2, 1, text.len() - 3]);
+
+        let (result, result_runs) =
+            wrapper.truncate_wrapped_line(text.into(), px(72.), 0, "…", &runs, TruncateFrom::End);
+
+        assert_eq!(result, "");
+        assert!(result_runs.is_empty());
     }
 
     #[test]

@@ -802,9 +802,6 @@ fn pick_covering_slot(
     fallback_chain: &[(FontId, SharedString)],
     covers: &impl Fn(FontId, char) -> bool,
 ) -> Option<usize> {
-    if grapheme.is_ascii() {
-        return None;
-    }
     if slot_covers_grapheme(primary, grapheme, covers) {
         return None;
     }
@@ -1114,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    fn run_spans_keep_ascii_graphemes_on_primary_even_when_fallback_covers() {
+    fn run_spans_use_fallback_for_missing_ascii_graphemes() {
         let primary = fid(0);
         let fallback_chain = chain(&[1]);
         let covers = |id: FontId, ch: char| {
@@ -1124,7 +1121,10 @@ mod tests {
 
         let spans = compute_run_spans(text, 0, text.len(), primary, &fallback_chain, &covers);
 
-        assert_eq!(spans.as_slice(), &[span(0, text.len(), None, primary)]);
+        assert_eq!(
+            spans.as_slice(),
+            &[span(0, 1, None, primary), span(1, 2, Some(0), fid(1))]
+        );
     }
 
     #[test]

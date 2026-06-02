@@ -558,7 +558,7 @@ impl TextLayout {
                 }
 
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
-                let (text, runs) = if truncate_width.is_some() {
+                let (text, runs) = if let Some(truncate_width) = truncate_width {
                     if let Some(max_lines) = text_style.line_clamp
                         && let Some(wrap_width) = wrap_width
                     {
@@ -573,7 +573,7 @@ impl TextLayout {
                     } else {
                         line_wrapper.truncate_line(
                             text.clone(),
-                            truncate_width.unwrap(),
+                            truncate_width,
                             &truncation_affix,
                             &runs,
                             truncate_from,

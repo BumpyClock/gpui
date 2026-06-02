@@ -171,16 +171,22 @@ fn test_foreground_task_can_hold_mut_borrow_across_await() {
     TestScheduler::once(async |scheduler| {
         let foreground = scheduler.foreground();
         let (sender, mut receiver) = mpsc::unbounded::<()>();
+        let (completion_sender, completion_receiver) = oneshot::channel::<()>();
 
         foreground
             .spawn(async move {
                 receiver.next().await;
+                completion_sender.send(()).ok();
             })
             .detach();
 
         scheduler.run();
         sender.unbounded_send(()).unwrap();
         scheduler.run();
+        assert!(
+            matches!(completion_receiver.now_or_never(), Some(Ok(()))),
+            "foreground task should resume after receiving from the channel"
+        );
     });
 }
 

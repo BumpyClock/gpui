@@ -749,7 +749,7 @@ impl ListState {
         }
 
         let scroll_top = self.logical_scroll_top();
-        if ix < scroll_top.item_ix {
+        if scroll_top.item_ix < self.item_count() && ix < scroll_top.item_ix {
             // Rows before the logical scroll top have no item bounds, but
             // their position relative to the viewport is known from scroll state.
             return Some(true);
@@ -768,7 +768,7 @@ impl ListState {
         }
 
         let scroll_top = self.logical_scroll_top();
-        if ix < scroll_top.item_ix {
+        if scroll_top.item_ix < self.item_count() && ix < scroll_top.item_ix {
             // Rows before the logical scroll top have no item bounds, but
             // their position relative to the viewport is known from scroll state.
             return Some(false);
@@ -1782,8 +1782,8 @@ mod test {
         state.scroll_to_end();
 
         assert_eq!(state.logical_scroll_top().item_ix, state.item_count());
-        assert_eq!(state.item_is_above_viewport(0), Some(true));
-        assert_eq!(state.item_is_below_viewport(0), Some(false));
+        assert_eq!(state.item_is_above_viewport(0), None);
+        assert_eq!(state.item_is_below_viewport(0), None);
     }
 
     #[gpui::test]

@@ -730,7 +730,7 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
   }
 
   if (shadow.inset != 0u) {
-    alpha = 1. - alpha;
+    alpha = saturate(1. - alpha);
     float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
                                       shadow.element_corner_radii);
     alpha *= saturate(0.5 - element_distance);
