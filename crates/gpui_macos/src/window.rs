@@ -48,7 +48,8 @@ use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
+    collections::HashMap,
     ffi::{CStr, c_void},
     mem,
     ops::Range,
@@ -74,6 +75,11 @@ static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
+
+thread_local! {
+    static A11Y_ADAPTERS: RefCell<HashMap<usize, accesskit_macos::SubclassingAdapter>> =
+        RefCell::new(HashMap::new());
+}
 
 #[allow(non_upper_case_globals)]
 const NSWindowStyleMaskNonactivatingPanel: NSWindowStyleMask =
@@ -442,7 +448,6 @@ struct MacWindowState {
     activated_least_once: bool,
     closed: Arc<AtomicBool>,
     cursor_visible: Arc<AtomicBool>,
-    accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
 }
@@ -594,6 +599,10 @@ impl MacWindowState {
     }
 }
 
+// AppKit callbacks and GPUI foreground tasks access this state on the main
+// thread. Background tasks only hold the mutex long enough to check counters and
+// call sendable callbacks. Main-thread-only objects, such as AccessKit's macOS
+// adapter, must stay out of this struct.
 unsafe impl Send for MacWindowState {}
 
 pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>);
@@ -770,7 +779,6 @@ impl MacWindow {
                 activated_least_once: false,
                 closed: Arc::new(AtomicBool::new(false)),
                 cursor_visible,
-                accesskit_adapter: None,
                 sheet_parent: None,
             })));
 
@@ -1009,6 +1017,7 @@ impl Drop for MacWindow {
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
         this.display_link.take();
+        remove_a11y_adapter(window);
         unsafe {
             this.native_window.setDelegate_(nil);
         }
@@ -1739,8 +1748,7 @@ impl PlatformWindow for MacWindow {
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
-        let mut lock = self.0.lock();
-
+        let window = self.0.lock().native_window;
         let activation_handler = A11yActivationHandler {
             callback: callbacks.activation,
         };
@@ -1748,22 +1756,19 @@ impl PlatformWindow for MacWindow {
 
         let adapter = unsafe {
             accesskit_macos::SubclassingAdapter::for_window(
-                lock.native_window as *mut c_void,
+                window as *mut c_void,
                 activation_handler,
                 action_handler,
             )
         };
 
-        lock.accesskit_adapter = Some(adapter);
+        set_a11y_adapter(window, adapter);
     }
 
     fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
-        let events = {
-            let mut lock = self.0.lock();
-            lock.accesskit_adapter
-                .as_mut()
-                .and_then(|adapter| adapter.update_if_active(|| tree_update))
-        };
+        let window = self.0.lock().native_window;
+        let events =
+            with_a11y_adapter(window, |adapter| adapter.update_if_active(|| tree_update)).flatten();
         if let Some(events) = events {
             events.raise();
         }
@@ -1851,8 +1856,45 @@ unsafe fn get_window_state(object: &Object) -> Arc<Mutex<MacWindowState>> {
 unsafe fn drop_window_state(object: &Object) {
     unsafe {
         let raw: *mut c_void = *object.get_ivar(WINDOW_STATE_IVAR);
-        Arc::from_raw(raw as *mut Mutex<MacWindowState>);
+        let window_state = Arc::from_raw(raw as *mut Mutex<MacWindowState>);
+        remove_a11y_adapter(window_state.lock().native_window);
     }
+}
+
+fn a11y_adapter_key(window: id) -> usize {
+    window as usize
+}
+
+fn set_a11y_adapter(window: id, adapter: accesskit_macos::SubclassingAdapter) {
+    debug_assert_main_thread();
+    A11Y_ADAPTERS.with_borrow_mut(|adapters| {
+        adapters.insert(a11y_adapter_key(window), adapter);
+    });
+}
+
+fn remove_a11y_adapter(window: id) {
+    debug_assert_main_thread();
+    A11Y_ADAPTERS.with_borrow_mut(|adapters| {
+        // This is intentionally idempotent: both MacWindow::drop and Objective-C
+        // dealloc paths can observe teardown, depending on who releases last.
+        adapters.remove(&a11y_adapter_key(window));
+    });
+}
+
+fn with_a11y_adapter<T>(
+    window: id,
+    f: impl FnOnce(&mut accesskit_macos::SubclassingAdapter) -> T,
+) -> Option<T> {
+    debug_assert_main_thread();
+    A11Y_ADAPTERS.with_borrow_mut(|adapters| adapters.get_mut(&a11y_adapter_key(window)).map(f))
+}
+
+fn debug_assert_main_thread() {
+    let is_main_thread: BOOL = unsafe { msg_send![class!(NSThread), isMainThread] };
+    debug_assert_eq!(
+        is_main_thread, YES,
+        "macOS accessibility adapters must stay on the main thread"
+    );
 }
 
 extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
@@ -2299,12 +2341,11 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     let executor = lock.foreground_executor.clone();
     drop(lock);
 
-    let a11y_events = {
-        let mut lock = window_state.lock();
-        lock.accesskit_adapter
-            .as_mut()
-            .and_then(|adapter| adapter.update_view_focus_state(is_active))
-    };
+    let native_window = window_state.lock().native_window;
+    let a11y_events = with_a11y_adapter(native_window, |adapter| {
+        adapter.update_view_focus_state(is_active)
+    })
+    .flatten();
     if let Some(events) = a11y_events {
         events.raise();
     }
