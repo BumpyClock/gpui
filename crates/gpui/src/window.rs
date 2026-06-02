@@ -5400,6 +5400,11 @@ impl Window {
                     matched = true;
                 }
             }
+            if let Some(mut current_listeners) =
+                self.a11y.action_listeners.remove(&request.target_node)
+            {
+                listeners.append(&mut current_listeners);
+            }
             self.a11y
                 .action_listeners
                 .insert(request.target_node, listeners);

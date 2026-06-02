@@ -3997,6 +3997,60 @@ mod tests {
         assert_eq!(action_count.get(), 1);
     }
 
+    #[gpui::test]
+    fn a11y_listener_registered_during_dispatch_survives_for_same_target(cx: &mut TestAppContext) {
+        let original_count = Rc::new(Cell::new(0));
+        let registered_count = Rc::new(Cell::new(0));
+        let node_id = accesskit::NodeId(1);
+        let cx = cx.add_empty_window();
+
+        cx.update(|window, _| {
+            let original_count = original_count.clone();
+            let registered_count = registered_count.clone();
+            window.on_a11y_action(node_id, accesskit::Action::Click, move |_, window, _| {
+                original_count.set(original_count.get() + 1);
+                let registered_count = registered_count.clone();
+                window.on_a11y_action(node_id, accesskit::Action::Click, move |_, _, _| {
+                    registered_count.set(registered_count.get() + 1);
+                });
+            });
+        });
+
+        cx.update(|window, cx| {
+            window.handle_a11y_action(
+                accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: node_id,
+                    data: None,
+                },
+                cx,
+            );
+        });
+
+        assert_eq!(original_count.get(), 1);
+        assert_eq!(registered_count.get(), 0);
+        assert_eq!(
+            cx.update(|window, _| window.a11y.action_listeners[&node_id].len()),
+            2
+        );
+
+        cx.update(|window, cx| {
+            window.handle_a11y_action(
+                accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: node_id,
+                    data: None,
+                },
+                cx,
+            );
+        });
+
+        assert_eq!(original_count.get(), 2);
+        assert_eq!(registered_count.get(), 1);
+    }
+
     #[test]
     fn key_context_accepts_try_into_errors_without_display() {
         struct KeyContextSource;
