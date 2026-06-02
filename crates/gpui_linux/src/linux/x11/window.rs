@@ -2,6 +2,9 @@ use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
+use crate::linux::accesskit_shims::{
+    TrivialActionHandler, TrivialActivationHandler, TrivialDeactivationHandler,
+};
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     OverlayInputMode, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
@@ -1919,33 +1922,5 @@ impl PlatformWindow for X11Window {
         if let Some(adapter) = state.accesskit_adapter.as_mut() {
             adapter.set_root_window_bounds(outer, inner);
         }
-    }
-}
-
-struct TrivialActivationHandler {
-    callback: Box<dyn Fn() -> Option<accesskit::TreeUpdate> + Send + 'static>,
-}
-
-impl accesskit::ActivationHandler for TrivialActivationHandler {
-    fn request_initial_tree(&mut self) -> Option<accesskit::TreeUpdate> {
-        (self.callback)()
-    }
-}
-
-struct TrivialActionHandler(Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>);
-
-impl accesskit::ActionHandler for TrivialActionHandler {
-    fn do_action(&mut self, request: accesskit::ActionRequest) {
-        (self.0)(request);
-    }
-}
-
-struct TrivialDeactivationHandler {
-    callback: Box<dyn Fn() + Send + 'static>,
-}
-
-impl accesskit::DeactivationHandler for TrivialDeactivationHandler {
-    fn deactivate_accessibility(&mut self) {
-        (self.callback)();
     }
 }

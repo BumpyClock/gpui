@@ -1,6 +1,7 @@
 use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, px};
 use collections::HashMap;
 use std::{borrow::Cow, iter, sync::Arc};
+use unicode_general_category::{GeneralCategory, get_general_category};
 
 /// Determines whether to truncate text from the start or end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -585,8 +586,21 @@ fn trim_end_before_truncation_affix<'a>(text: &'a str, truncation_affix: &str) -
     if truncation_affix.is_empty() {
         text
     } else {
-        text.trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
+        text.trim_end_matches(|c: char| c.is_whitespace() || is_truncation_boundary_punctuation(c))
     }
+}
+
+fn is_truncation_boundary_punctuation(c: char) -> bool {
+    matches!(
+        get_general_category(c),
+        GeneralCategory::ConnectorPunctuation
+            | GeneralCategory::DashPunctuation
+            | GeneralCategory::OpenPunctuation
+            | GeneralCategory::ClosePunctuation
+            | GeneralCategory::InitialPunctuation
+            | GeneralCategory::FinalPunctuation
+            | GeneralCategory::OtherPunctuation
+    )
 }
 
 fn runs_for_prefix(runs: &[TextRun], prefix_len: usize) -> Vec<TextRun> {
@@ -966,6 +980,52 @@ mod tests {
         perform_test(&mut wrapper, "hello world", "hello…", "…", px(70.));
         perform_test(&mut wrapper, "hello, world", "hello…", "…", px(70.));
         perform_test(&mut wrapper, "hello, world", "hello, ", "", px(70.));
+    }
+
+    #[test]
+    fn test_truncate_line_end_trims_unicode_punctuation_before_affix() {
+        let mut wrapper = build_wrapper();
+
+        for text in ["hello— world", "hello، world"] {
+            let dummy_runs = generate_test_runs(&[text.len()]);
+            let line_width = text
+                .chars()
+                .take(6)
+                .chain("…".chars())
+                .map(|c| wrapper.width_for_char(c))
+                .fold(px(0.), |width, char_width| width + char_width)
+                + px(1.);
+
+            let (result, result_runs) =
+                wrapper.truncate_line(text.into(), line_width, "…", &dummy_runs, TruncateFrom::End);
+
+            assert_eq!(result, "hello…");
+            assert_eq!(
+                result_runs.iter().map(|run| run.len).sum::<usize>(),
+                result.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_truncate_line_end_preserves_unicode_punctuation_without_affix() {
+        let mut wrapper = build_wrapper();
+        let text = "hello— world";
+        let dummy_runs = generate_test_runs(&[text.len()]);
+        let line_width = "hello—"
+            .chars()
+            .map(|c| wrapper.width_for_char(c))
+            .fold(px(0.), |width, char_width| width + char_width)
+            + px(1.);
+
+        let (result, result_runs) =
+            wrapper.truncate_line(text.into(), line_width, "", &dummy_runs, TruncateFrom::End);
+
+        assert_eq!(result, "hello—");
+        assert_eq!(
+            result_runs.iter().map(|run| run.len).sum::<usize>(),
+            result.len()
+        );
     }
 
     #[test]

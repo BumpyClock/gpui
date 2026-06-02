@@ -28,6 +28,7 @@ wayland = [
     "wayland-protocols-plasma",
     "wayland-protocols-wlr",
     "filedescriptor",
+    "wgpu",
     "xkbcommon",
     "open",
     "gpui/wayland",
@@ -93,6 +94,7 @@ font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "11052312
 bitflags = { workspace = true, optional = true }
 filedescriptor = { version = "0.8.2", optional = true }
 open = { version = "5.2.0", optional = true }
+wgpu = { workspace = true, optional = true }
 xkbcommon = { version = "0.8.0", features = ["wayland", "x11"], optional = true }
 
 # Screen capture

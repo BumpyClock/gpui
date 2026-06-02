@@ -71,6 +71,7 @@ raw-window-handle = "0.6"
 refineable.workspace = true
 regex.workspace = true
 scheduler.workspace = true
+unicode-general-category.workspace = true
 resvg = { version = "0.45.0", default-features = false, features = [
   "text",
   "system-fonts",

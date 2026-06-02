@@ -27,6 +27,9 @@ use wayland_protocols::{
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
+use crate::linux::accesskit_shims::{
+    TrivialActionHandler, TrivialActivationHandler, TrivialDeactivationHandler,
+};
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
@@ -1499,34 +1502,6 @@ impl PlatformWindow for WaylandWindow {
 
     fn a11y_update_window_bounds(&self) {
         // Wayland does not expose window position.
-    }
-}
-
-struct TrivialActivationHandler {
-    callback: Box<dyn Fn() -> Option<accesskit::TreeUpdate> + Send + 'static>,
-}
-
-impl accesskit::ActivationHandler for TrivialActivationHandler {
-    fn request_initial_tree(&mut self) -> Option<accesskit::TreeUpdate> {
-        (self.callback)()
-    }
-}
-
-struct TrivialActionHandler(Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>);
-
-impl accesskit::ActionHandler for TrivialActionHandler {
-    fn do_action(&mut self, request: accesskit::ActionRequest) {
-        (self.0)(request);
-    }
-}
-
-struct TrivialDeactivationHandler {
-    callback: Box<dyn Fn() + Send + 'static>,
-}
-
-impl accesskit::DeactivationHandler for TrivialDeactivationHandler {
-    fn deactivate_accessibility(&mut self) {
-        (self.callback)();
     }
 }
 

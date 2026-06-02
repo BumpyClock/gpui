@@ -1126,97 +1126,97 @@ pub trait StatefulInteractiveElement: InteractiveElement {
             role != accesskit::Role::GenericContainer,
             "GenericContainer is filtered out of the a11y tree and has no effect"
         );
-        self.interactivity().override_role = Some(role);
+        self.interactivity().a11y_state_mut().override_role = Some(role);
         self
     }
 
     /// Set the accessible label for this element.
     fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
-        self.interactivity().aria_label = Some(label.into());
+        self.interactivity().a11y_state_mut().aria_label = Some(label.into());
         self
     }
 
     /// Set the selected state for this element.
     fn aria_selected(mut self, selected: bool) -> Self {
-        self.interactivity().aria_selected = Some(selected);
+        self.interactivity().a11y_state_mut().aria_selected = Some(selected);
         self
     }
 
     /// Set the expanded state for this element.
     fn aria_expanded(mut self, expanded: bool) -> Self {
-        self.interactivity().aria_expanded = Some(expanded);
+        self.interactivity().a11y_state_mut().aria_expanded = Some(expanded);
         self
     }
 
     /// Set the toggled state for this element.
     fn aria_toggled(mut self, toggled: accesskit::Toggled) -> Self {
-        self.interactivity().aria_toggled = Some(toggled);
+        self.interactivity().a11y_state_mut().aria_toggled = Some(toggled);
         self
     }
 
     /// Set the numeric value for this element.
     fn aria_numeric_value(mut self, value: f64) -> Self {
-        self.interactivity().aria_numeric_value = Some(value);
+        self.interactivity().a11y_state_mut().aria_numeric_value = Some(value);
         self
     }
 
     /// Set the minimum numeric value for this element.
     fn aria_min_numeric_value(mut self, value: f64) -> Self {
-        self.interactivity().aria_min_numeric_value = Some(value);
+        self.interactivity().a11y_state_mut().aria_min_numeric_value = Some(value);
         self
     }
 
     /// Set the maximum numeric value for this element.
     fn aria_max_numeric_value(mut self, value: f64) -> Self {
-        self.interactivity().aria_max_numeric_value = Some(value);
+        self.interactivity().a11y_state_mut().aria_max_numeric_value = Some(value);
         self
     }
 
     /// Set the orientation of this element.
     fn aria_orientation(mut self, orientation: accesskit::Orientation) -> Self {
-        self.interactivity().aria_orientation = Some(orientation);
+        self.interactivity().a11y_state_mut().aria_orientation = Some(orientation);
         self
     }
 
     /// Set the heading level of this element.
     fn aria_level(mut self, level: usize) -> Self {
-        self.interactivity().aria_level = Some(level);
+        self.interactivity().a11y_state_mut().aria_level = Some(level);
         self
     }
 
     /// Set the position in set of this element.
     fn aria_position_in_set(mut self, position: usize) -> Self {
-        self.interactivity().aria_position_in_set = Some(position);
+        self.interactivity().a11y_state_mut().aria_position_in_set = Some(position);
         self
     }
 
     /// Set the size of set for this element.
     fn aria_size_of_set(mut self, size: usize) -> Self {
-        self.interactivity().aria_size_of_set = Some(size);
+        self.interactivity().a11y_state_mut().aria_size_of_set = Some(size);
         self
     }
 
     /// Set the row index for this element.
     fn aria_row_index(mut self, index: usize) -> Self {
-        self.interactivity().aria_row_index = Some(index);
+        self.interactivity().a11y_state_mut().aria_row_index = Some(index);
         self
     }
 
     /// Set the column index for this element.
     fn aria_column_index(mut self, index: usize) -> Self {
-        self.interactivity().aria_column_index = Some(index);
+        self.interactivity().a11y_state_mut().aria_column_index = Some(index);
         self
     }
 
     /// Set the row count for this element.
     fn aria_row_count(mut self, count: usize) -> Self {
-        self.interactivity().aria_row_count = Some(count);
+        self.interactivity().a11y_state_mut().aria_row_count = Some(count);
         self
     }
 
     /// Set the column count for this element.
     fn aria_column_count(mut self, count: usize) -> Self {
-        self.interactivity().aria_column_count = Some(count);
+        self.interactivity().a11y_state_mut().aria_column_count = Some(count);
         self
     }
 
@@ -1227,7 +1227,8 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         listener: impl FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.interactivity()
-            .a11y_action_listeners
+            .a11y_state_mut()
+            .action_listeners
             .push((action, Box::new(listener)));
         self
     }
@@ -1539,7 +1540,9 @@ impl Element for Div {
 
     fn a11y_role(&self) -> Option<accesskit::Role> {
         self.interactivity
-            .override_role
+            .a11y_state
+            .as_deref()
+            .and_then(|state| state.override_role)
             .filter(|role| *role != accesskit::Role::GenericContainer)
     }
 
@@ -1782,24 +1785,7 @@ pub struct Interactivity {
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
     pub(crate) tab_stop: bool,
-    pub(crate) a11y_action_listeners:
-        Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
-    pub(crate) override_role: Option<accesskit::Role>,
-    pub(crate) aria_label: Option<SharedString>,
-    pub(crate) aria_selected: Option<bool>,
-    pub(crate) aria_expanded: Option<bool>,
-    pub(crate) aria_toggled: Option<accesskit::Toggled>,
-    pub(crate) aria_numeric_value: Option<f64>,
-    pub(crate) aria_min_numeric_value: Option<f64>,
-    pub(crate) aria_max_numeric_value: Option<f64>,
-    pub(crate) aria_orientation: Option<accesskit::Orientation>,
-    pub(crate) aria_level: Option<usize>,
-    pub(crate) aria_position_in_set: Option<usize>,
-    pub(crate) aria_size_of_set: Option<usize>,
-    pub(crate) aria_row_index: Option<usize>,
-    pub(crate) aria_column_index: Option<usize>,
-    pub(crate) aria_row_count: Option<usize>,
-    pub(crate) aria_column_count: Option<usize>,
+    pub(crate) a11y_state: Option<Box<A11yState>>,
 
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,
@@ -1808,7 +1794,34 @@ pub struct Interactivity {
     pub(crate) debug_selector: Option<String>,
 }
 
+#[derive(Default)]
+pub(crate) struct A11yState {
+    action_listeners: Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
+    override_role: Option<accesskit::Role>,
+    aria_label: Option<SharedString>,
+    aria_selected: Option<bool>,
+    aria_expanded: Option<bool>,
+    aria_toggled: Option<accesskit::Toggled>,
+    aria_numeric_value: Option<f64>,
+    aria_min_numeric_value: Option<f64>,
+    aria_max_numeric_value: Option<f64>,
+    aria_orientation: Option<accesskit::Orientation>,
+    aria_level: Option<usize>,
+    aria_position_in_set: Option<usize>,
+    aria_size_of_set: Option<usize>,
+    aria_row_index: Option<usize>,
+    aria_column_index: Option<usize>,
+    aria_row_count: Option<usize>,
+    aria_column_count: Option<usize>,
+}
+
 impl Interactivity {
+    fn a11y_state_mut(&mut self) -> &mut A11yState {
+        self.a11y_state
+            .get_or_insert_with(Box::<A11yState>::default)
+            .as_mut()
+    }
+
     /// Layout this element according to this interactivity state's configured styles
     pub fn request_layout(
         &mut self,
@@ -2218,9 +2231,12 @@ impl Interactivity {
                                                     None
                                                 };
                                                 if let Some(node_id) = current_a11y_node_id {
-                                                    if !self.a11y_action_listeners.is_empty() {
+                                                    if let Some(a11y_state) =
+                                                        self.a11y_state.as_mut()
+                                                        && !a11y_state.action_listeners.is_empty()
+                                                    {
                                                         for (action, listener) in
-                                                            self.a11y_action_listeners.drain(..)
+                                                            a11y_state.action_listeners.drain(..)
                                                         {
                                                             window.on_a11y_action(
                                                                 node_id, action, listener,
@@ -3025,6 +3041,20 @@ impl Interactivity {
     }
 
     pub(crate) fn write_a11y_info(&self, node: &mut accesskit::Node) {
+        if let Some(a11y_state) = self.a11y_state.as_deref() {
+            a11y_state.write_a11y_info(node);
+        }
+        if !self.click_listeners.is_empty() {
+            node.add_action(accesskit::Action::Click);
+        }
+        if self.tracked_focus_handle.is_some() || self.focusable {
+            node.add_action(accesskit::Action::Focus);
+        }
+    }
+}
+
+impl A11yState {
+    fn write_a11y_info(&self, node: &mut accesskit::Node) {
         if let Some(label) = &self.aria_label {
             node.set_label(label.to_string());
         }
@@ -3070,13 +3100,7 @@ impl Interactivity {
         if let Some(count) = self.aria_column_count {
             node.set_column_count(count);
         }
-        if !self.click_listeners.is_empty() {
-            node.add_action(accesskit::Action::Click);
-        }
-        if self.tracked_focus_handle.is_some() || self.focusable {
-            node.add_action(accesskit::Action::Focus);
-        }
-        for (action, _) in &self.a11y_action_listeners {
+        for (action, _) in &self.action_listeners {
             node.add_action(*action);
         }
     }
