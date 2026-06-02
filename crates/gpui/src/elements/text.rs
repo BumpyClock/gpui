@@ -44,7 +44,8 @@ impl Text {
         self.id.as_ref()
     }
 
-    /// Produce a new [`Text`] with the given `id`.
+    /// Produce a new [`Text`] with the given `id`, replacing any default
+    /// macro-generated ID.
     pub fn with_id(mut self, id: impl Into<ElementId>) -> Self {
         self.id = Some(id.into());
         self
@@ -90,6 +91,12 @@ pub const fn __hash_text_macro_location_unstable_do_not_use(s: &'static str) -> 
 }
 
 /// Create a new accessible [`Text`] element.
+///
+/// The `text!("...")` form assigns an ID derived from the macro call site
+/// (`file!`, `line!`, and `column!`). This gives one call site a stable ID
+/// across frames, but repeated calls through the same helper or loop body will
+/// reuse that ID. When rendering repeated text elements, pass a unique ID with
+/// `text!(id = ..., ...)` or [`Text::with_id`].
 #[macro_export]
 macro_rules! text {
     (id = $id:expr, $text:expr) => {{ $crate::Text::new($id.into(), $text.into()) }};
@@ -1112,14 +1119,53 @@ impl IntoElement for InteractiveText {
 
 #[cfg(test)]
 mod tests {
+    use crate::{ElementId, SharedString, Text};
+
     #[test]
     fn test_into_element_for() {
-        use crate::{ParentElement as _, SharedString, div};
+        use crate::{ParentElement as _, div};
         use std::borrow::Cow;
 
         let _ = div().child("static str");
         let _ = div().child("String".to_string());
         let _ = div().child(Cow::Borrowed("Cow"));
         let _ = div().child(SharedString::from("SharedString"));
+    }
+
+    #[test]
+    fn text_macro_default_id_is_source_location_based() {
+        fn text_from_same_call_site() -> ElementId {
+            crate::text!("item").id().cloned().unwrap()
+        }
+
+        let first = text_from_same_call_site();
+        let second = text_from_same_call_site();
+        let separate_call_site = crate::text!("item").id().cloned().unwrap();
+
+        assert_eq!(first, second);
+        assert_ne!(first, separate_call_site);
+    }
+
+    #[test]
+    fn text_macro_accepts_explicit_ids_for_repeated_text() {
+        let first = crate::text!(id = ("item", 0usize), "item");
+        let second = crate::text!(id = ("item", 1usize), "item");
+        let overridden =
+            Text::new_inaccessible(SharedString::from("item")).with_id(("item", 2usize));
+
+        assert_eq!(
+            first.id(),
+            Some(&ElementId::from((SharedString::new_static("item"), 0usize)))
+        );
+        assert_eq!(
+            second.id(),
+            Some(&ElementId::from((SharedString::new_static("item"), 1usize)))
+        );
+        assert_eq!(
+            overridden.id(),
+            Some(&ElementId::from((SharedString::new_static("item"), 2usize)))
+        );
+        assert_ne!(first.id(), second.id());
+        assert_ne!(second.id(), overridden.id());
     }
 }
