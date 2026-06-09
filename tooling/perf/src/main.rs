@@ -416,16 +416,10 @@ fn triage_test(
 /// Try to find the hyperfine binary the user has installed.
 fn hyp_binary() -> Option<Command> {
     const HYP_PATH: &str = "hyperfine";
-    const HYP_HOME: &str = "~/.cargo/bin/hyperfine";
-    if Command::new(HYP_PATH).output().is_err() {
-        if Command::new(HYP_HOME).output().is_err() {
-            None
-        } else {
-            Some(Command::new(HYP_HOME))
-        }
-    } else {
-        Some(Command::new(HYP_PATH))
-    }
+    Command::new(HYP_PATH)
+        .output()
+        .is_ok()
+        .then(|| Command::new(HYP_PATH))
 }
 
 /// Profiles a given test with hyperfine, returning the mean and standard deviation

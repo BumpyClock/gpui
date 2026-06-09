@@ -309,19 +309,10 @@ where
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let level = self.1;
-        let location = self.2;
-        let inner = unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().0) };
-        match inner.poll(cx) {
-            Poll::Ready(output) => Poll::Ready(match output {
-                Ok(output) => Some(output),
-                Err(error) => {
-                    log_error_with_caller(location, error, level);
-                    None
-                }
-            }),
-            Poll::Pending => Poll::Pending,
-        }
+        let this = unsafe { self.get_unchecked_mut() };
+        poll_log_error_future(&mut this.0, cx, this.1, this.2, |location, error, level| {
+            log_error_with_caller(location, error, level);
+        })
     }
 }
 
@@ -336,19 +327,33 @@ where
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let level = self.1;
-        let location = self.2;
-        let inner = unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().0) };
-        match inner.poll(cx) {
-            Poll::Ready(output) => Poll::Ready(match output {
-                Ok(output) => Some(output),
-                Err(error) => {
-                    log_error_with_caller(location, DebugAsDisplay(&error), level);
-                    None
-                }
-            }),
-            Poll::Pending => Poll::Pending,
-        }
+        let this = unsafe { self.get_unchecked_mut() };
+        poll_log_error_future(&mut this.0, cx, this.1, this.2, |location, error, level| {
+            log_error_with_caller(location, DebugAsDisplay(&error), level);
+        })
+    }
+}
+
+fn poll_log_error_future<F, T, E>(
+    future: &mut F,
+    cx: &mut Context,
+    level: log::Level,
+    location: core::panic::Location<'static>,
+    log_error: impl FnOnce(core::panic::Location<'static>, E, log::Level),
+) -> Poll<Option<T>>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    let inner = unsafe { Pin::new_unchecked(future) };
+    match inner.poll(cx) {
+        Poll::Ready(output) => Poll::Ready(match output {
+            Ok(output) => Some(output),
+            Err(error) => {
+                log_error(location, error, level);
+                None
+            }
+        }),
+        Poll::Pending => Poll::Pending,
     }
 }
 
