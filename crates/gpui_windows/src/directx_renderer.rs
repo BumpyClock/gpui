@@ -327,6 +327,7 @@ impl DirectXRenderer {
     }
 
     fn update_retained_layer_cache(&mut self, scene: &Scene) -> Result<()> {
+        let supports_retained_layer_scene = self.supports_retained_layer_scene(scene);
         let Some(direct_composition) = self.direct_composition.as_mut() else {
             return Ok(());
         };
@@ -337,7 +338,7 @@ impl DirectXRenderer {
             .swap_chain
             .clone();
 
-        if !self.supports_retained_layer_scene(scene) {
+        if !supports_retained_layer_scene {
             direct_composition.disable_retained_layers(&swap_chain)?;
             return Ok(());
         }

@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use anyhow::Context;
-use util::ResultExt;
+use ::util::ResultExt;
 use windows::{
     UI::{
         Color,
