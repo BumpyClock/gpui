@@ -5414,26 +5414,6 @@ impl Window {
         }
 
         match request.action {
-            accesskit::Action::Click => {
-                if let Some(bounds) = self.a11y.node_bounds.get(&request.target_node).copied() {
-                    let center = bounds.center();
-                    let mouse_down = PlatformInput::MouseDown(crate::MouseDownEvent {
-                        button: MouseButton::Left,
-                        position: center,
-                        modifiers: Modifiers::default(),
-                        click_count: 1,
-                        first_mouse: false,
-                    });
-                    let mouse_up = PlatformInput::MouseUp(MouseUpEvent {
-                        button: MouseButton::Left,
-                        position: center,
-                        modifiers: Modifiers::default(),
-                        click_count: 1,
-                    });
-                    self.dispatch_event(mouse_down, cx);
-                    self.dispatch_event(mouse_up, cx);
-                }
-            }
             accesskit::Action::Focus => {
                 if let Some(focus_id) = self.a11y.focus_ids.get(&request.target_node).copied()
                     && let Some(handle) = FocusHandle::for_id(focus_id, &cx.focus_handles)
