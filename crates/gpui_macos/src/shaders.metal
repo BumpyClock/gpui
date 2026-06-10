@@ -655,14 +655,18 @@ vertex ShadowVertexOutput shadow_vertex(
   float2 unit_vertex = unit_vertices[unit_vertex_id];
   Shadow shadow = shadows[shadow_id];
 
-  float margin = 3. * shadow.blur_radius;
-  // Set the bounds of the shadow and adjust its size based on the shadow's
-  // spread radius to achieve the spreading effect
-  Bounds_ScaledPixels bounds = shadow.bounds;
-  bounds.origin.x -= margin;
-  bounds.origin.y -= margin;
-  bounds.size.width += 2. * margin;
-  bounds.size.height += 2. * margin;
+  Bounds_ScaledPixels bounds;
+  if (shadow.inset != 0u) {
+    bounds = shadow.element_bounds;
+  } else {
+    // Leave room for the gaussian tail outside the shadow rect.
+    float margin = 3. * shadow.blur_radius;
+    bounds = shadow.bounds;
+    bounds.origin.x -= margin;
+    bounds.origin.y -= margin;
+    bounds.size.width += 2. * margin;
+    bounds.size.height += 2. * margin;
+  }
 
   float4 device_position =
       to_device_position(unit_vertex, bounds, viewport_size);
@@ -723,6 +727,13 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
                gaussian(y, shadow.blur_radius) * step;
       y += step;
     }
+  }
+
+  if (shadow.inset != 0u) {
+    alpha = saturate(1. - alpha);
+    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                      shadow.element_corner_radii);
+    alpha *= saturate(0.5 - element_distance);
   }
 
   return input.color * float4(1., 1., 1., alpha);

@@ -207,8 +207,10 @@ impl TextSystem {
         Ok(result * font_size)
     }
 
-    // Consider removing this?
-    /// Returns the shaped layout width of for the given character, in the given font and size.
+    /// Returns this text system's shaped layout width for the given character.
+    ///
+    /// This intentionally goes through the platform text system, while
+    /// [`WindowTextSystem::layout_width`] uses the window-local line layout cache.
     pub fn layout_width(&self, font_id: FontId, font_size: Pixels, ch: char) -> Pixels {
         let mut buffer = [0; 4];
         let buffer = ch.encode_utf8(&mut buffer);
@@ -238,8 +240,10 @@ impl TextSystem {
         Ok(self.advance(font_id, font_size, 'm')?.width)
     }
 
-    // Consider removing this?
-    /// Returns the shaped layout width of an `em`.
+    /// Returns this text system's shaped layout width of an `em`.
+    ///
+    /// This intentionally goes through the platform text system, while
+    /// [`WindowTextSystem::em_layout_width`] uses the window-local line layout cache.
     pub fn em_layout_width(&self, font_id: FontId, font_size: Pixels) -> Pixels {
         self.layout_width(font_id, font_size, 'm')
     }
@@ -696,6 +700,34 @@ impl WindowTextSystem {
         self.font_runs_pool.lock().push(font_runs);
 
         layout
+    }
+
+    /// Returns the window-local cached shaped layout width for the given character.
+    ///
+    /// This intentionally uses the line layout cache, while
+    /// [`TextSystem::layout_width`] goes directly through the platform text system.
+    pub fn layout_width(&self, font_id: FontId, font_size: Pixels, ch: char) -> Pixels {
+        let mut buffer = [0; 4];
+        let buffer: &_ = ch.encode_utf8(&mut buffer);
+        self.line_layout_cache
+            .layout_line(
+                buffer,
+                font_size,
+                &[FontRun {
+                    len: buffer.len(),
+                    font_id,
+                }],
+                None,
+            )
+            .width
+    }
+
+    /// Returns the window-local cached shaped layout width of an `em`.
+    ///
+    /// This intentionally uses the line layout cache, while
+    /// [`TextSystem::em_layout_width`] goes directly through the platform text system.
+    pub fn em_layout_width(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.layout_width(font_id, font_size, 'm')
     }
 
     /// Probe the line layout cache using a caller-provided content hash, without allocating.

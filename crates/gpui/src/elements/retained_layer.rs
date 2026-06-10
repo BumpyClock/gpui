@@ -178,6 +178,9 @@ impl<E: IntoElement + 'static> Element for RetainedLayerElement<E> {
                     state.content_revision != content_revision
                         || state.bounds != bounds
                         || state.content_mask != content_mask
+                        // Repaint while accessibility is active so descendants
+                        // re-emit nodes, bounds, and action listeners each frame.
+                        || window.a11y.is_active()
                 }
                 None => true,
             };

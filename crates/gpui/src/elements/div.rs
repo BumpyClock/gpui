@@ -1120,6 +1120,119 @@ pub trait InteractiveElement: Sized {
 /// A trait for elements that want to use the standard GPUI interactivity features
 /// that require state.
 pub trait StatefulInteractiveElement: InteractiveElement {
+    /// Set the accessible role for this element.
+    fn role(mut self, role: accesskit::Role) -> Self {
+        debug_assert!(
+            role != accesskit::Role::GenericContainer,
+            "GenericContainer is filtered out of the a11y tree and has no effect"
+        );
+        self.interactivity().a11y_state_mut().override_role = Some(role);
+        self
+    }
+
+    /// Set the accessible label for this element.
+    fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.interactivity().a11y_state_mut().aria_label = Some(label.into());
+        self
+    }
+
+    /// Set the selected state for this element.
+    fn aria_selected(mut self, selected: bool) -> Self {
+        self.interactivity().a11y_state_mut().aria_selected = Some(selected);
+        self
+    }
+
+    /// Set the expanded state for this element.
+    fn aria_expanded(mut self, expanded: bool) -> Self {
+        self.interactivity().a11y_state_mut().aria_expanded = Some(expanded);
+        self
+    }
+
+    /// Set the toggled state for this element.
+    fn aria_toggled(mut self, toggled: accesskit::Toggled) -> Self {
+        self.interactivity().a11y_state_mut().aria_toggled = Some(toggled);
+        self
+    }
+
+    /// Set the numeric value for this element.
+    fn aria_numeric_value(mut self, value: f64) -> Self {
+        self.interactivity().a11y_state_mut().aria_numeric_value = Some(value);
+        self
+    }
+
+    /// Set the minimum numeric value for this element.
+    fn aria_min_numeric_value(mut self, value: f64) -> Self {
+        self.interactivity().a11y_state_mut().aria_min_numeric_value = Some(value);
+        self
+    }
+
+    /// Set the maximum numeric value for this element.
+    fn aria_max_numeric_value(mut self, value: f64) -> Self {
+        self.interactivity().a11y_state_mut().aria_max_numeric_value = Some(value);
+        self
+    }
+
+    /// Set the orientation of this element.
+    fn aria_orientation(mut self, orientation: accesskit::Orientation) -> Self {
+        self.interactivity().a11y_state_mut().aria_orientation = Some(orientation);
+        self
+    }
+
+    /// Set the heading level of this element.
+    fn aria_level(mut self, level: usize) -> Self {
+        self.interactivity().a11y_state_mut().aria_level = Some(level);
+        self
+    }
+
+    /// Set the position in set of this element.
+    fn aria_position_in_set(mut self, position: usize) -> Self {
+        self.interactivity().a11y_state_mut().aria_position_in_set = Some(position);
+        self
+    }
+
+    /// Set the size of set for this element.
+    fn aria_size_of_set(mut self, size: usize) -> Self {
+        self.interactivity().a11y_state_mut().aria_size_of_set = Some(size);
+        self
+    }
+
+    /// Set the row index for this element.
+    fn aria_row_index(mut self, index: usize) -> Self {
+        self.interactivity().a11y_state_mut().aria_row_index = Some(index);
+        self
+    }
+
+    /// Set the column index for this element.
+    fn aria_column_index(mut self, index: usize) -> Self {
+        self.interactivity().a11y_state_mut().aria_column_index = Some(index);
+        self
+    }
+
+    /// Set the row count for this element.
+    fn aria_row_count(mut self, count: usize) -> Self {
+        self.interactivity().a11y_state_mut().aria_row_count = Some(count);
+        self
+    }
+
+    /// Set the column count for this element.
+    fn aria_column_count(mut self, count: usize) -> Self {
+        self.interactivity().a11y_state_mut().aria_column_count = Some(count);
+        self
+    }
+
+    /// Register a handler for an accessibility action on this element.
+    fn on_a11y_action(
+        mut self,
+        action: accesskit::Action,
+        listener: impl FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity()
+            .a11y_state_mut()
+            .action_listeners
+            .push((action, Box::new(listener)));
+        self
+    }
+
     /// Set this element to focusable.
     fn focusable(mut self) -> Self {
         self.interactivity().focusable = true;
@@ -1425,6 +1538,18 @@ impl Element for Div {
         self.interactivity.source_location()
     }
 
+    fn a11y_role(&self) -> Option<accesskit::Role> {
+        self.interactivity
+            .a11y_state
+            .as_deref()
+            .and_then(|state| state.override_role)
+            .filter(|role| *role != accesskit::Role::GenericContainer)
+    }
+
+    fn write_a11y_info(&self, node: &mut accesskit::Node) {
+        self.interactivity.write_a11y_info(node);
+    }
+
     #[stacksafe]
     fn request_layout(
         &mut self,
@@ -1622,6 +1747,7 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) current_a11y_node: bool,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -1659,6 +1785,7 @@ pub struct Interactivity {
     pub(crate) tab_index: Option<isize>,
     pub(crate) tab_group: bool,
     pub(crate) tab_stop: bool,
+    pub(crate) a11y_state: Option<Box<A11yState>>,
 
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,
@@ -1667,7 +1794,34 @@ pub struct Interactivity {
     pub(crate) debug_selector: Option<String>,
 }
 
+#[derive(Default)]
+pub(crate) struct A11yState {
+    action_listeners: Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
+    override_role: Option<accesskit::Role>,
+    aria_label: Option<SharedString>,
+    aria_selected: Option<bool>,
+    aria_expanded: Option<bool>,
+    aria_toggled: Option<accesskit::Toggled>,
+    aria_numeric_value: Option<f64>,
+    aria_min_numeric_value: Option<f64>,
+    aria_max_numeric_value: Option<f64>,
+    aria_orientation: Option<accesskit::Orientation>,
+    aria_level: Option<usize>,
+    aria_position_in_set: Option<usize>,
+    aria_size_of_set: Option<usize>,
+    aria_row_index: Option<usize>,
+    aria_column_index: Option<usize>,
+    aria_row_count: Option<usize>,
+    aria_column_count: Option<usize>,
+}
+
 impl Interactivity {
+    fn a11y_state_mut(&mut self) -> &mut A11yState {
+        self.a11y_state
+            .get_or_insert_with(Box::<A11yState>::default)
+            .as_mut()
+    }
+
     /// Layout this element according to this interactivity state's configured styles
     pub fn request_layout(
         &mut self,
@@ -1778,9 +1932,20 @@ impl Interactivity {
             },
         );
 
+        let current_a11y_node_id = if window.a11y.is_active() {
+            global_id
+                .and_then(|global_id| window.a11y.node_id_for_existing(global_id))
+                .filter(|node_id| window.a11y.nodes.has_current_node(*node_id))
+        } else {
+            None
+        };
+        let has_current_a11y_node = current_a11y_node_id.is_some();
+        self.current_a11y_node = has_current_a11y_node;
+
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
             window.set_focus_handle(focus_handle, cx);
         }
+
         window.with_optional_element_state::<InteractiveElementState, _>(
             global_id,
             |element_state, window| {
@@ -1809,6 +1974,37 @@ impl Interactivity {
                 }
 
                 let translated_bounds = bounds + style.translate;
+                let suppress_a11y_descendants = window.a11y.is_active()
+                    && (style.visibility == Visibility::Hidden || style.display == Display::None);
+                if window.a11y.is_active() {
+                    if suppress_a11y_descendants {
+                        if let Some(node_id) = current_a11y_node_id {
+                            if window.a11y.nodes.suppress_current_node(node_id) {
+                                self.current_a11y_node = false;
+                                window.a11y.node_bounds.remove(&node_id);
+                                window.a11y.focus_ids.remove(&node_id);
+                                window.a11y.action_listeners.remove(&node_id);
+                            }
+                        }
+                    } else if let Some(node_id) = current_a11y_node_id {
+                        let scale_factor = window.scale_factor();
+                        let updated_bounds = window.a11y.nodes.update_current_node_bounds(
+                            node_id,
+                            translated_bounds,
+                            scale_factor,
+                        );
+                        if updated_bounds {
+                            window.a11y.node_bounds.insert(node_id, translated_bounds);
+                        }
+                        if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
+                            window.a11y.focus_ids.insert(node_id, focus_handle.id);
+                            if focus_handle.is_focused(window) {
+                                window.a11y.nodes.set_focus(node_id);
+                            }
+                        }
+                    }
+                }
+
                 window.with_text_style(style.text_style().cloned(), |window| {
                     window.with_content_mask(
                         style.overflow_mask(translated_bounds, window.rem_size()),
@@ -1821,7 +2017,13 @@ impl Interactivity {
 
                             let scroll_offset =
                                 self.clamp_scroll_position(bounds, &style, window, cx);
+                            if suppress_a11y_descendants {
+                                window.a11y.nodes.begin_suppressing_descendants();
+                            }
                             let result = f(&style, scroll_offset, hitbox, window, cx);
+                            if suppress_a11y_descendants {
+                                window.a11y.nodes.end_suppressing_descendants();
+                            }
                             (result, element_state)
                         },
                     )
@@ -2013,6 +2215,32 @@ impl Interactivity {
                                             }
 
                                             self.paint_keyboard_listeners(window, cx);
+
+                                            if window.a11y.is_active() {
+                                                let current_a11y_node_id = if self.current_a11y_node
+                                                {
+                                                    global_id.and_then(|global_id| {
+                                                        window.a11y.node_id_for_existing(global_id)
+                                                    })
+                                                } else {
+                                                    None
+                                                };
+                                                if let Some(node_id) = current_a11y_node_id {
+                                                    if let Some(a11y_state) =
+                                                        self.a11y_state.as_mut()
+                                                        && !a11y_state.action_listeners.is_empty()
+                                                    {
+                                                        for (action, listener) in
+                                                            a11y_state.action_listeners.drain(..)
+                                                        {
+                                                            window.on_a11y_action(
+                                                                node_id, action, listener,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+
                                             f(&style, window, cx);
 
                                             if let Some(_hitbox) = hitbox {
@@ -2806,6 +3034,71 @@ impl Interactivity {
 
         style
     }
+
+    pub(crate) fn write_a11y_info(&self, node: &mut accesskit::Node) {
+        if let Some(a11y_state) = self.a11y_state.as_deref() {
+            a11y_state.write_a11y_info(node);
+        }
+        if !self.click_listeners.is_empty() {
+            node.add_action(accesskit::Action::Click);
+        }
+        if self.tracked_focus_handle.is_some() || self.focusable {
+            node.add_action(accesskit::Action::Focus);
+        }
+    }
+}
+
+impl A11yState {
+    fn write_a11y_info(&self, node: &mut accesskit::Node) {
+        if let Some(label) = &self.aria_label {
+            node.set_label(label.to_string());
+        }
+        if let Some(selected) = self.aria_selected {
+            node.set_selected(selected);
+        }
+        if let Some(expanded) = self.aria_expanded {
+            node.set_expanded(expanded);
+        }
+        if let Some(toggled) = self.aria_toggled {
+            node.set_toggled(toggled);
+        }
+        if let Some(value) = self.aria_numeric_value {
+            node.set_numeric_value(value);
+        }
+        if let Some(value) = self.aria_min_numeric_value {
+            node.set_min_numeric_value(value);
+        }
+        if let Some(value) = self.aria_max_numeric_value {
+            node.set_max_numeric_value(value);
+        }
+        if let Some(orientation) = self.aria_orientation {
+            node.set_orientation(orientation);
+        }
+        if let Some(level) = self.aria_level {
+            node.set_level(level);
+        }
+        if let Some(position) = self.aria_position_in_set {
+            node.set_position_in_set(position);
+        }
+        if let Some(size) = self.aria_size_of_set {
+            node.set_size_of_set(size);
+        }
+        if let Some(index) = self.aria_row_index {
+            node.set_row_index(index);
+        }
+        if let Some(index) = self.aria_column_index {
+            node.set_column_index(index);
+        }
+        if let Some(count) = self.aria_row_count {
+            node.set_row_count(count);
+        }
+        if let Some(count) = self.aria_column_count {
+            node.set_column_count(count);
+        }
+        for (action, _) in &self.action_listeners {
+            node.add_action(*action);
+        }
+    }
 }
 
 /// The per-frame state of an interactive element. Used for tracking stateful interactions like clicks
@@ -3201,6 +3494,14 @@ where
         self.element.source_location()
     }
 
+    fn a11y_role(&self) -> Option<accesskit::Role> {
+        self.element.a11y_role()
+    }
+
+    fn write_a11y_info(&self, node: &mut accesskit::Node) {
+        self.element.write_a11y_info(node);
+    }
+
     fn request_layout(
         &mut self,
         id: Option<&GlobalElementId>,
@@ -3517,6 +3818,238 @@ impl ScrollHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        AnyView, AppContext, Context, DrawPhase, Drawable, Render, StyleRefinement, TestAppContext,
+        deferred, text,
+    };
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    fn draw_accessible<E>(
+        cx: &mut crate::VisualTestContext,
+        origin: Point<Pixels>,
+        space: impl Into<Size<crate::AvailableSpace>>,
+        f: impl FnOnce(&mut Window, &mut App) -> E,
+    ) -> accesskit::TreeUpdate
+    where
+        E: Element,
+    {
+        cx.update(|window, cx| {
+            window.a11y.set_active_for_test(true);
+            window.a11y.begin_frame();
+
+            window.invalidator.set_phase(DrawPhase::Prepaint);
+            let mut element = Drawable::new(f(window, cx));
+            element.layout_as_root(space.into(), window, cx);
+            window.with_absolute_element_offset(origin, |window| element.prepaint(window, cx));
+
+            window.invalidator.set_phase(DrawPhase::Paint);
+            element.paint(window, cx);
+            window.invalidator.set_phase(DrawPhase::None);
+
+            let update = window.a11y.end_frame();
+            window.a11y.set_active_for_test(false);
+
+            window.next_frame.finish(&mut window.rendered_frame);
+            std::mem::swap(&mut window.rendered_frame, &mut window.next_frame);
+            window.next_frame.clear();
+
+            update
+        })
+    }
+
+    fn root_node(update: &accesskit::TreeUpdate) -> &accesskit::Node {
+        update
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| {
+                (*node_id == crate::window::a11y::ROOT_NODE_ID).then_some(node)
+            })
+            .unwrap()
+    }
+
+    fn node_with_role(
+        update: &accesskit::TreeUpdate,
+        role: accesskit::Role,
+    ) -> Option<(accesskit::NodeId, &accesskit::Node)> {
+        update
+            .nodes
+            .iter()
+            .find_map(|(node_id, node)| (node.role() == role).then_some((*node_id, node)))
+    }
+
+    fn global_id(id: impl Into<ElementId>) -> GlobalElementId {
+        let ids: Arc<[ElementId]> = Arc::from([id.into()]);
+        GlobalElementId(ids)
+    }
+
+    fn node_id_for_existing_element_id(
+        window: &Window,
+        id: impl Into<ElementId>,
+    ) -> Option<accesskit::NodeId> {
+        window.a11y.node_id_for_existing(&global_id(id))
+    }
+
+    fn assert_tree_has_no_missing_children(update: &accesskit::TreeUpdate) {
+        let node_ids = update
+            .nodes
+            .iter()
+            .map(|(node_id, _)| *node_id)
+            .collect::<Vec<_>>();
+
+        for (node_id, node) in &update.nodes {
+            for child_id in node.children() {
+                assert!(
+                    node_ids.contains(child_id),
+                    "node {node_id:?} references missing child {child_id:?}"
+                );
+            }
+        }
+    }
+
+    struct CachedDeferredRoot {
+        child: Entity<CachedDeferredChild>,
+    }
+
+    impl Render for CachedDeferredRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            AnyView::from(self.child.clone())
+                .cached(StyleRefinement::default().w(px(20.)).h(px(20.)))
+        }
+    }
+
+    struct CachedDeferredChild {
+        action_count: Rc<Cell<usize>>,
+    }
+
+    impl Render for CachedDeferredChild {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let action_count = self.action_count.clone();
+            deferred(
+                div()
+                    .id("cached-deferred-child")
+                    .role(accesskit::Role::Button)
+                    .on_a11y_action(accesskit::Action::Click, move |_, _, _| {
+                        action_count.set(action_count.get() + 1);
+                    })
+                    .w(px(10.))
+                    .h(px(10.)),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn a11y_cached_deferred_draw(cx: &mut TestAppContext) {
+        let action_count = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let action_count = action_count.clone();
+            move |_, cx| {
+                let child = cx.new(|_| CachedDeferredChild {
+                    action_count: action_count.clone(),
+                });
+                CachedDeferredRoot { child }
+            }
+        });
+
+        cx.update(|window, cx| {
+            window.a11y.set_active_for_test(true);
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let child_id = cx.update(|window, _| {
+            assert_eq!(
+                window.a11y.action_listeners.len(),
+                1,
+                "deferred child should rebuild its a11y action listener"
+            );
+            let child_id = window
+                .a11y
+                .action_listeners
+                .keys()
+                .next()
+                .copied()
+                .expect("deferred child should have an a11y action listener");
+            assert!(
+                window.a11y.node_bounds.contains_key(&child_id),
+                "deferred child should be emitted into the active a11y frame"
+            );
+            child_id
+        });
+
+        cx.update(|window, cx| {
+            window.handle_a11y_action(
+                accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: child_id,
+                    data: None,
+                },
+                cx,
+            );
+        });
+
+        assert_eq!(action_count.get(), 1);
+    }
+
+    #[gpui::test]
+    fn a11y_listener_registered_during_dispatch_survives_for_same_target(cx: &mut TestAppContext) {
+        let original_count = Rc::new(Cell::new(0));
+        let registered_count = Rc::new(Cell::new(0));
+        let node_id = accesskit::NodeId(1);
+        let cx = cx.add_empty_window();
+
+        cx.update(|window, _| {
+            let original_count = original_count.clone();
+            let registered_count = registered_count.clone();
+            window.on_a11y_action(node_id, accesskit::Action::Click, move |_, window, _| {
+                original_count.set(original_count.get() + 1);
+                let registered_count = registered_count.clone();
+                window.on_a11y_action(node_id, accesskit::Action::Click, move |_, _, _| {
+                    registered_count.set(registered_count.get() + 1);
+                });
+            });
+        });
+
+        cx.update(|window, cx| {
+            window.handle_a11y_action(
+                accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: node_id,
+                    data: None,
+                },
+                cx,
+            );
+        });
+
+        assert_eq!(original_count.get(), 1);
+        assert_eq!(registered_count.get(), 0);
+        assert_eq!(
+            cx.update(|window, _| window.a11y.action_listeners[&node_id].len()),
+            2
+        );
+
+        cx.update(|window, cx| {
+            window.handle_a11y_action(
+                accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: node_id,
+                    data: None,
+                },
+                cx,
+            );
+        });
+
+        assert_eq!(original_count.get(), 2);
+        assert_eq!(registered_count.get(), 1);
+    }
 
     #[test]
     fn key_context_accepts_try_into_errors_without_display() {
@@ -3572,5 +4105,341 @@ mod tests {
         handle.scroll_to_active_item();
 
         assert_eq!(handle.offset().y, px(-25.));
+    }
+
+    #[gpui::test]
+    fn a11y_hidden_role_div_is_absent_from_tree(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let update = draw_accessible(
+            cx,
+            point(px(0.), px(0.)),
+            size(px(100.), px(100.)),
+            |_, _| {
+                div()
+                    .id("hidden-button")
+                    .role(accesskit::Role::Button)
+                    .invisible()
+                    .w(px(20.))
+                    .h(px(20.))
+            },
+        );
+
+        assert!(node_with_role(&update, accesskit::Role::Button).is_none());
+        assert_eq!(root_node(&update).children(), &[]);
+        assert_tree_has_no_missing_children(&update);
+    }
+
+    #[gpui::test]
+    fn a11y_display_none_role_div_is_absent_from_tree(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let focus_handle = cx.update(|_, cx| cx.focus_handle());
+        cx.update(|window, cx| focus_handle.focus(window, cx));
+
+        let update = draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
+            let focus_handle = focus_handle.clone();
+            move |_, _| {
+                div()
+                    .id("display-none-button")
+                    .role(accesskit::Role::Button)
+                    .track_focus(&focus_handle)
+                    .on_a11y_action(accesskit::Action::Click, |_, _, _| {})
+                    .hidden()
+                    .child(text!(id = "display-none-label", "Hidden child"))
+            }
+        });
+
+        assert!(node_with_role(&update, accesskit::Role::Button).is_none());
+        assert!(node_with_role(&update, accesskit::Role::Label).is_none());
+        assert_eq!(root_node(&update).children(), &[]);
+        assert_eq!(update.focus, crate::window::a11y::ROOT_NODE_ID);
+        assert_tree_has_no_missing_children(&update);
+
+        cx.update(|window, _| {
+            let node_id = node_id_for_existing_element_id(window, "display-none-button").unwrap();
+            assert!(!window.a11y.node_bounds.contains_key(&node_id));
+            assert!(!window.a11y.focus_ids.contains_key(&node_id));
+            assert!(!window.a11y.action_listeners.contains_key(&node_id));
+        });
+    }
+
+    #[gpui::test]
+    fn a11y_hidden_container_suppresses_descendants(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let focus_handle = cx.update(|_, cx| cx.focus_handle());
+
+        let update = draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
+            let focus_handle = focus_handle.clone();
+            move |_, _| {
+                div().invisible().child(
+                    div()
+                        .id("child-button")
+                        .role(accesskit::Role::Button)
+                        .track_focus(&focus_handle)
+                        .child(text!(id = "child-label", "Hidden child")),
+                )
+            }
+        });
+
+        assert!(node_with_role(&update, accesskit::Role::Button).is_none());
+        assert!(node_with_role(&update, accesskit::Role::Label).is_none());
+        assert_eq!(root_node(&update).children(), &[]);
+        assert_tree_has_no_missing_children(&update);
+
+        cx.update(|window, _| {
+            let child_id = node_id_for_existing_element_id(window, "child-button").unwrap();
+            assert!(!window.a11y.node_bounds.contains_key(&child_id));
+            assert!(!window.a11y.focus_ids.contains_key(&child_id));
+        });
+    }
+
+    #[gpui::test]
+    fn a11y_translated_clickable_div_updates_bounds_and_clicks_at_translated_center(
+        cx: &mut TestAppContext,
+    ) {
+        let clicked_at = Rc::new(Cell::new(None));
+        let cx = cx.add_empty_window();
+
+        let update = draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
+            let clicked_at = clicked_at.clone();
+            move |_, _| {
+                div()
+                    .id("translated-button")
+                    .role(accesskit::Role::Button)
+                    .on_click(move |event, _, _| clicked_at.set(Some(event.position())))
+                    .translate(px(10.), px(20.))
+                    .w(px(40.))
+                    .h(px(30.))
+            }
+        });
+
+        let expected_bounds = Bounds::new(point(px(10.), px(20.)), size(px(40.), px(30.)));
+        let scale_factor = cx.update(|window, _| window.scale_factor());
+        let (button_id, button) = node_with_role(&update, accesskit::Role::Button).unwrap();
+        assert!(button.supports_action(accesskit::Action::Click));
+        assert_eq!(
+            button.bounds(),
+            Some(accesskit::Rect {
+                x0: (expected_bounds.left().0 * scale_factor) as f64,
+                y0: (expected_bounds.top().0 * scale_factor) as f64,
+                x1: (expected_bounds.right().0 * scale_factor) as f64,
+                y1: (expected_bounds.bottom().0 * scale_factor) as f64,
+            })
+        );
+
+        let node_bounds = cx
+            .update(|window, _| window.a11y.node_bounds.get(&button_id).copied())
+            .unwrap();
+        assert_eq!(node_bounds, expected_bounds);
+
+        cx.update(|window, cx| {
+            window.handle_a11y_action(
+                accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: button_id,
+                    data: None,
+                },
+                cx,
+            );
+        });
+
+        assert_eq!(clicked_at.get(), Some(point(px(30.), px(35.))));
+    }
+
+    #[gpui::test]
+    fn a11y_window_transact_rolls_back_prepaint_state(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let accepted_global_id = global_id("accepted-node");
+        let rejected_global_id = global_id("rejected-node");
+        let accepted_bounds = Bounds::new(point(px(1.), px(2.)), size(px(3.), px(4.)));
+        let rejected_bounds = Bounds::new(point(px(5.), px(6.)), size(px(7.), px(8.)));
+
+        let (update, accepted_id, rejected_id, focus_ids, node_bounds) = cx.update(|window, cx| {
+            window.a11y.set_active_for_test(true);
+            window.a11y.begin_frame();
+            window.invalidator.set_phase(DrawPhase::Prepaint);
+
+            let accepted_focus = cx.focus_handle();
+            let rejected_focus = cx.focus_handle();
+            let mut accepted_node = accesskit::Node::new(accesskit::Role::Button);
+            accepted_node.set_label("accepted");
+            let accepted_id = window.a11y.node_id_for(&accepted_global_id);
+            assert!(window.a11y.nodes.push(accepted_id, accepted_node));
+            window.a11y.node_bounds.insert(accepted_id, accepted_bounds);
+            window.a11y.focus_ids.insert(accepted_id, accepted_focus.id);
+            window.a11y.nodes.pop();
+
+            let mut rejected_id = None;
+            let result = window.transact(|window| {
+                let mut rejected_node = accesskit::Node::new(accesskit::Role::TextInput);
+                rejected_node.set_label("rejected");
+                let node_id = window.a11y.node_id_for(&rejected_global_id);
+                rejected_id = Some(node_id);
+                assert!(window.a11y.nodes.push(node_id, rejected_node));
+                window.a11y.node_bounds.insert(node_id, rejected_bounds);
+                window.a11y.focus_ids.insert(node_id, rejected_focus.id);
+                window.a11y.nodes.set_focus(node_id);
+                window.a11y.nodes.pop();
+                Err::<(), ()>(())
+            });
+            assert!(result.is_err());
+
+            let focus_ids = window.a11y.focus_ids.clone();
+            let node_bounds = window.a11y.node_bounds.clone();
+            let update = window.a11y.end_frame();
+            window.invalidator.set_phase(DrawPhase::None);
+            window.a11y.set_active_for_test(false);
+            (
+                update,
+                accepted_id,
+                rejected_id.unwrap(),
+                focus_ids,
+                node_bounds,
+            )
+        });
+
+        assert!(update.nodes.iter().any(|(id, _)| *id == accepted_id));
+        assert!(!update.nodes.iter().any(|(id, _)| *id == rejected_id));
+        assert_eq!(root_node(&update).children(), &[accepted_id]);
+        assert_eq!(update.focus, crate::window::a11y::ROOT_NODE_ID);
+        assert_eq!(node_bounds.get(&accepted_id), Some(&accepted_bounds));
+        assert!(!node_bounds.contains_key(&rejected_id));
+        assert!(focus_ids.contains_key(&accepted_id));
+        assert!(!focus_ids.contains_key(&rejected_id));
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[gpui::test]
+    fn a11y_duplicate_id_does_not_override_focus_fallback(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let first_focus_handle = cx.update(|_, cx| cx.focus_handle());
+        let second_focus_handle = cx.update(|_, cx| cx.focus_handle());
+        let first_focus_handle_id = first_focus_handle.id;
+
+        draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
+            let first_focus_handle = first_focus_handle;
+            let second_focus_handle = second_focus_handle;
+            move |_, _| {
+                div()
+                    .child(
+                        div()
+                            .id("shared-focus")
+                            .role(accesskit::Role::Button)
+                            .track_focus(&first_focus_handle),
+                    )
+                    .child(
+                        div()
+                            .id("shared-focus")
+                            .role(accesskit::Role::TextInput)
+                            .track_focus(&second_focus_handle),
+                    )
+            }
+        });
+
+        cx.update(|window, _| {
+            let duplicate_id = node_id_for_existing_element_id(window, "shared-focus").unwrap();
+            assert_eq!(
+                window.a11y.focus_ids.get(&duplicate_id),
+                Some(&first_focus_handle_id)
+            );
+        });
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[gpui::test]
+    fn a11y_hidden_duplicate_id_does_not_remove_accepted_sibling_accessibility_state(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let first_focus_handle = cx.update(|_, cx| cx.focus_handle());
+        let second_focus_handle = cx.update(|_, cx| cx.focus_handle());
+        let first_focus_handle_id = first_focus_handle.id;
+        let expected_bounds = Bounds::new(point(px(0.), px(0.)), size(px(20.), px(10.)));
+
+        draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
+            let first_focus_handle = first_focus_handle;
+            let second_focus_handle = second_focus_handle;
+            move |_, _| {
+                div()
+                    .child(
+                        div()
+                            .id("shared-hidden-node")
+                            .role(accesskit::Role::Button)
+                            .track_focus(&first_focus_handle)
+                            .on_a11y_action(accesskit::Action::Click, |_, _, _| {})
+                            .w(px(20.))
+                            .h(px(10.)),
+                    )
+                    .child(
+                        div()
+                            .id("shared-hidden-node")
+                            .role(accesskit::Role::Button)
+                            .track_focus(&second_focus_handle)
+                            .on_a11y_action(accesskit::Action::Click, |_, _, _| {})
+                            .invisible(),
+                    )
+            }
+        });
+
+        cx.update(|window, _| {
+            let duplicate_id =
+                node_id_for_existing_element_id(window, "shared-hidden-node").unwrap();
+            assert_eq!(
+                window.a11y.node_bounds.get(&duplicate_id),
+                Some(&expected_bounds)
+            );
+            assert_eq!(
+                window.a11y.focus_ids.get(&duplicate_id),
+                Some(&first_focus_handle_id)
+            );
+            assert_eq!(
+                window
+                    .a11y
+                    .action_listeners
+                    .get(&duplicate_id)
+                    .expect("duplicate node should retain first listener")
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[gpui::test]
+    fn a11y_duplicate_id_does_not_register_a11y_action_listeners_for_rejected_node(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+
+        draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
+            move |_, _| {
+                div()
+                    .child(
+                        div()
+                            .id("shared-listener")
+                            .role(accesskit::Role::Button)
+                            .on_a11y_action(accesskit::Action::Click, |_, _, _| {}),
+                    )
+                    .child(
+                        div()
+                            .id("shared-listener")
+                            .role(accesskit::Role::TextInput)
+                            .on_a11y_action(accesskit::Action::Click, |_, _, _| {}),
+                    )
+            }
+        });
+
+        cx.update(|window, _| {
+            let duplicate_id = node_id_for_existing_element_id(window, "shared-listener").unwrap();
+            assert_eq!(
+                window
+                    .a11y
+                    .action_listeners
+                    .get(&duplicate_id)
+                    .map(|listeners| listeners.len()),
+                Some(1)
+            );
+        });
     }
 }

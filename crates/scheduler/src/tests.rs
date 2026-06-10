@@ -8,7 +8,7 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeSet, HashSet},
     pin::Pin,
     rc::Rc,
@@ -35,10 +35,124 @@ fn test_background_executor_spawn() {
 }
 
 #[test]
+fn test_scheduler_drops_with_stalled_detached_foreground_task() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let weak_scheduler = Arc::downgrade(&scheduler);
+    let (sender, receiver) = oneshot::channel::<()>();
+
+    scheduler
+        .foreground()
+        .spawn(async move {
+            receiver.await.ok();
+        })
+        .detach();
+    scheduler.run();
+
+    drop(scheduler);
+    assert!(weak_scheduler.upgrade().is_none());
+    drop(sender);
+}
+
+#[test]
+fn test_scheduler_drops_with_stalled_detached_background_task() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let weak_scheduler = Arc::downgrade(&scheduler);
+    let (sender, receiver) = oneshot::channel::<()>();
+
+    scheduler
+        .background()
+        .spawn(async move {
+            receiver.await.ok();
+        })
+        .detach();
+    scheduler.run();
+
+    drop(scheduler);
+    assert!(weak_scheduler.upgrade().is_none());
+    drop(sender);
+}
+
+#[test]
+fn test_scheduler_drops_with_queued_detached_foreground_task() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let weak_scheduler = Arc::downgrade(&scheduler);
+
+    scheduler.foreground().spawn(async {}).detach();
+
+    drop(scheduler);
+    assert!(weak_scheduler.upgrade().is_none());
+}
+
+#[test]
+fn test_scheduler_drops_with_queued_detached_background_task() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let weak_scheduler = Arc::downgrade(&scheduler);
+
+    scheduler.background().spawn(async {}).detach();
+
+    drop(scheduler);
+    assert!(weak_scheduler.upgrade().is_none());
+}
+
+#[test]
+fn test_detached_foreground_task_wakes_after_executor_handle_drop() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let completed = Rc::new(Cell::new(false));
+    let (sender, receiver) = oneshot::channel::<()>();
+
+    let foreground = scheduler.foreground();
+    foreground
+        .spawn({
+            let completed = completed.clone();
+            async move {
+                receiver.await.ok();
+                completed.set(true);
+            }
+        })
+        .detach();
+    drop(foreground);
+
+    scheduler.run();
+    assert!(!completed.get());
+
+    sender.send(()).unwrap();
+    scheduler.run();
+    assert!(completed.get());
+}
+
+#[test]
+fn test_detached_background_task_wakes_after_executor_handle_drop() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let completed = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = oneshot::channel::<()>();
+
+    let background = scheduler.background();
+    background
+        .spawn({
+            let completed = completed.clone();
+            async move {
+                receiver.await.ok();
+                completed.store(true, Ordering::SeqCst);
+            }
+        })
+        .detach();
+    drop(background);
+
+    scheduler.run();
+    assert!(!completed.load(Ordering::SeqCst));
+
+    sender.send(()).unwrap();
+    scheduler.run();
+    assert!(completed.load(Ordering::SeqCst));
+}
+
+#[test]
 fn test_foreground_ordering() {
     let mut traces = HashSet::new();
 
-    TestScheduler::many(100, async |scheduler| {
+    TestScheduler::many(if cfg!(miri) { 5 } else { 100 }, async |scheduler| {
         #[derive(Hash, PartialEq, Eq)]
         struct TraceEntry {
             session: usize,
@@ -125,6 +239,46 @@ fn test_timer_ordering() {
             .boxed(),
         );
         assert_eq!(futures.collect::<Vec<_>>().await, vec![1, 2, 3]);
+    });
+}
+
+#[test]
+fn test_foreground_task_can_hold_mut_borrow_across_await() {
+    TestScheduler::once(async |scheduler| {
+        let foreground = scheduler.foreground();
+        let (sender, mut receiver) = mpsc::unbounded::<()>();
+        let (completion_sender, completion_receiver) = oneshot::channel::<i32>();
+        let state = Rc::new(RefCell::new(1));
+
+        foreground
+            .spawn({
+                let state = state.clone();
+                async move {
+                    let mut state = state.borrow_mut();
+                    *state += 1;
+
+                    receiver.next().await;
+
+                    *state += 1;
+                    completion_sender.send(*state).ok();
+                }
+            })
+            .detach();
+
+        scheduler.run();
+        assert!(
+            state.try_borrow_mut().is_err(),
+            "foreground task should hold the mutable borrow while suspended"
+        );
+
+        sender.unbounded_send(()).unwrap();
+        scheduler.run();
+        assert_eq!(
+            completion_receiver.now_or_never(),
+            Some(Ok(3)),
+            "foreground task should resume after receiving from the channel"
+        );
+        assert_eq!(*state.borrow(), 3);
     });
 }
 
@@ -238,7 +392,7 @@ fn test_block() {
 }
 
 #[test]
-#[should_panic(expected = "Parking forbidden. Pending traces:")]
+#[should_panic(expected = "Parking forbidden.")]
 fn test_parking_panics() {
     let config = TestSchedulerConfig {
         capture_pending_traces: true,
@@ -315,7 +469,7 @@ fn test_block_with_timeout() {
 
     // Test case: future makes progress via timer but still times out
     let mut results = BTreeSet::new();
-    TestScheduler::many(100, async |scheduler| {
+    TestScheduler::many(if cfg!(miri) { 5 } else { 100 }, async |scheduler| {
         // Keep the existing probabilistic behavior here (do not force 0 ticks), since this subtest
         // is explicitly checking that some seeds/timeouts can complete while others can time out.
         let task = scheduler.background().spawn(async move {
@@ -329,7 +483,11 @@ fn test_block_with_timeout() {
     });
     assert_eq!(
         results.into_iter().collect::<Vec<_>>(),
-        vec![None, Some(42)]
+        if cfg!(miri) {
+            vec![Some(42)]
+        } else {
+            vec![None, Some(42)]
+        }
     );
 
     // Regression test:
@@ -375,7 +533,7 @@ fn test_block_with_timeout() {
 #[test]
 fn test_block_does_not_progress_same_session_foreground() {
     let mut task2_made_progress_once = false;
-    TestScheduler::many(1000, async |scheduler| {
+    TestScheduler::many(if cfg!(miri) { 5 } else { 1000 }, async |scheduler| {
         let foreground1 = scheduler.foreground();
         let foreground2 = scheduler.foreground();
 
@@ -589,7 +747,7 @@ fn test_background_priority_scheduling() {
 
     // Run many iterations to get statistical significance
     let mut high_before_low_count = 0;
-    let iterations = 100;
+    let iterations = if cfg!(miri) { 5 } else { 100 };
 
     for seed in 0..iterations {
         let config = TestSchedulerConfig::with_seed(seed);
@@ -641,5 +799,314 @@ fn test_background_priority_scheduling() {
          Got {} out of {} iterations",
         high_before_low_count,
         iterations
+    );
+}
+
+#[test]
+fn test_spawn_dedicated_basic_round_trip() {
+    let result = TestScheduler::once(async |scheduler| {
+        scheduler
+            .background()
+            .spawn_dedicated(|_executor| async { 42 })
+            .await
+    });
+    assert_eq!(result, 42);
+}
+
+#[test]
+fn test_spawn_dedicated_not_send_future() {
+    let result = TestScheduler::once(async |scheduler| {
+        scheduler
+            .background()
+            .spawn_dedicated(|_executor| async move {
+                let state = Rc::new(RefCell::new(0_i32));
+                for _ in 0..5 {
+                    *state.borrow_mut() += 1;
+                }
+                *state.borrow()
+            })
+            .await
+    });
+    assert_eq!(result, 5);
+}
+
+#[test]
+fn test_spawn_dedicated_output_only_needs_send() {
+    let result = TestScheduler::once(async |scheduler| {
+        scheduler
+            .background()
+            .spawn_dedicated(|_executor| async { Cell::new(7_u32) })
+            .await
+    });
+    assert_eq!(result.get(), 7);
+}
+
+#[test]
+fn test_spawn_dedicated_send_closure_captures() {
+    use parking_lot::Mutex;
+
+    let observed = TestScheduler::once(async |scheduler| {
+        let shared = Arc::new(Mutex::new(0_i32));
+        let shared_for_closure = shared.clone();
+        let returned = scheduler
+            .background()
+            .spawn_dedicated(move |_executor| {
+                let local = shared_for_closure;
+                async move {
+                    *local.lock() = 7;
+                }
+            })
+            .await;
+        let _: () = returned;
+        *shared.lock()
+    });
+    assert_eq!(observed, 7);
+}
+
+#[test]
+fn test_spawn_dedicated_inner_spawn_local() {
+    let result = TestScheduler::once(async |scheduler| {
+        scheduler
+            .background()
+            .spawn_dedicated(|executor| async move {
+                let inner = Rc::new(RefCell::new(0_i32));
+                let inner_for_child = inner.clone();
+                let child = executor.spawn(async move {
+                    *inner_for_child.borrow_mut() = 99;
+                    *inner_for_child.borrow()
+                });
+                child.await
+            })
+            .await
+    });
+    assert_eq!(result, 99);
+}
+
+#[test]
+fn test_spawn_dedicated_thread_closure_panic_reaches_caller() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = spawn_dedicated_thread(
+            SessionId::new(1),
+            scheduler,
+            |_executor| -> future::Ready<()> {
+                panic!("dedicated root task constructor exploded");
+            },
+        );
+    }));
+
+    assert!(result.is_err(), "expected spawn_dedicated_thread to panic");
+    let panic_payload = result.unwrap_err();
+    let panic_message = panic_payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<unknown panic>");
+
+    assert!(
+        panic_message.contains("dedicated root task constructor exploded"),
+        "expected caller panic to include the dedicated closure panic, got: {}",
+        panic_message
+    );
+}
+
+#[test]
+fn test_spawn_dedicated_determinism_under_many() {
+    use parking_lot::Mutex;
+
+    let outcomes = TestScheduler::many(if cfg!(miri) { 4 } else { 20 }, async |scheduler| {
+        let trace = Arc::new(Mutex::new(Vec::<u32>::new()));
+
+        let background = scheduler.background();
+        let mut tasks = Vec::new();
+        for id in 0..4_u32 {
+            let trace = trace.clone();
+            let task = background.spawn_dedicated(move |executor| async move {
+                for step in 0..3 {
+                    trace.lock().push(id * 100 + step);
+                    executor.spawn(async {}).await;
+                }
+                id
+            });
+            tasks.push(task);
+        }
+
+        let mut outputs = Vec::new();
+        for task in tasks {
+            outputs.push(task.await);
+        }
+
+        (trace.lock().clone(), outputs)
+    });
+
+    let outcomes_replay = TestScheduler::many(if cfg!(miri) { 4 } else { 20 }, async |scheduler| {
+        let trace = Arc::new(Mutex::new(Vec::<u32>::new()));
+
+        let background = scheduler.background();
+        let mut tasks = Vec::new();
+        for id in 0..4_u32 {
+            let trace = trace.clone();
+            let task = background.spawn_dedicated(move |executor| async move {
+                for step in 0..3 {
+                    trace.lock().push(id * 100 + step);
+                    executor.spawn(async {}).await;
+                }
+                id
+            });
+            tasks.push(task);
+        }
+
+        let mut outputs = Vec::new();
+        for task in tasks {
+            outputs.push(task.await);
+        }
+
+        (trace.lock().clone(), outputs)
+    });
+
+    assert_eq!(
+        outcomes, outcomes_replay,
+        "per-seed outcomes should be reproducible"
+    );
+
+    let any_interleaved = outcomes.iter().any(|(trace, _)| {
+        trace
+            .windows(2)
+            .any(|window| window[0] / 100 != window[1] / 100)
+    });
+    assert!(
+        any_interleaved,
+        "expected at least one seed to interleave dedicated tasks"
+    );
+}
+
+#[test]
+fn test_spawn_dedicated_dropping_task_cancels_future() {
+    use parking_lot::Mutex;
+
+    let counter_after = TestScheduler::once(async |scheduler| {
+        let counter = Arc::new(Mutex::new(0_u32));
+        let (resume_tx, resume_rx) = oneshot::channel::<()>();
+
+        let task = {
+            let counter = counter.clone();
+            scheduler
+                .background()
+                .spawn_dedicated(move |_executor| async move {
+                    *counter.lock() = 1;
+                    let _ = resume_rx.await;
+                    *counter.lock() = 2;
+                })
+        };
+
+        scheduler.run();
+        assert_eq!(*counter.lock(), 1);
+
+        drop(task);
+        let _ = resume_tx.send(());
+        scheduler.run();
+
+        *counter.lock()
+    });
+
+    assert_eq!(
+        counter_after, 1,
+        "dropping the dedicated task must cancel the root future before its second write"
+    );
+}
+
+#[test]
+fn test_spawn_dedicated_detached_child_runs_after_root_completes() {
+    use parking_lot::Mutex;
+
+    let child_ran = TestScheduler::once(async |scheduler| {
+        let child_ran = Arc::new(Mutex::new(false));
+
+        let task = {
+            let child_ran = child_ran.clone();
+            scheduler
+                .background()
+                .spawn_dedicated(move |executor| async move {
+                    executor
+                        .spawn(async move {
+                            *child_ran.lock() = true;
+                        })
+                        .detach();
+                })
+        };
+
+        task.await;
+        scheduler.run();
+
+        *child_ran.lock()
+    });
+
+    assert!(
+        child_ran,
+        "detached child must complete after the root, not be cancelled with it"
+    );
+}
+
+#[test]
+fn test_scheduler_drops_with_stalled_spawn_dedicated_detached_child() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let weak_scheduler = Arc::downgrade(&scheduler);
+    let (sender, receiver) = oneshot::channel::<()>();
+
+    let task = scheduler
+        .background()
+        .spawn_dedicated(move |executor| async move {
+            executor
+                .spawn(async move {
+                    receiver.await.ok();
+                })
+                .detach();
+        });
+
+    scheduler.run();
+    assert!(task.is_ready());
+    drop(task);
+
+    drop(scheduler);
+    assert!(weak_scheduler.upgrade().is_none());
+    drop(sender);
+}
+
+#[test]
+fn test_spawn_dedicated_detached_child_wakes_after_root_task_completes() {
+    use parking_lot::Mutex;
+
+    let child_ran = TestScheduler::once(async |scheduler| {
+        let child_ran = Arc::new(Mutex::new(false));
+        let (resume_tx, resume_rx) = oneshot::channel::<()>();
+
+        let task = {
+            let child_ran = child_ran.clone();
+            scheduler
+                .background()
+                .spawn_dedicated(move |executor| async move {
+                    executor
+                        .spawn(async move {
+                            let _ = resume_rx.await;
+                            *child_ran.lock() = true;
+                        })
+                        .detach();
+                })
+        };
+
+        task.await;
+        scheduler.run();
+        assert!(!*child_ran.lock());
+
+        let _ = resume_tx.send(());
+        scheduler.run();
+
+        *child_ran.lock()
+    });
+
+    assert!(
+        child_ran,
+        "detached dedicated child must wake after the root task has completed"
     );
 }

@@ -2,6 +2,9 @@ use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
+use crate::linux::accesskit_shims::{
+    TrivialActionHandler, TrivialActivationHandler, TrivialDeactivationHandler,
+};
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     OverlayInputMode, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
@@ -282,6 +285,7 @@ pub struct X11WindowState {
     edge_constraints: Option<EdgeConstraints>,
     pub handle: AnyWindowHandle,
     last_insets: [u32; 4],
+    accesskit_adapter: Option<accesskit_unix::Adapter>,
 }
 
 impl X11WindowState {
@@ -340,7 +344,12 @@ impl rwh::HasDisplayHandle for X11Window {
         };
         let screen_id = {
             let state = self.0.state.borrow();
-            u32::from(state.display.id()) as i32
+            let display_id = u64::from(state.display.id());
+            let Ok(screen_id) = i32::try_from(display_id) else {
+                log::error!("X11 display id {display_id} cannot fit into XCB screen id");
+                return Err(rwh::HandleError::Unavailable);
+            };
+            screen_id
         };
         let handle = rwh::XcbDisplayHandle::new(Some(non_zero), screen_id);
         Ok(unsafe { rwh::DisplayHandle::borrow_raw(handle.into()) })
@@ -423,9 +432,17 @@ impl X11WindowState {
         supports_xinput_gestures: bool,
         is_bgr: bool,
     ) -> anyhow::Result<Self> {
-        let x_screen_index = params
-            .display_id
-            .map_or(x_main_screen_index, |did| u32::from(did) as usize);
+        let x_screen_index = match params.display_id {
+            Some(did) => {
+                let index = usize::try_from(u64::from(did))
+                    .context("X11 display id does not fit in usize")?;
+                xcb.setup().roots.get(index).with_context(|| {
+                    format!("no X11 screen found for display id {}", u64::from(did))
+                })?;
+                index
+            }
+            None => x_main_screen_index,
+        };
 
         let visual_set = find_visuals(xcb, x_screen_index);
 
@@ -727,6 +744,7 @@ impl X11WindowState {
                     // If the window appearance changes, then the renderer will get updated
                     // too
                     transparent: false,
+                    preferred_present_mode: None,
                 };
                 WgpuRenderer::new(gpu_context, &raw_window, config)?
             };
@@ -780,6 +798,7 @@ impl X11WindowState {
                 decorations: WindowDecorations::Server,
                 last_insets: [0, 0, 0, 0],
                 edge_constraints: None,
+                accesskit_adapter: None,
                 counter_id: sync_request_counter,
                 last_sync_counter: None,
             })
@@ -1049,15 +1068,15 @@ impl X11WindowStatePtr {
             .chunks_exact(4)
             .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
 
-        state.active = false;
         state.fullscreen = false;
         state.maximized_vertical = false;
         state.maximized_horizontal = false;
         state.hidden = false;
 
+        let mut active = false;
         for atom in atoms {
             if atom == state.atoms._NET_WM_STATE_FOCUSED {
-                state.active = true;
+                active = true;
             } else if atom == state.atoms._NET_WM_STATE_FULLSCREEN {
                 state.fullscreen = true;
             } else if atom == state.atoms._NET_WM_STATE_MAXIMIZED_VERT {
@@ -1067,6 +1086,13 @@ impl X11WindowStatePtr {
             } else if atom == state.atoms._NET_WM_STATE_HIDDEN {
                 state.hidden = true;
             }
+        }
+
+        let active_changed = state.active != active;
+        drop(state);
+
+        if active_changed {
+            self.set_active(active);
         }
 
         Ok(())
@@ -1250,8 +1276,12 @@ impl X11WindowStatePtr {
     }
 
     pub fn set_active(&self, focus: bool) {
+        self.state.borrow_mut().active = focus;
         if let Some(ref mut fun) = self.callbacks.borrow_mut().active_status_change {
             fun(focus);
+        }
+        if let Some(adapter) = self.state.borrow_mut().accesskit_adapter.as_mut() {
+            adapter.update_window_focus_state(focus);
         }
     }
 
@@ -1853,5 +1883,60 @@ impl PlatformWindow for X11Window {
         // Volume 0% means don't increase or decrease from system volume.
         check_reply(|| "X11 Bell failed.", self.0.xcb.bell(0)).log_err();
         xcb_flush(&self.0.xcb);
+    }
+
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        let activation_handler = TrivialActivationHandler {
+            callback: callbacks.activation,
+        };
+        let action_handler = TrivialActionHandler {
+            callback: callbacks.action,
+        };
+        let deactivation_handler = TrivialDeactivationHandler {
+            callback: callbacks.deactivation,
+        };
+
+        let mut adapter =
+            accesskit_unix::Adapter::new(activation_handler, action_handler, deactivation_handler);
+        adapter.update_window_focus_state(self.0.state.borrow().active);
+
+        self.0.state.borrow_mut().accesskit_adapter = Some(adapter);
+    }
+
+    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
+        let mut state = self.0.state.borrow_mut();
+        if let Some(adapter) = state.accesskit_adapter.as_mut() {
+            adapter.update_if_active(|| tree_update);
+        }
+    }
+
+    fn a11y_update_window_bounds(&self) {
+        let mut state = self.0.state.borrow_mut();
+        let scale = state.scale_factor;
+        let bounds = state.bounds;
+        let [left, right, top, bottom] = state.last_insets;
+
+        let x = f32::from(bounds.origin.x);
+        let y = f32::from(bounds.origin.y);
+        let width = f32::from(bounds.size.width);
+        let height = f32::from(bounds.size.height);
+
+        let outer = accesskit::Rect {
+            x0: (x * scale) as f64,
+            y0: (y * scale) as f64,
+            x1: ((x + width) * scale) as f64,
+            y1: ((y + height) * scale) as f64,
+        };
+
+        let inner = accesskit::Rect {
+            x0: (x * scale) as f64 + left as f64,
+            y0: (y * scale) as f64 + top as f64,
+            x1: ((x + width) * scale) as f64 - right as f64,
+            y1: ((y + height) * scale) as f64 - bottom as f64,
+        };
+
+        if let Some(adapter) = state.accesskit_adapter.as_mut() {
+            adapter.set_root_window_bounds(outer, inner);
+        }
     }
 }

@@ -1,5 +1,6 @@
 use crate::dispatcher::WebDispatcher;
 use crate::display::WebDisplay;
+use crate::events::WebEventListener;
 use crate::keyboard::WebKeyboardLayout;
 use crate::window::WebWindow;
 use anyhow::Result;
@@ -13,11 +14,12 @@ use gpui::{
 use gpui_wgpu::WgpuContext;
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
 };
+use wasm_bindgen::JsCast;
 
 static BUNDLED_FONTS: &[&[u8]] = &[
     include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
@@ -39,6 +41,10 @@ pub struct WebPlatform {
     active_display: Rc<dyn PlatformDisplay>,
     callbacks: RefCell<WebPlatformCallbacks>,
     wgpu_context: Rc<RefCell<Option<WgpuContext>>>,
+    cursor_visible: Rc<Cell<bool>>,
+    last_cursor_css: Rc<Cell<&'static str>>,
+    #[allow(dead_code)]
+    cursor_restore_listeners: Vec<WebEventListener>,
 }
 
 #[derive(Default)]
@@ -75,6 +81,13 @@ impl WebPlatform {
         }
         let text_system: Arc<dyn PlatformTextSystem> = text_system;
         let active_display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new());
+        let cursor_visible = Rc::new(Cell::new(true));
+        let last_cursor_css = Rc::new(Cell::new("default"));
+        let cursor_restore_listeners = Self::cursor_restore_listeners(
+            &browser_window,
+            cursor_visible.clone(),
+            last_cursor_css.clone(),
+        );
 
         Self {
             browser_window,
@@ -85,7 +98,68 @@ impl WebPlatform {
             active_display,
             callbacks: RefCell::new(WebPlatformCallbacks::default()),
             wgpu_context: Rc::new(RefCell::new(None)),
+            cursor_visible,
+            last_cursor_css,
+            cursor_restore_listeners,
         }
+    }
+
+    fn cursor_restore_listeners(
+        browser_window: &web_sys::Window,
+        cursor_visible: Rc<Cell<bool>>,
+        last_cursor_css: Rc<Cell<&'static str>>,
+    ) -> Vec<WebEventListener> {
+        let mut listeners = Vec::new();
+        let window_target: web_sys::EventTarget = browser_window.clone().unchecked_into();
+        for event_name in ["mousemove", "mouseenter", "blur"] {
+            listeners.push(Self::cursor_restore_listener(
+                window_target.clone(),
+                event_name,
+                browser_window.clone(),
+                cursor_visible.clone(),
+                last_cursor_css.clone(),
+            ));
+        }
+
+        if let Some(document) = browser_window.document() {
+            listeners.push(Self::cursor_restore_listener(
+                document.unchecked_into(),
+                "visibilitychange",
+                browser_window.clone(),
+                cursor_visible,
+                last_cursor_css,
+            ));
+        }
+
+        listeners
+    }
+
+    fn cursor_restore_listener(
+        target: web_sys::EventTarget,
+        event_name: &'static str,
+        browser_window: web_sys::Window,
+        cursor_visible: Rc<Cell<bool>>,
+        last_cursor_css: Rc<Cell<&'static str>>,
+    ) -> WebEventListener {
+        WebEventListener::new(target, event_name, move |_| {
+            if !cursor_visible.replace(true) {
+                Self::apply_cursor_css_to_window(&browser_window, last_cursor_css.get());
+            }
+        })
+    }
+
+    fn apply_cursor_css_to_window(browser_window: &web_sys::Window, css_cursor: &str) {
+        if let Some(document) = browser_window.document() {
+            if let Some(body) = document.body() {
+                if let Err(error) = body.style().set_property("cursor", css_cursor) {
+                    log::warn!("Failed to set cursor style: {error:?}");
+                }
+            }
+        }
+    }
+
+    fn apply_cursor_css(&self, css_cursor: &str) {
+        Self::apply_cursor_css_to_window(&self.browser_window, css_cursor);
     }
 }
 
@@ -302,13 +376,19 @@ impl Platform for WebPlatform {
             CursorStyle::None => "none",
         };
 
-        if let Some(document) = self.browser_window.document() {
-            if let Some(body) = document.body() {
-                if let Err(error) = body.style().set_property("cursor", css_cursor) {
-                    log::warn!("Failed to set cursor style: {error:?}");
-                }
-            }
+        self.last_cursor_css.set(css_cursor);
+        if self.cursor_visible.get() {
+            self.apply_cursor_css(css_cursor);
         }
+    }
+
+    fn hide_cursor_until_mouse_moves(&self) {
+        self.cursor_visible.set(false);
+        self.apply_cursor_css("none");
+    }
+
+    fn is_cursor_visible(&self) -> bool {
+        self.cursor_visible.get() && self.last_cursor_css.get() != "none"
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {

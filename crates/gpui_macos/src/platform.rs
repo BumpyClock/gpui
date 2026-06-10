@@ -50,7 +50,10 @@ use std::{
     ptr,
     rc::Rc,
     slice, str,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use util::{
     ResultExt,
@@ -64,7 +67,7 @@ const MAC_PLATFORM_IVAR: &str = "platform";
 static mut APP_CLASS: *const Class = ptr::null();
 static mut APP_DELEGATE_CLASS: *const Class = ptr::null();
 
-#[ctor]
+#[ctor(unsafe)]
 unsafe fn build_classes() {
     unsafe {
         APP_CLASS = {
@@ -74,7 +77,7 @@ unsafe fn build_classes() {
         }
     };
     unsafe {
-        APP_DELEGATE_CLASS = unsafe {
+        APP_DELEGATE_CLASS = {
             let mut decl = ClassDecl::new("GPUIApplicationDelegate", class!(NSResponder)).unwrap();
             decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
             decl.add_method(
@@ -177,6 +180,9 @@ pub(crate) struct MacPlatformState {
     dock_menu: Option<id>,
     menus: Option<Vec<OwnedMenu>>,
     keyboard_mapper: Rc<MacKeyboardMapper>,
+    /// Mirrors `[NSCursor setHiddenUntilMouseMoves:]` state, which AppKit doesn't expose.
+    cursor_visible: Arc<AtomicBool>,
+    cursor_hidden_by_style: bool,
 }
 
 impl MacPlatform {
@@ -213,6 +219,8 @@ impl MacPlatform {
             on_thermal_state_change: None,
             menus: None,
             keyboard_mapper,
+            cursor_visible: Arc::new(AtomicBool::new(true)),
+            cursor_hidden_by_style: false,
         }))
     }
 
@@ -616,10 +624,14 @@ impl Platform for MacPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        let renderer_context = self.0.lock().renderer_context.clone();
+        let (renderer_context, cursor_visible) = {
+            let state = self.0.lock();
+            (state.renderer_context.clone(), state.cursor_visible.clone())
+        };
         Ok(Box::new(MacWindow::open(
             handle,
             options,
+            cursor_visible,
             self.foreground_executor(),
             self.background_executor(),
             renderer_context,
@@ -975,10 +987,27 @@ impl Platform for MacPlatform {
     /// Match cursor style to one of the styles available
     /// in macOS's [NSCursor](https://developer.apple.com/documentation/appkit/nscursor).
     fn set_cursor_style(&self, style: CursorStyle) {
+        let cursor_was_hidden_by_style = {
+            let mut state = self.0.lock();
+            if style == CursorStyle::None {
+                if state.cursor_hidden_by_style {
+                    return;
+                }
+                state.cursor_hidden_by_style = true;
+                false
+            } else {
+                std::mem::replace(&mut state.cursor_hidden_by_style, false)
+            }
+        };
+
         unsafe {
             if style == CursorStyle::None {
-                let _: () = msg_send![class!(NSCursor), setHiddenUntilMouseMoves:YES];
+                let _: () = msg_send![class!(NSCursor), hide];
                 return;
+            }
+
+            if cursor_was_hidden_by_style {
+                let _: () = msg_send![class!(NSCursor), unhide];
             }
 
             let new_cursor: id = match style {
@@ -1023,6 +1052,21 @@ impl Platform for MacPlatform {
                 let _: () = msg_send![new_cursor, set];
             }
         }
+    }
+
+    fn hide_cursor_until_mouse_moves(&self) {
+        let cursor_visible = self.0.lock().cursor_visible.clone();
+        if !cursor_visible.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        unsafe {
+            let _: () = msg_send![class!(NSCursor), setHiddenUntilMouseMoves: YES];
+        }
+    }
+
+    fn is_cursor_visible(&self) -> bool {
+        let state = self.0.lock();
+        !state.cursor_hidden_by_style && state.cursor_visible.load(Ordering::Relaxed)
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {

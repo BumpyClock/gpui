@@ -2,8 +2,12 @@ use crate::{PlatformDispatcher, RunnableMeta};
 use async_task::Runnable;
 use chrono::{DateTime, Utc};
 use futures::channel::oneshot;
-use scheduler::{Clock, Priority, Scheduler, SessionId, TestScheduler, Timer};
+use scheduler::{
+    Clock, LocalExecutor, Priority, Scheduler, SessionId, Task, TestScheduler, Timer,
+    spawn_dedicated_thread,
+};
 use std::{
+    any::Any,
     future::Future,
     pin::Pin,
     sync::{
@@ -34,8 +38,20 @@ impl PlatformScheduler {
         }
     }
 
-    pub fn allocate_session_id(&self) -> SessionId {
+    fn next_session_id(&self) -> SessionId {
         SessionId::new(self.next_session_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    pub fn foreground_executor(self: &Arc<Self>) -> LocalExecutor {
+        let session_id = self.next_session_id();
+        // Detached local tasks can leave runnables or wakers behind; scheduling
+        // must not keep the platform scheduler alive after callers drop it.
+        let scheduler = Arc::downgrade(self);
+        LocalExecutor::new(session_id, self.clone(), move |runnable| {
+            if let Some(scheduler) = scheduler.upgrade() {
+                scheduler.schedule_local(session_id, runnable);
+            }
+        })
     }
 }
 
@@ -78,7 +94,7 @@ impl Scheduler for PlatformScheduler {
         }
     }
 
-    fn schedule_foreground(&self, _session_id: SessionId, runnable: Runnable<RunnableMeta>) {
+    fn schedule_local(&self, _session_id: SessionId, runnable: Runnable<RunnableMeta>) {
         self.dispatcher
             .dispatch_on_main_thread(runnable, Priority::default());
     }
@@ -102,7 +118,7 @@ impl Scheduler for PlatformScheduler {
 
         // Create a runnable that will send the completion signal
         let location = std::panic::Location::caller();
-        let (runnable, _task) = async_task::Builder::new()
+        let (runnable, task) = async_task::Builder::new()
             .metadata(RunnableMeta { location })
             .spawn(
                 move |_| async move {
@@ -112,6 +128,7 @@ impl Scheduler for PlatformScheduler {
                     dispatcher.dispatch_after(duration, runnable);
                 },
             );
+        task.detach();
         runnable.schedule();
 
         Timer::new(rx)
@@ -119,6 +136,21 @@ impl Scheduler for PlatformScheduler {
 
     fn clock(&self) -> Arc<dyn Clock> {
         self.clock.clone()
+    }
+
+    fn spawn_dedicated(
+        self: Arc<Self>,
+        f: Box<
+            dyn FnOnce(
+                    LocalExecutor,
+                )
+                    -> Pin<Box<dyn Future<Output = Box<dyn Any + Send>> + 'static>>
+                + Send
+                + 'static,
+        >,
+    ) -> Task<Box<dyn Any + Send>> {
+        let session_id = self.next_session_id();
+        spawn_dedicated_thread(session_id, self, move |executor| f(executor))
     }
 
     fn as_test(&self) -> Option<&TestScheduler> {

@@ -362,23 +362,50 @@ impl AsyncWindowContext {
 }
 
 impl AppContext for AsyncWindowContext {
+    /// Create a new entity using the bound window's context.
+    ///
+    /// Panics if the bound window has been closed before the entity can be created.
     fn new<T>(&mut self, build_entity: impl FnOnce(&mut Context<T>) -> T) -> Entity<T>
     where
         T: 'static,
     {
-        self.app.new(build_entity)
+        let mut build_entity = Some(build_entity);
+        match self.app.update_window(self.window, |_, _, cx| {
+            cx.new(
+                build_entity
+                    .take()
+                    .expect("build_entity is taken exactly once"),
+            )
+        }) {
+            Ok(entity) => entity,
+            Err(error) => {
+                panic!("AsyncWindowContext::new failed: bound window could not be updated: {error}")
+            }
+        }
     }
 
     fn reserve_entity<T: 'static>(&mut self) -> Reservation<T> {
         self.app.reserve_entity()
     }
 
+    /// Insert a reserved entity using the bound window's context.
+    ///
+    /// Panics if the bound window has been closed before the entity can be inserted.
     fn insert_entity<T: 'static>(
         &mut self,
         reservation: Reservation<T>,
         build_entity: impl FnOnce(&mut Context<T>) -> T,
     ) -> Entity<T> {
-        self.app.insert_entity(reservation, build_entity)
+        let mut args = Some((reservation, build_entity));
+        match self.app.update_window(self.window, |_, _, cx| {
+            let (reservation, build_entity) = args.take().expect("args are taken exactly once");
+            cx.insert_entity(reservation, build_entity)
+        }) {
+            Ok(entity) => entity,
+            Err(error) => panic!(
+                "AsyncWindowContext::insert_entity failed: bound window could not be updated: {error}"
+            ),
+        }
     }
 
     fn update_entity<T: 'static, R>(
@@ -490,5 +517,117 @@ impl VisualContext for AsyncWindowContext {
         self.app.update_window(self.window, |_, window, cx| {
             view.read(cx).focus_handle(cx).focus(window, cx);
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        any::Any,
+        cell::Cell,
+        panic::{AssertUnwindSafe, catch_unwind},
+        rc::Rc,
+    };
+
+    use crate::{AppContext, Empty, TestAppContext, WindowHandle};
+
+    use super::AsyncWindowContext;
+
+    fn open_async_window_context(
+        cx: &mut TestAppContext,
+    ) -> (AsyncWindowContext, WindowHandle<Empty>) {
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(|_| Empty))
+                .unwrap()
+        });
+        let async_cx = AsyncWindowContext::new_context(cx.to_async(), window.into());
+        (async_cx, window)
+    }
+
+    fn close_window(cx: &mut TestAppContext, window: WindowHandle<Empty>) {
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+    }
+
+    fn panic_message(error: &(dyn Any + Send)) -> Option<&str> {
+        error
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| error.downcast_ref::<&str>().copied())
+    }
+
+    #[gpui::test]
+    fn async_window_context_new_panics_when_bound_window_is_closed(cx: &mut TestAppContext) {
+        let (mut async_cx, window) = open_async_window_context(cx);
+        close_window(cx, window);
+
+        let builder_invoked = Rc::new(Cell::new(false));
+        let result = {
+            let builder_invoked = builder_invoked.clone();
+            catch_unwind(AssertUnwindSafe(move || {
+                async_cx.new(|_| {
+                    builder_invoked.set(true);
+                    1usize
+                });
+            }))
+        };
+
+        let error = result.expect_err("AsyncWindowContext::new should panic");
+        let message = panic_message(error.as_ref()).expect("panic should include a message");
+        assert!(
+            message.contains("AsyncWindowContext::new failed: bound window could not be updated"),
+            "{message}"
+        );
+        assert!(message.contains("window not found"), "{message}");
+        assert!(!builder_invoked.get());
+    }
+
+    #[gpui::test]
+    fn async_window_context_insert_entity_panics_when_bound_window_is_closed(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut async_cx, window) = open_async_window_context(cx);
+        let reservation = async_cx.reserve_entity::<usize>();
+        close_window(cx, window);
+
+        let builder_invoked = Rc::new(Cell::new(false));
+        let result = {
+            let builder_invoked = builder_invoked.clone();
+            catch_unwind(AssertUnwindSafe(move || {
+                async_cx.insert_entity(reservation, |_| {
+                    builder_invoked.set(true);
+                    1usize
+                });
+            }))
+        };
+
+        let error = result.expect_err("AsyncWindowContext::insert_entity should panic");
+        let message = panic_message(error.as_ref()).expect("panic should include a message");
+        assert!(
+            message.contains(
+                "AsyncWindowContext::insert_entity failed: bound window could not be updated"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("window not found"), "{message}");
+        assert!(!builder_invoked.get());
+    }
+
+    #[gpui::test]
+    fn async_window_context_new_uses_live_window(cx: &mut TestAppContext) {
+        let (mut async_cx, _) = open_async_window_context(cx);
+        let builder_invoked = Rc::new(Cell::new(false));
+
+        let entity = {
+            let builder_invoked = builder_invoked.clone();
+            async_cx.new(|_| {
+                builder_invoked.set(true);
+                42usize
+            })
+        };
+
+        assert!(builder_invoked.get());
+        assert_eq!(async_cx.read_entity(&entity, |value, _| *value), 42);
     }
 }

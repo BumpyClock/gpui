@@ -8,7 +8,7 @@ use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
     GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
     IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
-    StyleRefinement, Styled, Window, point, size,
+    StyleRefinement, Styled, Window, point, px, size,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc, usize};
@@ -234,6 +234,22 @@ impl UniformListScrollHandle {
         } else {
             false
         }
+    }
+
+    /// Whether the list is scrolled to the end, or `None` if the list is
+    /// not scrollable.
+    pub fn is_scrolled_to_end(&self) -> Option<bool> {
+        let state = self.0.borrow();
+        let max_offset = state.base_handle.max_offset();
+        if max_offset.height <= px(0.) {
+            return None;
+        }
+        let offset = state.base_handle.offset();
+        Some(if state.y_flipped {
+            offset.y == px(0.)
+        } else {
+            -offset.y >= max_offset.height
+        })
     }
 
     /// Scroll to the bottom of the list.
@@ -707,7 +723,82 @@ impl InteractiveElement for UniformList {
 
 #[cfg(test)]
 mod test {
-    use crate::TestAppContext;
+    use crate::{TestAppContext, UniformListScrollHandle};
+
+    fn draw_scroll_end_test_list(
+        cx: &mut TestAppContext,
+        handle: UniformListScrollHandle,
+        y_flipped: bool,
+    ) {
+        use crate::{
+            Context, IntoElement, Render, Window, div, point, prelude::*, px, size, uniform_list,
+        };
+
+        struct TestView {
+            handle: UniformListScrollHandle,
+            y_flipped: bool,
+        }
+
+        impl Render for TestView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let list = uniform_list("items", 10, |range, _, _| {
+                    range
+                        .map(|ix| div().id(ix).h(px(10.)).child(format!("Item {ix}")))
+                        .collect()
+                })
+                .track_scroll(&self.handle)
+                .h(px(30.));
+
+                if self.y_flipped {
+                    list.y_flipped(true)
+                } else {
+                    list
+                }
+            }
+        }
+
+        let cx = cx.add_empty_window();
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(30.)), |_, cx| {
+            cx.new(|_| TestView { handle, y_flipped })
+                .into_any_element()
+        });
+    }
+
+    #[gpui::test]
+    fn test_is_scrolled_to_end(cx: &mut TestAppContext) {
+        use crate::{UniformListScrollHandle, point, px};
+
+        let handle = UniformListScrollHandle::new();
+        draw_scroll_end_test_list(cx, handle.clone(), false);
+
+        assert_eq!(handle.is_scrolled_to_end(), Some(false));
+
+        let base_handle = handle.0.borrow().base_handle.clone();
+        base_handle.set_offset(point(px(0.), -base_handle.max_offset().height));
+
+        assert_eq!(handle.is_scrolled_to_end(), Some(true));
+    }
+
+    #[gpui::test]
+    fn test_is_scrolled_to_end_with_flipped_list(cx: &mut TestAppContext) {
+        use crate::{UniformListScrollHandle, point, px};
+
+        let handle = UniformListScrollHandle::new();
+        draw_scroll_end_test_list(cx, handle.clone(), true);
+
+        let base_handle = handle.0.borrow().base_handle.clone();
+        base_handle.set_offset(point(px(0.), -base_handle.max_offset().height));
+
+        assert_eq!(handle.is_scrolled_to_end(), Some(false));
+
+        base_handle.set_offset(point(px(0.), px(0.)));
+
+        assert_eq!(handle.is_scrolled_to_end(), Some(true));
+    }
 
     #[gpui::test]
     fn test_scroll_strategy_nearest(cx: &mut TestAppContext) {

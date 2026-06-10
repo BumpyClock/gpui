@@ -27,6 +27,9 @@ use wayland_protocols::{
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
+use crate::linux::accesskit_shims::{
+    TrivialActionHandler, TrivialActivationHandler, TrivialDeactivationHandler,
+};
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
@@ -121,6 +124,7 @@ pub struct WaylandWindowState {
     in_progress_window_controls: Option<WindowControls>,
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
+    accesskit_adapter: Option<accesskit_unix::Adapter>,
 }
 
 pub enum WaylandSurfaceState {
@@ -343,6 +347,7 @@ impl WaylandWindowState {
                     height: DevicePixels(f32::from(options.bounds.size.height) as i32),
                 },
                 transparent: true,
+                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             };
             WgpuRenderer::new(gpu_context, &raw_window, config)?
         };
@@ -393,6 +398,7 @@ impl WaylandWindowState {
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
+            accesskit_adapter: None,
         })
     }
 
@@ -433,6 +439,30 @@ impl WaylandWindowState {
         match self.decorations {
             WindowDecorations::Server => px(0.0),
             WindowDecorations::Client => self.client_inset.unwrap_or(px(0.0)),
+        }
+    }
+
+    fn update_accesskit_window_bounds(&mut self) {
+        let scale = self.scale;
+        let bounds = self.bounds.map_origin(|_| px(0.0));
+        let inner_bounds = bounds.inset(self.inset());
+
+        let outer = accesskit::Rect {
+            x0: f64::from(f32::from(bounds.origin.x) * scale),
+            y0: f64::from(f32::from(bounds.origin.y) * scale),
+            x1: f64::from(f32::from(bounds.origin.x + bounds.size.width) * scale),
+            y1: f64::from(f32::from(bounds.origin.y + bounds.size.height) * scale),
+        };
+
+        let inner = accesskit::Rect {
+            x0: f64::from(f32::from(inner_bounds.origin.x) * scale),
+            y0: f64::from(f32::from(inner_bounds.origin.y) * scale),
+            x1: f64::from(f32::from(inner_bounds.origin.x + inner_bounds.size.width) * scale),
+            y1: f64::from(f32::from(inner_bounds.origin.y + inner_bounds.size.height) * scale),
+        };
+
+        if let Some(adapter) = self.accesskit_adapter.as_mut() {
+            adapter.set_root_window_bounds(outer, inner);
         }
     }
 }
@@ -952,6 +982,7 @@ impl WaylandWindowStatePtr {
             if let Some(scale) = scale {
                 state.scale = scale;
             }
+            state.update_accesskit_window_bounds();
             let device_bounds = state.bounds.to_device_pixels(state.scale);
             state.renderer.update_drawable_size(device_bounds.size);
             (state.bounds.size, state.scale)
@@ -1026,6 +1057,9 @@ impl WaylandWindowStatePtr {
         self.state.borrow_mut().active = focus;
         if let Some(ref mut fun) = self.callbacks.borrow_mut().active_status_change {
             fun(focus);
+        }
+        if let Some(adapter) = self.state.borrow_mut().accesskit_adapter.as_mut() {
+            adapter.update_window_focus_state(focus);
         }
     }
 
@@ -1467,6 +1501,36 @@ impl PlatformWindow for WaylandWindow {
         if let Some(bell) = state.globals.system_bell.as_ref() {
             bell.ring(surface);
         }
+    }
+
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        let activation_handler = TrivialActivationHandler {
+            callback: callbacks.activation,
+        };
+        let action_handler = TrivialActionHandler {
+            callback: callbacks.action,
+        };
+        let deactivation_handler = TrivialDeactivationHandler {
+            callback: callbacks.deactivation,
+        };
+
+        let mut adapter =
+            accesskit_unix::Adapter::new(activation_handler, action_handler, deactivation_handler);
+        adapter.update_window_focus_state(self.borrow().active);
+
+        self.borrow_mut().accesskit_adapter = Some(adapter);
+    }
+
+    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
+        let mut state = self.borrow_mut();
+        if let Some(adapter) = state.accesskit_adapter.as_mut() {
+            adapter.update_if_active(|| tree_update);
+        }
+    }
+
+    fn a11y_update_window_bounds(&self) {
+        let mut state = self.borrow_mut();
+        state.update_accesskit_window_bounds();
     }
 }
 

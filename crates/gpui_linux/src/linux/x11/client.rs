@@ -210,6 +210,8 @@ pub struct X11ClientState {
     pub(crate) cursor_handle: cursor::Handle,
     pub(crate) cursor_styles: HashMap<xproto::Window, CursorStyle>,
     pub(crate) cursor_cache: HashMap<CursorStyle, Option<xproto::Cursor>>,
+    pub(crate) invisible_cursor_cache: Option<xproto::Cursor>,
+    pub(crate) cursor_hidden_window: Option<xproto::Window>,
 
     pointer_device_states: BTreeMap<xinput::DeviceId, PointerDeviceState>,
     pub(crate) pinch_scale: f32,
@@ -247,6 +249,9 @@ impl X11ClientStatePtr {
         }
         if state.keyboard_focused_window == Some(x_window) {
             state.keyboard_focused_window = None;
+        }
+        if state.cursor_hidden_window == Some(x_window) {
+            state.cursor_hidden_window = None;
         }
         state.cursor_styles.remove(&x_window);
     }
@@ -531,6 +536,8 @@ impl X11Client {
             cursor_handle,
             cursor_styles: HashMap::default(),
             cursor_cache: HashMap::default(),
+            cursor_hidden_window: None,
+            invisible_cursor_cache: None,
 
             pointer_device_states,
             pinch_scale: 1.0,
@@ -953,6 +960,7 @@ impl X11Client {
                     compose_state.reset();
                 }
                 state.pre_edit_text.take();
+                state.restore_cursor_after_hide();
                 drop(state);
                 self.reset_ime();
                 window.handle_ime_delete();
@@ -1269,6 +1277,7 @@ impl X11Client {
             Event::XinputMotion(event) => {
                 let window = self.get_window(event.event)?;
                 let mut state = self.0.borrow_mut();
+                state.restore_cursor_after_hide();
                 if window.is_blocked() {
                     // We want to set the cursor to the default arrow
                     // when the window is blocked
@@ -1331,6 +1340,7 @@ impl X11Client {
                 window.set_hovered(true);
                 let mut state = self.0.borrow_mut();
                 state.mouse_focused_window = Some(event.event);
+                state.restore_cursor_after_hide();
             }
             Event::XinputLeave(event) if event.mode == xinput::NotifyMode::NORMAL => {
                 let mut state = self.0.borrow_mut();
@@ -1544,7 +1554,7 @@ impl LinuxClient for X11Client {
             X11Display::new(
                 &state.xcb_connection,
                 state.scale_factor,
-                u32::from(id) as usize,
+                u64::from(id) as usize,
             )
             .ok()?,
         ))
@@ -1646,11 +1656,22 @@ impl LinuxClient for X11Client {
             return;
         }
 
-        let Some(cursor) = state.get_cursor_icon(style) else {
+        state.cursor_styles.insert(focused_window, style);
+
+        // Don't clobber the invisible cursor; restore reads back from `cursor_styles`.
+        if state.cursor_hidden_window == Some(focused_window) {
+            return;
+        }
+
+        let cursor = if style == CursorStyle::None {
+            state.get_or_create_invisible_cursor()
+        } else {
+            state.get_cursor_icon(style)
+        };
+        let Some(cursor) = cursor else {
             return;
         };
 
-        state.cursor_styles.insert(focused_window, style);
         check_reply(
             || "Failed to set cursor style",
             state.xcb_connection.change_window_attributes(
@@ -1663,6 +1684,22 @@ impl LinuxClient for X11Client {
         )
         .log_err();
         state.xcb_connection.flush().log_err();
+    }
+
+    fn hide_cursor_until_mouse_moves(&self) {
+        self.0.borrow_mut().hide_cursor_until_mouse_moves();
+    }
+
+    fn is_cursor_visible(&self) -> bool {
+        let state = self.0.borrow();
+        let focused_cursor_style = state
+            .mouse_focused_window
+            .and_then(|window| state.cursor_styles.get(&window).copied());
+        is_cursor_visible(
+            state.cursor_hidden_window,
+            state.mouse_focused_window,
+            focused_cursor_style,
+        )
     }
 
     fn open_uri(&self, uri: &str) {
@@ -1965,41 +2002,33 @@ impl X11ClientState {
             return *cursor;
         }
 
-        let result;
-        match style {
-            CursorStyle::None => match create_invisible_cursor(&self.xcb_connection) {
-                Ok(loaded_cursor) => result = Ok(loaded_cursor),
-                Err(err) => result = Err(err.context("X11: error while creating invisible cursor")),
-            },
-            _ => 'outer: {
-                let mut errors = String::new();
-                let cursor_icon_names = cursor_style_to_icon_names(style);
-                for cursor_icon_name in cursor_icon_names {
-                    match self
-                        .cursor_handle
-                        .load_cursor(&self.xcb_connection, cursor_icon_name)
-                    {
-                        Ok(loaded_cursor) => {
-                            if loaded_cursor != x11rb::NONE {
-                                result = Ok(loaded_cursor);
-                                break 'outer;
-                            }
-                        }
-                        Err(err) => {
-                            errors.push_str(&err.to_string());
-                            errors.push('\n');
+        let result = 'outer: {
+            let mut errors = String::new();
+            let cursor_icon_names = cursor_style_to_icon_names(style);
+            for cursor_icon_name in cursor_icon_names {
+                match self
+                    .cursor_handle
+                    .load_cursor(&self.xcb_connection, cursor_icon_name)
+                {
+                    Ok(loaded_cursor) => {
+                        if loaded_cursor != x11rb::NONE {
+                            break 'outer Ok(loaded_cursor);
                         }
                     }
+                    Err(err) => {
+                        errors.push_str(&err.to_string());
+                        errors.push('\n');
+                    }
                 }
-                if errors.is_empty() {
-                    result = Err(anyhow!(
-                        "errors while loading cursor icons {:?}:\n{}",
-                        cursor_icon_names,
-                        errors
-                    ));
-                } else {
-                    result = Err(anyhow!("did not find cursor icons {:?}", cursor_icon_names));
-                }
+            }
+            if errors.is_empty() {
+                Err(anyhow!("did not find cursor icons {:?}", cursor_icon_names))
+            } else {
+                Err(anyhow!(
+                    "errors while loading cursor icons {:?}:\n{}",
+                    cursor_icon_names,
+                    errors
+                ))
             }
         };
 
@@ -2030,6 +2059,95 @@ impl X11ClientState {
 
         self.cursor_cache.insert(style, cursor);
         cursor
+    }
+
+    fn get_or_create_invisible_cursor(&mut self) -> Option<xproto::Cursor> {
+        if let Some(cursor) = self.invisible_cursor_cache {
+            return Some(cursor);
+        }
+        let root = self.xcb_connection.setup().roots[self.x_root_index].root;
+        let cursor = create_invisible_cursor(&self.xcb_connection, root)
+            .context("X11: error while creating invisible cursor")
+            .log_err()?;
+        self.invisible_cursor_cache = Some(cursor);
+        Some(cursor)
+    }
+
+    fn hide_cursor_until_mouse_moves(&mut self) {
+        if self.cursor_hidden_window.is_some() {
+            return;
+        }
+        let Some(focused_window) = self.mouse_focused_window else {
+            // No window to apply the per-window invisible cursor to.
+            return;
+        };
+        let Some(invisible_cursor) = self.get_or_create_invisible_cursor() else {
+            return;
+        };
+        let hide_result = check_reply(
+            || "Failed to hide cursor",
+            self.xcb_connection.change_window_attributes(
+                focused_window,
+                &ChangeWindowAttributesAux {
+                    cursor: Some(invisible_cursor),
+                    ..Default::default()
+                },
+            ),
+        )
+        .and_then(|()| {
+            self.xcb_connection
+                .flush()
+                .map(|_| ())
+                .map_err(handle_connection_error)
+                .context("X11 flush failed")
+        })
+        .log_err();
+        if hide_result.is_some() {
+            self.cursor_hidden_window = Some(focused_window);
+        }
+    }
+
+    fn restore_cursor_after_hide(&mut self) {
+        let Some(hidden_window) = self.cursor_hidden_window else {
+            return;
+        };
+        let style = self
+            .cursor_styles
+            .get(&hidden_window)
+            .copied()
+            .unwrap_or(CursorStyle::Arrow);
+        if style == CursorStyle::None {
+            self.cursor_hidden_window = None;
+            return;
+        }
+        let Some(cursor) = self.get_cursor_icon(style) else {
+            log::warn!(
+                "X11: no cursor icon available to restore {:?} after hide; cursor may stay invisible",
+                style
+            );
+            return;
+        };
+        let restore_result = check_reply(
+            || "Failed to restore cursor style after hide",
+            self.xcb_connection.change_window_attributes(
+                hidden_window,
+                &ChangeWindowAttributesAux {
+                    cursor: Some(cursor),
+                    ..Default::default()
+                },
+            ),
+        )
+        .and_then(|()| {
+            self.xcb_connection
+                .flush()
+                .map(|_| ())
+                .map_err(handle_connection_error)
+                .context("X11 flush failed")
+        })
+        .log_err();
+        if restore_result.is_some() {
+            self.cursor_hidden_window = None;
+        }
     }
 }
 
@@ -2396,11 +2514,26 @@ fn make_scroll_wheel_event(
     }
 }
 
+fn is_cursor_visible(
+    cursor_hidden_window: Option<xproto::Window>,
+    mouse_focused_window: Option<xproto::Window>,
+    focused_cursor_style: Option<CursorStyle>,
+) -> bool {
+    if focused_cursor_style == Some(CursorStyle::None) {
+        return false;
+    }
+
+    !matches!(
+        (cursor_hidden_window, mouse_focused_window),
+        (Some(hidden_window), Some(focused_window)) if hidden_window == focused_window
+    )
+}
+
 fn create_invisible_cursor(
     connection: &XCBConnection,
+    root: xproto::Window,
 ) -> anyhow::Result<crate::linux::x11::client::xproto::Cursor> {
     let empty_pixmap = connection.generate_id()?;
-    let root = connection.setup().roots[0].root;
     connection.create_pixmap(1, empty_pixmap, root, 1, 1)?;
 
     let cursor = connection.generate_id()?;
@@ -2694,4 +2827,19 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
     );
 
     key_event_state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_is_visible_unless_hidden_window_is_focused_window() {
+        assert!(is_cursor_visible(None, None, None));
+        assert!(is_cursor_visible(Some(1), None, None));
+        assert!(is_cursor_visible(None, Some(1), None));
+        assert!(is_cursor_visible(Some(1), Some(2), None));
+        assert!(!is_cursor_visible(Some(1), Some(1), None));
+        assert!(!is_cursor_visible(None, Some(1), Some(CursorStyle::None)));
+    }
 }
