@@ -417,6 +417,7 @@ struct MacWindowState {
     native_window: id,
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
+    blurred_view_corner_radius: Option<Pixels>,
     background_appearance: WindowBackgroundAppearance,
     display_link: Option<DisplayLink>,
     renderer: renderer::Renderer,
@@ -739,6 +740,7 @@ impl MacWindow {
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
+                blurred_view_corner_radius: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 display_link: None,
                 renderer: renderer::new_renderer(
@@ -1423,7 +1425,12 @@ impl PlatformWindow for MacWindow {
                 // Whether `-[NSVisualEffectView respondsToSelector:@selector(_updateProxyLayer)]`.
                 // On macOS Catalina/Big Sur `NSVisualEffectView` doesn’t own concrete sublayers
                 // but uses a `CAProxyLayer`. Use the legacy WindowServer API.
-                let blur_radius = if background_appearance == WindowBackgroundAppearance::Blurred {
+                // Any rounded `corner_radius` is ignored here: the CGS window blur can't be
+                // masked (it follows the window alpha), so it degrades to a rectangular blur.
+                let blur_radius = if matches!(
+                    background_appearance,
+                    WindowBackgroundAppearance::Blurred { .. }
+                ) {
                     80
                 } else {
                     0
@@ -1435,25 +1442,45 @@ impl PlatformWindow for MacWindow {
                 // On newer macOS `NSVisualEffectView` manages the effect layer directly. Using it
                 // could have a better performance (it downsamples the backdrop) and more control
                 // over the effect layer.
-                if background_appearance != WindowBackgroundAppearance::Blurred {
-                    if let Some(blur_view) = this.blurred_view {
-                        NSView::removeFromSuperview(blur_view);
-                        this.blurred_view = None;
-                    }
-                } else if this.blurred_view.is_none() {
-                    let content_view = this.native_window.contentView();
-                    let frame = NSView::bounds(content_view);
-                    let mut blur_view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
-                    blur_view = NSView::initWithFrame_(blur_view, frame);
-                    blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+                if let WindowBackgroundAppearance::Blurred { corner_radius } = background_appearance
+                {
+                    let blur_view = if let Some(blur_view) = this.blurred_view {
+                        blur_view
+                    } else {
+                        let content_view = this.native_window.contentView();
+                        let frame = NSView::bounds(content_view);
+                        let mut blur_view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
+                        blur_view = NSView::initWithFrame_(blur_view, frame);
+                        blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
 
-                    let _: () = msg_send![
-                        content_view,
-                        addSubview: blur_view
-                        positioned: NSWindowOrderingMode::NSWindowBelow
-                        relativeTo: nil
-                    ];
-                    this.blurred_view = Some(blur_view.autorelease());
+                        let _: () = msg_send![
+                            content_view,
+                            addSubview: blur_view
+                            positioned: NSWindowOrderingMode::NSWindowBelow
+                            relativeTo: nil
+                        ];
+                        let blur_view = blur_view.autorelease();
+                        this.blurred_view = Some(blur_view);
+                        blur_view
+                    };
+
+                    // The mask image is set once; the view's width/height autoresizing stretches
+                    // its 9-slice cap insets to fit, so no resize hook is needed. Rebuild only
+                    // when the radius actually changes.
+                    if corner_radius > px(0.) {
+                        if this.blurred_view_corner_radius != Some(corner_radius) {
+                            let mask = rounded_rect_mask_image(corner_radius.to_f64());
+                            let _: () = msg_send![blur_view, setMaskImage: mask];
+                            this.blurred_view_corner_radius = Some(corner_radius);
+                        }
+                    } else if this.blurred_view_corner_radius.is_some() {
+                        let _: () = msg_send![blur_view, setMaskImage: nil];
+                        this.blurred_view_corner_radius = None;
+                    }
+                } else if let Some(blur_view) = this.blurred_view {
+                    NSView::removeFromSuperview(blur_view);
+                    this.blurred_view = None;
+                    this.blurred_view_corner_radius = None;
                 }
             }
         }
@@ -2829,6 +2856,55 @@ unsafe fn display_id_for_screen(screen: id) -> CGDirectDisplayID {
         let screen_number = device_description.objectForKey_(screen_number_key);
         let screen_number: NSUInteger = msg_send![screen_number, unsignedIntegerValue];
         screen_number as CGDirectDisplayID
+    }
+}
+
+// `NSEdgeInsets` is not exported by the `cocoa` crate, so mirror AppKit's declaration.
+// Fields are `CGFloat` (f64 on 64-bit) in the order top/left/bottom/right.
+#[repr(C)]
+struct NSEdgeInsets {
+    top: f64,
+    left: f64,
+    bottom: f64,
+    right: f64,
+}
+
+/// Builds a resizable (9-slice) rounded-rect mask image for
+/// `NSVisualEffectView.maskImage`. Radius is in points (== logical pixels).
+unsafe fn rounded_rect_mask_image(radius: f64) -> id {
+    unsafe {
+        let size = NSSize::new(radius * 2.0 + 1.0, radius * 2.0 + 1.0);
+        let handler = ConcreteBlock::new(move |rect: NSRect| -> BOOL {
+            let path: id = msg_send![
+                class!(NSBezierPath),
+                bezierPathWithRoundedRect: rect
+                xRadius: radius
+                yRadius: radius
+            ];
+            let color: id = msg_send![class!(NSColor), blackColor];
+            let _: () = msg_send![color, set];
+            let _: () = msg_send![path, fill];
+            YES
+        });
+        let handler = handler.copy();
+        let image: id = msg_send![
+            class!(NSImage),
+            imageWithSize: size
+            flipped: NO
+            drawingHandler: handler
+        ];
+        let _: () = msg_send![
+            image,
+            setCapInsets: NSEdgeInsets {
+                top: radius,
+                left: radius,
+                bottom: radius,
+                right: radius,
+            }
+        ];
+        // NSImageResizingModeStretch = 1
+        let _: () = msg_send![image, setResizingMode: 1i64];
+        image
     }
 }
 

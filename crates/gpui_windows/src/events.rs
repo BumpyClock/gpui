@@ -222,6 +222,20 @@ impl WindowsWindowInner {
             callback(new_logical_size, scale_factor);
             self.state.callbacks.resize.set(Some(callback));
         }
+        // Re-clip the rounded host-backdrop blur to the new size. This covers
+        // WM_SIZE and DPI changes (which round-trip through WM_SIZE or call this
+        // directly). The renderer recomputes the device-pixel corner radius from
+        // the current scale factor.
+        if let WindowBackgroundAppearance::Blurred { corner_radius } =
+            self.state.background_appearance.get()
+            && corner_radius > px(0.)
+        {
+            self.state
+                .renderer
+                .borrow_mut()
+                .update_rounded_backdrop(scale_factor)
+                .log_err();
+        }
     }
 
     fn handle_size_move_loop(&self, handle: HWND) -> Option<isize> {

@@ -891,9 +891,15 @@ impl PlatformWindow for WindowsWindow {
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         self.state.background_appearance.set(background_appearance);
         let hwnd = self.0.hwnd;
+        let scale_factor = self.state.scale_factor.get();
         let opaque = matches!(background_appearance, WindowBackgroundAppearance::Opaque);
         let corner_preference = match background_appearance {
             WindowBackgroundAppearance::Transparent => DWMWCP_DONOTROUND,
+            // We clip the acrylic blur to our own rounded region, so let Windows
+            // leave the frame square. Radius 0 keeps the legacy default rounding.
+            WindowBackgroundAppearance::Blurred { corner_radius } if corner_radius > px(0.) => {
+                DWMWCP_DONOTROUND
+            }
             _ => DWMWCP_DEFAULT,
         };
         unsafe {
@@ -907,32 +913,76 @@ impl PlatformWindow for WindowsWindow {
 
         // using Dwm APIs for Mica and MicaAlt backdrops.
         // others follow the set_window_composition_attribute approach
+        let mut renderer = self.state.renderer.borrow_mut();
         match background_appearance {
             WindowBackgroundAppearance::Opaque => {
                 set_window_composition_attribute(hwnd, None, 0);
+                renderer
+                    .set_rounded_backdrop_blur(None, scale_factor)
+                    .log_err();
             }
             WindowBackgroundAppearance::Transparent => {
                 set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 2);
                 // Ensure Windows 11 system backdrop is disabled for transparent overlays.
                 dwm_set_window_composition_attribute(hwnd, 1);
+                renderer
+                    .set_rounded_backdrop_blur(None, scale_factor)
+                    .log_err();
             }
-            WindowBackgroundAppearance::Blurred => {
-                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+            WindowBackgroundAppearance::Blurred { corner_radius } => {
+                if corner_radius > px(0.) {
+                    // Documented enabler: DWM only feeds the host backdrop that
+                    // `CreateHostBackdropBrush` samples when DWMWA_USE_HOSTBACKDROPBRUSH
+                    // is set on the top-level HWND.
+                    let use_host_backdrop: BOOL = true.into();
+                    unsafe {
+                        DwmSetWindowAttribute(
+                            hwnd,
+                            DWMWA_USE_HOSTBACKDROPBRUSH,
+                            &use_host_backdrop as *const _ as *const _,
+                            std::mem::size_of::<BOOL>() as u32,
+                        )
+                    }
+                    .log_err();
+                    // Belt-and-suspenders: the undocumented accent state 5
+                    // (ACCENT_ENABLE_HOSTBACKDROP) also nudges DWM to provide the
+                    // host backdrop on builds where the attribute alone is not
+                    // enough. The rounded clip is applied by the
+                    // Windows.UI.Composition tree in the renderer, so no GDI window
+                    // region is used here.
+                    //
+                    // Note: when the OS "Transparency effects" setting is off, or
+                    // under battery saver / Remote Desktop, HostBackdropBrush
+                    // renders its fallback and the pill shows transparent (not
+                    // blurred). That degradation is expected and needs no code.
+                    set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 5);
+                    renderer
+                        .set_rounded_backdrop_blur(Some(f32::from(corner_radius)), scale_factor)
+                        .log_err();
+                } else {
+                    set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+                    renderer
+                        .set_rounded_backdrop_blur(None, scale_factor)
+                        .log_err();
+                }
             }
             WindowBackgroundAppearance::MicaBackdrop => {
                 // DWMSBT_MAINWINDOW => MicaBase
                 dwm_set_window_composition_attribute(hwnd, 2);
+                renderer
+                    .set_rounded_backdrop_blur(None, scale_factor)
+                    .log_err();
             }
             WindowBackgroundAppearance::MicaAltBackdrop => {
                 // DWMSBT_TABBEDWINDOW => MicaAlt
                 dwm_set_window_composition_attribute(hwnd, 4);
+                renderer
+                    .set_rounded_backdrop_blur(None, scale_factor)
+                    .log_err();
             }
         }
 
-        self.state
-            .renderer
-            .borrow_mut()
-            .update_transparency(!opaque);
+        renderer.update_transparency(!opaque);
     }
 
     fn set_has_shadow(&self, has_shadow: bool) {
@@ -1671,13 +1721,15 @@ fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32
             let set_window_composition_attribute: SetWindowCompositionAttributeType =
                 std::mem::transmute(GetProcAddress(user32, func_name));
             let mut color = color.unwrap_or_default();
-            let is_acrylic = state == 4;
-            if is_acrylic && color.3 == 0 {
+            // state 4 = ACCENT_ENABLE_ACRYLICBLURBEHIND, 5 = ACCENT_ENABLE_HOSTBACKDROP.
+            let is_blur = state == 4 || state == 5;
+            // Acrylic needs a non-zero gradient alpha to tint; host backdrop does not.
+            if state == 4 && color.3 == 0 {
                 color.3 = 1;
             }
             let accent = AccentPolicy {
                 accent_state: state,
-                accent_flags: if is_acrylic { 0 } else { 2 },
+                accent_flags: if is_blur { 0 } else { 2 },
                 gradient_color: (color.0 as u32)
                     | ((color.1 as u32) << 8)
                     | ((color.2 as u32) << 16)

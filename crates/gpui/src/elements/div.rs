@@ -2175,6 +2175,18 @@ impl Interactivity {
                                     |window| {
                                         window.with_tab_group(tab_group, |window| {
                                             if let Some(hitbox) = hitbox {
+                                                let current_a11y_node_id = if window
+                                                    .a11y
+                                                    .is_active()
+                                                    && self.current_a11y_node
+                                                {
+                                                    global_id.and_then(|global_id| {
+                                                        window.a11y.node_id_for_existing(global_id)
+                                                    })
+                                                } else {
+                                                    None
+                                                };
+
                                                 #[cfg(debug_assertions)]
                                                 self.paint_debug_info(
                                                     global_id, hitbox, &style, window, cx,
@@ -2206,6 +2218,7 @@ impl Interactivity {
                                                 self.paint_mouse_listeners(
                                                     hitbox,
                                                     element_state.as_mut(),
+                                                    current_a11y_node_id,
                                                     window,
                                                     cx,
                                                 );
@@ -2392,6 +2405,7 @@ impl Interactivity {
         &mut self,
         hitbox: &Hitbox,
         element_state: Option<&mut InteractiveElementState>,
+        a11y_node_id: Option<accesskit::NodeId>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -2511,6 +2525,30 @@ impl Interactivity {
         let click_listeners = mem::take(&mut self.click_listeners);
         let aux_click_listeners = mem::take(&mut self.aux_click_listeners);
         let can_drop_predicate = mem::take(&mut self.can_drop_predicate);
+
+        let has_explicit_a11y_click_listener = self.a11y_state.as_ref().is_some_and(|a11y_state| {
+            a11y_state
+                .action_listeners
+                .iter()
+                .any(|(action, _)| *action == accesskit::Action::Click)
+        });
+        if let Some(node_id) = a11y_node_id
+            && !click_listeners.is_empty()
+            && !has_explicit_a11y_click_listener
+        {
+            let click_listeners = click_listeners.clone();
+            let bounds = hitbox.bounds;
+            window.on_a11y_action(node_id, accesskit::Action::Click, move |_, window, cx| {
+                let click_event = ClickEvent::Keyboard(KeyboardClickEvent {
+                    button: KeyboardButton::Enter,
+                    bounds,
+                });
+
+                for listener in &click_listeners {
+                    listener(&click_event, window, cx);
+                }
+            });
+        }
 
         if !drop_listeners.is_empty() {
             let hitbox = hitbox.clone();
@@ -4194,19 +4232,24 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a11y_translated_clickable_div_updates_bounds_and_clicks_at_translated_center(
+    fn a11y_translated_clickable_div_invokes_click_listener_without_mouse_event(
         cx: &mut TestAppContext,
     ) {
-        let clicked_at = Rc::new(Cell::new(None));
+        let click_count = Rc::new(Cell::new(0));
+        let mouse_position = Rc::new(Cell::new(None));
         let cx = cx.add_empty_window();
 
         let update = draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
-            let clicked_at = clicked_at.clone();
+            let click_count = click_count.clone();
+            let mouse_position = mouse_position.clone();
             move |_, _| {
                 div()
                     .id("translated-button")
                     .role(accesskit::Role::Button)
-                    .on_click(move |event, _, _| clicked_at.set(Some(event.position())))
+                    .on_click(move |event, _, _| {
+                        click_count.set(click_count.get() + 1);
+                        mouse_position.set(event.mouse_position());
+                    })
                     .translate(px(10.), px(20.))
                     .w(px(40.))
                     .h(px(30.))
@@ -4244,7 +4287,8 @@ mod tests {
             );
         });
 
-        assert_eq!(clicked_at.get(), Some(point(px(30.), px(35.))));
+        assert_eq!(click_count.get(), 1);
+        assert_eq!(mouse_position.get(), None);
     }
 
     #[gpui::test]

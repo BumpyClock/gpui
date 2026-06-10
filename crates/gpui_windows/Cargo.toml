@@ -35,7 +35,12 @@ raw-window-handle = "0.6"
 smallvec.workspace = true
 util.workspace = true
 uuid.workspace = true
-windows.workspace = true
+windows = { workspace = true, features = [
+    "UI_Composition",
+    "UI_Composition_Desktop",
+    "System",
+    "Win32_System_WinRT_Composition",
+] }
 windows-core.workspace = true
 windows-numerics = "0.2"
 windows-registry = "0.5"

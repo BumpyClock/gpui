@@ -8,6 +8,11 @@ use std::{
 use ::util::ResultExt;
 use anyhow::{Context, Result};
 use windows::{
+    System::DispatcherQueueController,
+    UI::Composition::{
+        CompositionRoundedRectangleGeometry, Compositor, ContainerVisual,
+        Desktop::DesktopWindowTarget, SpriteVisual,
+    },
     Win32::{
         Foundation::HWND,
         Graphics::{
@@ -17,9 +22,15 @@ use windows::{
             DirectWrite::*,
             Dxgi::{Common::*, *},
         },
+        System::WinRT::{
+            Composition::{ICompositorDesktopInterop, ICompositorInterop},
+            CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT,
+            DispatcherQueueOptions,
+        },
     },
     core::{IUnknown, Interface},
 };
+use windows_numerics::Vector2;
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
@@ -49,6 +60,16 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
+    /// Windows.UI.Composition tree used for the rounded host-backdrop blur mode.
+    /// When `Some`, `direct_composition` is `None` (only one composition target
+    /// may exist per HWND) and the swap chain is presented through this tree.
+    rounded_backdrop: Option<RoundedBackdrop>,
+    /// Logical (DIP) corner radius for the rounded backdrop, retained so the
+    /// device-pixel radius can be recomputed on resize / DPI change.
+    rounded_backdrop_radius: Option<f32>,
+    /// Last scale factor applied to the rounded backdrop, retained so the tree
+    /// can be rebuilt with the correct device-pixel radius after device loss.
+    rounded_backdrop_scale: f32,
     font_info: &'static FontInfo,
 
     width: u32,
@@ -236,6 +257,9 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
+            rounded_backdrop: None,
+            rounded_backdrop_radius: None,
+            rounded_backdrop_scale: 1.0,
             font_info: Self::get_font_info(),
             width: 1,
             height: 1,
@@ -327,6 +351,7 @@ impl DirectXRenderer {
     }
 
     fn update_retained_layer_cache(&mut self, scene: &Scene) -> Result<()> {
+        let supports_retained_layer_scene = self.supports_retained_layer_scene(scene);
         let Some(direct_composition) = self.direct_composition.as_mut() else {
             return Ok(());
         };
@@ -337,7 +362,7 @@ impl DirectXRenderer {
             .swap_chain
             .clone();
 
-        if !self.supports_retained_layer_scene(scene) {
+        if !supports_retained_layer_scene {
             direct_composition.disable_retained_layers(&swap_chain)?;
             return Ok(());
         }
@@ -389,7 +414,11 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        let disable_direct_composition = self.direct_composition.is_none();
+        let rounded_active = self.rounded_backdrop.is_some();
+        // The rounded backdrop mode still relies on a composition swap chain even
+        // though it has no `DirectComposition` target, so don't disable DComp
+        // resources when it is active.
+        let disable_direct_composition = self.direct_composition.is_none() && !rounded_active;
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -411,6 +440,7 @@ impl DirectXRenderer {
             }
 
             self.direct_composition.take();
+            self.rounded_backdrop.take();
             self.devices.take();
         }
 
@@ -429,13 +459,28 @@ impl DirectXRenderer {
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectXRenderPipelines")?;
 
-        let direct_composition = if disable_direct_composition {
+        let direct_composition = if disable_direct_composition || rounded_active {
             None
         } else {
             let mut composition =
                 DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), self.hwnd)?;
             composition.set_swap_chain(&resources.swap_chain)?;
             Some(composition)
+        };
+        let rounded_backdrop = if rounded_active {
+            let device_radius =
+                self.rounded_backdrop_radius.unwrap_or(0.0) * self.rounded_backdrop_scale;
+            RoundedBackdrop::new(
+                self.hwnd,
+                &resources.swap_chain,
+                self.width,
+                self.height,
+                device_radius,
+            )
+            .context("Rebuilding rounded backdrop after device lost")
+            .log_err()
+        } else {
+            None
         };
 
         self.atlas
@@ -451,6 +496,7 @@ impl DirectXRenderer {
         self.globals = globals;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
+        self.rounded_backdrop = rounded_backdrop;
         self.skip_draws = true;
         Ok(())
     }
@@ -657,6 +703,12 @@ impl DirectXRenderer {
     }
 
     pub(crate) fn update_transparency(&mut self, transparent: bool) {
+        // The rounded backdrop mode already composes the swap chain with per-pixel
+        // alpha through its own Windows.UI.Composition target; never create a
+        // competing DirectComposition target for the same HWND.
+        if self.rounded_backdrop.is_some() {
+            return;
+        }
         if !transparent || self.direct_composition.is_some() {
             return;
         }
@@ -664,6 +716,102 @@ impl DirectXRenderer {
         self.enable_direct_composition_for_transparency()
             .context("Failed to enable transparency in DirectXRenderer")
             .log_err();
+    }
+
+    /// Enables or disables the rounded host-backdrop blur mode.
+    ///
+    /// `Some(logical_radius)` builds (or updates) a Windows.UI.Composition tree
+    /// for this HWND: a backdrop `SpriteVisual` painted with a host-backdrop
+    /// brush and an antialiased rounded-rectangle clip, plus a content
+    /// `SpriteVisual` whose brush is a composition surface wrapping the existing
+    /// swap chain (clipped to the same rounded rect). Because only one
+    /// composition target may exist per HWND, the legacy `DirectComposition`
+    /// target is torn down while this mode is active.
+    ///
+    /// `None` tears the tree down and restores the plain `DirectComposition`
+    /// transparency path (if it was previously in use).
+    pub(crate) fn set_rounded_backdrop_blur(
+        &mut self,
+        logical_radius: Option<f32>,
+        scale_factor: f32,
+    ) -> Result<()> {
+        match logical_radius {
+            Some(radius) => {
+                self.rounded_backdrop_radius = Some(radius);
+                self.rounded_backdrop_scale = scale_factor;
+                let device_radius = radius * scale_factor;
+
+                // Only one composition target per HWND: drop the DComp target.
+                self.direct_composition.take();
+
+                if let Some(backdrop) = self.rounded_backdrop.as_ref() {
+                    backdrop.update_geometry(self.width, self.height, device_radius)?;
+                } else {
+                    let swap_chain = self
+                        .resources
+                        .as_ref()
+                        .context("resources missing")?
+                        .swap_chain
+                        .clone();
+                    let backdrop = RoundedBackdrop::new(
+                        self.hwnd,
+                        &swap_chain,
+                        self.width,
+                        self.height,
+                        device_radius,
+                    )
+                    .context("Creating rounded backdrop")?;
+                    self.rounded_backdrop = Some(backdrop);
+                }
+            }
+            None => {
+                self.rounded_backdrop_radius = None;
+                if self.rounded_backdrop.take().is_some() {
+                    // We tore down the DComp target when entering rounded mode;
+                    // rebuild it so plain transparency keeps working.
+                    self.rebuild_direct_composition()
+                        .context("Restoring DirectComposition after rounded backdrop")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Recomputes the rounded backdrop clip geometry for the current device size
+    /// and scale factor. Called on resize / DPI change. No-op unless rounded
+    /// mode is active.
+    pub(crate) fn update_rounded_backdrop(&mut self, scale_factor: f32) -> Result<()> {
+        let Some(radius) = self.rounded_backdrop_radius else {
+            return Ok(());
+        };
+        self.rounded_backdrop_scale = scale_factor;
+        let device_radius = radius * scale_factor;
+        let (width, height) = (self.width, self.height);
+        if let Some(backdrop) = self.rounded_backdrop.as_ref() {
+            backdrop.update_geometry(width, height, device_radius)?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_direct_composition(&mut self) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let dxgi_device = devices
+            .dxgi_device
+            .as_ref()
+            .context("dxgi device missing for DirectComposition")?;
+        let swap_chain = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .swap_chain
+            .clone();
+        let mut composition =
+            DirectComposition::new(dxgi_device, self.hwnd).context("Creating DirectComposition")?;
+        composition
+            .set_swap_chain(&swap_chain)
+            .context("Setting swap chain for DirectComposition")?;
+        self.direct_composition = Some(composition);
+        Ok(())
     }
 
     fn enable_direct_composition_for_transparency(&mut self) -> Result<()> {
@@ -1837,6 +1985,151 @@ impl DirectComposition {
 
     pub fn commit(&self) -> Result<()> {
         self.retained_compositor.commit()
+    }
+}
+
+thread_local! {
+    /// A `DispatcherQueue` must exist on the current thread before a
+    /// `Compositor` can be constructed. We create one lazily per thread and keep
+    /// it alive for the life of the thread (windows run their message loop on the
+    /// same thread, which pumps the queue).
+    static DISPATCHER_QUEUE_CONTROLLER: std::cell::RefCell<Option<DispatcherQueueController>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Ensures a `DispatcherQueue` exists for the current thread so a `Compositor`
+/// can be created. Non-fatal: if a queue already exists (e.g. created elsewhere)
+/// the call fails and we proceed, since `Compositor::new` will still succeed.
+fn ensure_dispatcher_queue() {
+    DISPATCHER_QUEUE_CONTROLLER.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.is_some() {
+            return;
+        }
+        let options = DispatcherQueueOptions {
+            dwSize: std::mem::size_of::<DispatcherQueueOptions>() as u32,
+            threadType: DQTYPE_THREAD_CURRENT,
+            apartmentType: DQTAT_COM_NONE,
+        };
+        match unsafe { CreateDispatcherQueueController(options) } {
+            Ok(controller) => *cell = Some(controller),
+            Err(e) => {
+                log::warn!(
+                    "CreateDispatcherQueueController failed (a queue may already exist): {e}"
+                )
+            }
+        }
+    });
+}
+
+/// A Windows.UI.Composition tree that hosts the swap chain content above a
+/// host-backdrop blur, both clipped to an antialiased rounded rectangle.
+struct RoundedBackdrop {
+    // Held to keep the composition tree alive; not otherwise read.
+    _compositor: Compositor,
+    _target: DesktopWindowTarget,
+    _root: ContainerVisual,
+    _backdrop_visual: SpriteVisual,
+    _content_visual: SpriteVisual,
+    geometry: CompositionRoundedRectangleGeometry,
+}
+
+impl RoundedBackdrop {
+    fn new(
+        hwnd: HWND,
+        swap_chain: &IDXGISwapChain1,
+        width: u32,
+        height: u32,
+        device_radius: f32,
+    ) -> Result<Self> {
+        ensure_dispatcher_queue();
+
+        let compositor = Compositor::new().context("Creating WinComp Compositor")?;
+
+        let desktop_interop: ICompositorDesktopInterop = compositor
+            .cast()
+            .context("Casting Compositor to ICompositorDesktopInterop")?;
+        let target = unsafe { desktop_interop.CreateDesktopWindowTarget(hwnd, false) }
+            .context("Creating DesktopWindowTarget")?;
+
+        let root = compositor
+            .CreateContainerVisual()
+            .context("Creating root ContainerVisual")?;
+        root.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
+        target.SetRoot(&root)?;
+
+        // Shared rounded-rect geometry in physical pixels (DesktopWindowTarget
+        // visuals are not DPI-scaled).
+        let geometry = compositor
+            .CreateRoundedRectangleGeometry()
+            .context("Creating rounded rectangle geometry")?;
+        geometry.SetSize(Vector2 {
+            X: width as f32,
+            Y: height as f32,
+        })?;
+        geometry.SetCornerRadius(Vector2 {
+            X: device_radius,
+            Y: device_radius,
+        })?;
+
+        let backdrop_clip = compositor
+            .CreateGeometricClipWithGeometry(&geometry)
+            .context("Creating backdrop geometric clip")?;
+        let content_clip = compositor
+            .CreateGeometricClipWithGeometry(&geometry)
+            .context("Creating content geometric clip")?;
+
+        // Backdrop visual: host-backdrop blur clipped to the rounded rect.
+        let backdrop_visual = compositor
+            .CreateSpriteVisual()
+            .context("Creating backdrop SpriteVisual")?;
+        backdrop_visual.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
+        let host_brush = compositor
+            .CreateHostBackdropBrush()
+            .context("Creating host backdrop brush")?;
+        backdrop_visual.SetBrush(&host_brush)?;
+        backdrop_visual.SetClip(&backdrop_clip)?;
+
+        // Content visual: the GPUI swap chain, also clipped to the rounded rect.
+        let content_visual = compositor
+            .CreateSpriteVisual()
+            .context("Creating content SpriteVisual")?;
+        content_visual.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
+        let surface_interop: ICompositorInterop = compositor
+            .cast()
+            .context("Casting Compositor to ICompositorInterop")?;
+        let surface = unsafe { surface_interop.CreateCompositionSurfaceForSwapChain(swap_chain) }
+            .context("Creating composition surface for swap chain")?;
+        let surface_brush = compositor
+            .CreateSurfaceBrushWithSurface(&surface)
+            .context("Creating surface brush")?;
+        content_visual.SetBrush(&surface_brush)?;
+        content_visual.SetClip(&content_clip)?;
+
+        let children = root.Children()?;
+        children.InsertAtTop(&backdrop_visual)?;
+        children.InsertAtTop(&content_visual)?;
+
+        Ok(Self {
+            _compositor: compositor,
+            _target: target,
+            _root: root,
+            _backdrop_visual: backdrop_visual,
+            _content_visual: content_visual,
+            geometry,
+        })
+    }
+
+    fn update_geometry(&self, width: u32, height: u32, device_radius: f32) -> Result<()> {
+        self.geometry.SetSize(Vector2 {
+            X: width as f32,
+            Y: height as f32,
+        })?;
+        self.geometry.SetCornerRadius(Vector2 {
+            X: device_radius,
+            Y: device_radius,
+        })?;
+        Ok(())
     }
 }
 
