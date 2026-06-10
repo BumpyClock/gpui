@@ -969,7 +969,7 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn set_size_and_scale(&self, size: Option<Size<Pixels>>, scale: Option<f32>) {
-        let (size, scale) = {
+        let (size, scale, needs_blur_update) = {
             let mut state = self.state.borrow_mut();
             if size.is_none_or(|size| size == state.bounds.size)
                 && scale.is_none_or(|scale| scale == state.scale)
@@ -985,7 +985,13 @@ impl WaylandWindowStatePtr {
             state.update_accesskit_window_bounds();
             let device_bounds = state.bounds.to_device_pixels(state.scale);
             state.renderer.update_drawable_size(device_bounds.size);
-            (state.bounds.size, state.scale)
+            // A rounded blur region depends on the window size, so it must be
+            // rebuilt on resize. Capture the flag before dropping the borrow.
+            let needs_blur_update = matches!(
+                state.background_appearance,
+                WindowBackgroundAppearance::Blurred { corner_radius } if corner_radius > px(0.)
+            );
+            (state.bounds.size, state.scale, needs_blur_update)
         };
 
         if let Some(ref mut fun) = self.callbacks.borrow_mut().resize {
@@ -998,6 +1004,10 @@ impl WaylandWindowStatePtr {
                 viewport
                     .set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
             }
+        }
+
+        if needs_blur_update {
+            update_window(self.state.borrow_mut());
         }
     }
 
@@ -1534,6 +1544,39 @@ impl PlatformWindow for WaylandWindow {
     }
 }
 
+/// Approximates a rounded rectangle as horizontal bands for building a
+/// `wl_region`. Returns `(x, y, width, height)` rects in surface-local
+/// logical coordinates. `radius` is clamped to `min(width, height) / 2`;
+/// radius 0 yields a single full rect.
+pub(crate) fn rounded_rect_region_bands(
+    width: i32,
+    height: i32,
+    radius: i32,
+) -> Vec<(i32, i32, i32, i32)> {
+    if width <= 0 || height <= 0 {
+        return Vec::new();
+    }
+    let r = radius.clamp(0, width.min(height) / 2);
+    if r == 0 {
+        return vec![(0, 0, width, height)];
+    }
+
+    let rf = r as f64;
+    let mut bands = Vec::with_capacity((2 * r + 1) as usize);
+    for y in 0..r {
+        // Sample the band's vertical center to pick a representative inset.
+        let dy = rf - y as f64 - 0.5;
+        let inset = (rf - (rf * rf - dy * dy).sqrt()).round() as i32;
+        let band_width = width - 2 * inset;
+        // Top band, then its mirror at the bottom.
+        bands.push((inset, y, band_width, 1));
+        bands.push((inset, height - 1 - y, band_width, 1));
+    }
+    // Middle slab between the two rounded ends.
+    bands.push((0, r, width, height - 2 * r));
+    bands
+}
+
 fn update_window(mut state: RefMut<WaylandWindowState>) {
     let opaque = !state.is_transparent();
 
@@ -1580,17 +1623,38 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     state.surface.set_input_region(Some(&input_region));
 
     if let Some(ref blur_manager) = state.globals.blur_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
-            if state.blur.is_none() {
-                let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
-                state.blur = Some(blur);
+        match state.background_appearance {
+            WindowBackgroundAppearance::Blurred { corner_radius } => {
+                if state.blur.is_none() {
+                    let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
+                    state.blur = Some(blur);
+                }
+                // Clip the blur to a rounded rect approximated by horizontal
+                // bands, using the same logical window size as the opaque region.
+                let bounds = state.window_bounds.map(|v| f32::from(v) as i32);
+                let radius = f32::from(corner_radius) as i32;
+                let region = state
+                    .globals
+                    .compositor
+                    .create_region(&state.globals.qh, ());
+                for (x, y, w, h) in
+                    rounded_rect_region_bands(bounds.size.width, bounds.size.height, radius)
+                {
+                    region.add(x, y, w, h);
+                }
+                let blur = state.blur.as_ref().unwrap();
+                // Always set the region explicitly so a radius change clears any
+                // stale region; a null region would mean "whole surface" to KWin.
+                blur.set_region(Some(&region));
+                blur.commit();
+                region.destroy();
             }
-            state.blur.as_ref().unwrap().commit();
-        } else {
-            // It probably doesn't hurt to clear the blur for opaque windows
-            blur_manager.unset(&state.surface);
-            if let Some(b) = state.blur.take() {
-                b.release()
+            _ => {
+                // It probably doesn't hurt to clear the blur for opaque windows
+                blur_manager.unset(&state.surface);
+                if let Some(b) = state.blur.take() {
+                    b.release()
+                }
             }
         }
     }
@@ -1674,4 +1738,77 @@ fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) ->
     }
 
     bounds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rounded_rect_region_bands;
+    use std::collections::HashMap;
+
+    #[test]
+    fn radius_zero_is_single_full_rect() {
+        assert_eq!(rounded_rect_region_bands(120, 80, 0), vec![(0, 0, 120, 80)]);
+    }
+
+    #[test]
+    fn degenerate_sizes_yield_empty() {
+        assert!(rounded_rect_region_bands(0, 80, 10).is_empty());
+        assert!(rounded_rect_region_bands(120, 0, 10).is_empty());
+        assert!(rounded_rect_region_bands(-5, 80, 10).is_empty());
+    }
+
+    #[test]
+    fn band_count_is_two_r_plus_one() {
+        let (w, h, r) = (200, 200, 30);
+        assert!(r < w.min(h) / 2);
+        let bands = rounded_rect_region_bands(w, h, r);
+        assert_eq!(bands.len() as i32, 2 * r + 1);
+    }
+
+    #[test]
+    fn top_bottom_symmetry() {
+        let (w, h, r) = (200, 120, 25);
+        let bands = rounded_rect_region_bands(w, h, r);
+        // Map each band's y to its (x, width).
+        let by_y: HashMap<i32, (i32, i32)> =
+            bands.iter().map(|&(x, y, bw, _)| (y, (x, bw))).collect();
+        for y in 0..r {
+            let top = by_y[&y];
+            let bottom = by_y[&(h - 1 - y)];
+            assert_eq!(top, bottom, "rows {y} and {} differ", h - 1 - y);
+        }
+    }
+
+    #[test]
+    fn no_negative_widths_and_insets_in_range() {
+        let (w, h, r) = (200, 120, 25);
+        let bands = rounded_rect_region_bands(w, h, r);
+        for &(x, _y, bw, bh) in &bands {
+            assert!(bw >= 0, "negative width {bw}");
+            assert!(bh >= 0, "negative height {bh}");
+            // x is the inset for the rounded rows; must stay within [0, r].
+            assert!(x >= 0 && x <= r, "inset {x} out of range");
+        }
+    }
+
+    #[test]
+    fn oversized_radius_clamps() {
+        // min(width, height) / 2 == 25, so radius 100 behaves as radius 25.
+        assert_eq!(
+            rounded_rect_region_bands(200, 50, 100),
+            rounded_rect_region_bands(200, 50, 25)
+        );
+    }
+
+    #[test]
+    fn insets_are_monotonic() {
+        let (w, h, r) = (200, 120, 25);
+        let bands = rounded_rect_region_bands(w, h, r);
+        let by_y: HashMap<i32, i32> = bands.iter().map(|&(x, y, _, _)| (y, x)).collect();
+        // Inset is widest at the very edge (y = 0) and shrinks toward the slab.
+        let first = by_y[&0];
+        let last = by_y[&(r - 1)];
+        assert!(first >= last, "inset(0)={first} < inset(r-1)={last}");
+        assert!(last >= 0);
+    }
 }

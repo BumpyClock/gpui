@@ -1356,6 +1356,10 @@ pub struct OverlaySurfaceOptions {
     /// Whether the overlay should be focused when created.
     pub focus: bool,
     /// The appearance of the overlay background.
+    ///
+    /// Use `WindowBackgroundAppearance::Blurred { corner_radius }` to enable
+    /// native compositor blur clipped to a rounded rect — ideal for pill-shaped
+    /// overlays that should not show a rectangular blur gutter behind them.
     pub window_background: WindowBackgroundAppearance,
     /// Whether platform shadow should be enabled.
     pub has_shadow: Option<bool>,
@@ -1608,10 +1612,25 @@ pub enum WindowBackgroundAppearance {
     Opaque,
     /// Plain alpha transparency.
     Transparent,
-    /// Transparency, but the contents behind the window are blurred.
+    /// Plain alpha transparency with the desktop/window content behind the
+    /// window blurred by the OS compositor.
     ///
-    /// Not always supported.
-    Blurred,
+    /// `corner_radius` (logical pixels) clips the native blur to a rounded
+    /// rectangle so small pill-shaped overlays do not show a rectangular blur
+    /// gutter; `px(0.)` keeps the full rectangular window blur (legacy behavior).
+    ///
+    /// Platform support:
+    /// - Windows: acrylic accent, clipped via a rounded HWND region (GDI regions
+    ///   are aliased; render your content rounded at the same radius to hide the edge).
+    /// - macOS 12+: NSVisualEffectView with a rounded mask image; macOS < 12
+    ///   degrades to unmasked window-background blur.
+    /// - Linux Wayland: KDE blur protocol with a region approximating the rounded
+    ///   rect; compositors without blur support degrade to plain transparency.
+    /// - X11 / web: degrades to plain transparency (no blur, no artifact).
+    Blurred {
+        /// Corner radius of the blur clip region, in logical pixels. `px(0.)` = rectangular.
+        corner_radius: Pixels,
+    },
     /// The Mica backdrop material, supported on Windows 11.
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.
@@ -2180,5 +2199,27 @@ impl From<String> for ClipboardString {
             text: value,
             metadata: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_surface_options_preserve_blurred_rounded_background() {
+        let options = OverlaySurfaceOptions {
+            window_background: WindowBackgroundAppearance::Blurred {
+                corner_radius: px(12.),
+            },
+            ..Default::default()
+        };
+        let window_options = options.into_window_options();
+        assert_eq!(
+            window_options.window_background,
+            WindowBackgroundAppearance::Blurred {
+                corner_radius: px(12.)
+            }
+        );
     }
 }
