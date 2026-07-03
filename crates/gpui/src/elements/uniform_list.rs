@@ -5,10 +5,10 @@
 //! elements with uniform height.
 
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
-    GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
-    IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
-    StyleRefinement, Styled, Window, point, px, size,
+    point, px, size, AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId,
+    Entity, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity,
+    IntoElement, IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
+    StyleRefinement, Styled, Window,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc, usize};
@@ -245,10 +245,11 @@ impl UniformListScrollHandle {
             return None;
         }
         let offset = state.base_handle.offset();
+        let threshold = px(1.);
         Some(if state.y_flipped {
-            offset.y == px(0.)
+            offset.y >= -threshold
         } else {
-            -offset.y >= max_offset.height
+            -offset.y >= max_offset.height - threshold
         })
     }
 
@@ -731,7 +732,7 @@ mod test {
         y_flipped: bool,
     ) {
         use crate::{
-            Context, IntoElement, Render, Window, div, point, prelude::*, px, size, uniform_list,
+            div, point, prelude::*, px, size, uniform_list, Context, IntoElement, Render, Window,
         };
 
         struct TestView {
@@ -770,7 +771,7 @@ mod test {
 
     #[gpui::test]
     fn test_is_scrolled_to_end(cx: &mut TestAppContext) {
-        use crate::{UniformListScrollHandle, point, px};
+        use crate::{point, px, UniformListScrollHandle};
 
         let handle = UniformListScrollHandle::new();
         draw_scroll_end_test_list(cx, handle.clone(), false);
@@ -778,14 +779,14 @@ mod test {
         assert_eq!(handle.is_scrolled_to_end(), Some(false));
 
         let base_handle = handle.0.borrow().base_handle.clone();
-        base_handle.set_offset(point(px(0.), -base_handle.max_offset().height));
+        base_handle.set_offset(point(px(0.), -base_handle.max_offset().height + px(0.5)));
 
         assert_eq!(handle.is_scrolled_to_end(), Some(true));
     }
 
     #[gpui::test]
     fn test_is_scrolled_to_end_with_flipped_list(cx: &mut TestAppContext) {
-        use crate::{UniformListScrollHandle, point, px};
+        use crate::{point, px, UniformListScrollHandle};
 
         let handle = UniformListScrollHandle::new();
         draw_scroll_end_test_list(cx, handle.clone(), true);
@@ -795,7 +796,7 @@ mod test {
 
         assert_eq!(handle.is_scrolled_to_end(), Some(false));
 
-        base_handle.set_offset(point(px(0.), px(0.)));
+        base_handle.set_offset(point(px(0.), px(-0.5)));
 
         assert_eq!(handle.is_scrolled_to_end(), Some(true));
     }
@@ -803,8 +804,8 @@ mod test {
     #[gpui::test]
     fn test_scroll_strategy_nearest(cx: &mut TestAppContext) {
         use crate::{
-            Context, FocusHandle, ScrollStrategy, UniformListScrollHandle, Window, div, prelude::*,
-            px, uniform_list,
+            div, prelude::*, px, uniform_list, Context, FocusHandle, ScrollStrategy,
+            UniformListScrollHandle, Window,
         };
         use std::ops::Range;
 

@@ -37,7 +37,7 @@ pub struct ForegroundExecutor {
 /// This trait is implemented for `Task<Result<T, E>>` where `T: 'static` and
 /// `E: 'static + std::fmt::Display + std::fmt::Debug`.
 pub trait TaskExt<T, E> {
-    /// Run the task to completion in the background and log any errors that occur.
+    /// Run the task to completion on the foreground executor and log any errors that occur.
     fn detach_and_log_err(self, cx: &App);
     /// Like [`Self::detach_and_log_err`], but uses `{:?}` formatting on failure so `anyhow::Error`
     /// values emit their full backtrace. Prefer `detach_and_log_err` unless a backtrace is wanted.

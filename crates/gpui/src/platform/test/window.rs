@@ -111,6 +111,11 @@ impl TestWindow {
 
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
         let mut lock = self.0.lock();
+        if matches!(event, PlatformInput::MouseMove(_))
+            && let Some(platform) = lock.platform.upgrade()
+        {
+            platform.simulate_mouse_move();
+        }
         let Some(mut callback) = lock.input_callback.take() else {
             return false;
         };

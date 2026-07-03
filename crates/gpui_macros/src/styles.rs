@@ -2,9 +2,9 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    Token, Visibility, braced,
+    braced,
     parse::{Parse, ParseStream, Result},
-    parse_macro_input,
+    parse_macro_input, Token, Visibility,
 };
 
 #[derive(Debug)]
@@ -329,7 +329,7 @@ pub fn cursor_style_methods(input: TokenStream) -> TokenStream {
 
         /// Sets cursor style when hovering over an element to `none`.
         /// [Docs](https://tailwindcss.com/docs/cursor)
-        #visibility fn cursor_none(mut self, _cursor: CursorStyle) -> Self {
+        #visibility fn cursor_none(mut self) -> Self {
             self.style().mouse_cursor = Some(gpui::CursorStyle::None);
             self
         }

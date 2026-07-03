@@ -1,8 +1,8 @@
-use gpui::{CursorStyle, Styled, div};
+use gpui::{div, CursorStyle, Styled};
 
 #[test]
 fn cursor_none_helper_sets_none_cursor_style() {
-    let mut element = div().cursor_none(CursorStyle::Arrow);
+    let mut element = div().cursor_none();
 
     assert_eq!(element.style().mouse_cursor, Some(CursorStyle::None));
 }

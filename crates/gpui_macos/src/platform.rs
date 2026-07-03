@@ -1055,8 +1055,7 @@ impl Platform for MacPlatform {
     }
 
     fn hide_cursor_until_mouse_moves(&self) {
-        let cursor_visible = self.0.lock().cursor_visible.clone();
-        if !cursor_visible.swap(false, Ordering::Relaxed) {
+        if !self.0.lock().cursor_visible.swap(false, Ordering::Relaxed) {
             return;
         }
         unsafe {

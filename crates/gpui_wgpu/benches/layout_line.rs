@@ -1,15 +1,15 @@
-use criterion::{Criterion, criterion_group, criterion_main};
-use gpui::{FontFallbacks, FontRun, PlatformTextSystem, font, px};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use gpui::{font, px, FontFallbacks, FontRun, PlatformTextSystem};
 use gpui_wgpu::CosmicTextSystem;
 use std::borrow::Cow;
 
 const LILEX: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../gpui_web/assets/fonts/lilex/Lilex-Regular.ttf"
+    "/benches/assets/fonts/lilex/Lilex-Regular.ttf"
 ));
 const IBM_PLEX: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../gpui_web/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
+    "/benches/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
 ));
 
 // 991 chars of typical ASCII code text.
@@ -82,15 +82,29 @@ fn bench_layout_line(c: &mut Criterion) {
     let mut group = c.benchmark_group("layout_line");
 
     group.bench_function("no_fallback", |b| {
-        b.iter(|| system.layout_line(&text, px(14.0), &runs_no_fallback))
+        b.iter(|| {
+            black_box(system.layout_line(black_box(&text), px(14.0), black_box(&runs_no_fallback)))
+        })
     });
 
     group.bench_function("fallback_chain_ascii_text", |b| {
-        b.iter(|| system.layout_line(&text, px(14.0), &runs_with_fallback))
+        b.iter(|| {
+            black_box(system.layout_line(
+                black_box(&text),
+                px(14.0),
+                black_box(&runs_with_fallback),
+            ))
+        })
     });
 
     group.bench_function("fallback_chain_mixed_text", |b| {
-        b.iter(|| system.layout_line(&mixed_text, px(14.0), &runs_with_mixed_fallback))
+        b.iter(|| {
+            black_box(system.layout_line(
+                black_box(&mixed_text),
+                px(14.0),
+                black_box(&runs_with_mixed_fallback),
+            ))
+        })
     });
 
     group.finish();

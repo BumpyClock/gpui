@@ -417,6 +417,7 @@ fn triage_test(
 fn hyp_binary() -> Option<Command> {
     const HYP_PATH: &str = "hyperfine";
     Command::new(HYP_PATH)
+        .arg("--version")
         .output()
         .is_ok()
         .then(|| Command::new(HYP_PATH))

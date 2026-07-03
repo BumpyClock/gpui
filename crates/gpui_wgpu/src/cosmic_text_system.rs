@@ -5,16 +5,15 @@ use cosmic_text::{
     FontFeatures as CosmicFontFeatures, FontSystem, ShapeBuffer, ShapeLine,
 };
 use gpui::{
-    Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun, GlyphId,
-    LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ShapedGlyph, ShapedRun, SharedString, Size, TextRenderingMode, point,
-    size,
+    point, size, Bounds, DevicePixels, Font, FontFallbacks, FontFeatures, FontId, FontMetrics,
+    FontRun, GlyphId, LineLayout, Pixels, PlatformTextSystem, RenderGlyphParams, ShapedGlyph,
+    ShapedRun, SharedString, Size, TextRenderingMode, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
 };
 
 use itertools::Itertools;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, cell::RefCell, sync::Arc};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
     zeno::{Format, Vector},
@@ -522,7 +521,18 @@ impl CosmicTextSystemState {
                 spans
             } else {
                 let loaded_fonts = &self.loaded_fonts;
-                let covers = |id: FontId, ch: char| charmap_covers(loaded_fonts, id, ch);
+                let coverage_cache = RefCell::new(HashMap::default());
+                let covers = |id: FontId, ch: char| {
+                    let key = (id, ch);
+                    let mut cache = coverage_cache.borrow_mut();
+                    if let Some(covers) = cache.get(&key).copied() {
+                        return covers;
+                    }
+
+                    let covers = charmap_covers(loaded_fonts, id, ch);
+                    cache.insert(key, covers);
+                    covers
+                };
                 compute_run_spans(text, offs, run.len, run.font_id, &fallback_chain, &covers)
             };
 
@@ -1123,7 +1133,11 @@ mod tests {
         let primary = fid(0);
         let fallback_chain = chain(&[1]);
         let covers = |id: FontId, ch: char| {
-            if id == primary { ch == 'a' } else { ch == 'b' }
+            if id == primary {
+                ch == 'a'
+            } else {
+                ch == 'b'
+            }
         };
         let text = "ab";
 

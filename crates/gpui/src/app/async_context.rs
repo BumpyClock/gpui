@@ -369,14 +369,10 @@ impl AppContext for AsyncWindowContext {
     where
         T: 'static,
     {
-        let mut build_entity = Some(build_entity);
-        match self.app.update_window(self.window, |_, _, cx| {
-            cx.new(
-                build_entity
-                    .take()
-                    .expect("build_entity is taken exactly once"),
-            )
-        }) {
+        match self
+            .app
+            .update_window(self.window, |_, _, cx| cx.new(build_entity))
+        {
             Ok(entity) => entity,
             Err(error) => {
                 panic!("AsyncWindowContext::new failed: bound window could not be updated: {error}")
@@ -396,9 +392,7 @@ impl AppContext for AsyncWindowContext {
         reservation: Reservation<T>,
         build_entity: impl FnOnce(&mut Context<T>) -> T,
     ) -> Entity<T> {
-        let mut args = Some((reservation, build_entity));
         match self.app.update_window(self.window, |_, _, cx| {
-            let (reservation, build_entity) = args.take().expect("args are taken exactly once");
             cx.insert_entity(reservation, build_entity)
         }) {
             Ok(entity) => entity,

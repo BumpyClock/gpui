@@ -60,6 +60,7 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
+    disable_direct_composition: bool,
     /// Windows.UI.Composition tree used for the rounded host-backdrop blur mode.
     /// When `Some`, `direct_composition` is `None` (only one composition target
     /// may exist per HWND) and the swap chain is presented through this tree.
@@ -257,6 +258,7 @@ impl DirectXRenderer {
             globals,
             pipelines,
             direct_composition,
+            disable_direct_composition,
             rounded_backdrop: None,
             rounded_backdrop_radius: None,
             rounded_backdrop_scale: 1.0,
@@ -415,10 +417,9 @@ impl DirectXRenderer {
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
         let rounded_active = self.rounded_backdrop.is_some();
-        // The rounded backdrop mode still relies on a composition swap chain even
-        // though it has no `DirectComposition` target, so don't disable DComp
-        // resources when it is active.
-        let disable_direct_composition = self.direct_composition.is_none() && !rounded_active;
+        // Rounded backdrop mode is rejected when DirectComposition is disabled,
+        // so the stored configuration remains the source of truth here.
+        let disable_direct_composition = self.disable_direct_composition;
 
         unsafe {
             #[cfg(debug_assertions)]
@@ -470,15 +471,16 @@ impl DirectXRenderer {
         let rounded_backdrop = if rounded_active {
             let device_radius =
                 self.rounded_backdrop_radius.unwrap_or(0.0) * self.rounded_backdrop_scale;
-            RoundedBackdrop::new(
-                self.hwnd,
-                &resources.swap_chain,
-                self.width,
-                self.height,
-                device_radius,
+            Some(
+                RoundedBackdrop::new(
+                    self.hwnd,
+                    &resources.swap_chain,
+                    self.width,
+                    self.height,
+                    device_radius,
+                )
+                .context("Rebuilding rounded backdrop after device lost")?,
             )
-            .context("Rebuilding rounded backdrop after device lost")
-            .log_err()
         } else {
             None
         };
@@ -737,6 +739,10 @@ impl DirectXRenderer {
     ) -> Result<()> {
         match logical_radius {
             Some(radius) => {
+                if self.disable_direct_composition {
+                    anyhow::bail!("rounded backdrop blur requires DirectComposition");
+                }
+
                 self.rounded_backdrop_radius = Some(radius);
                 self.rounded_backdrop_scale = scale_factor;
                 let device_radius = radius * scale_factor;
@@ -766,7 +772,7 @@ impl DirectXRenderer {
             }
             None => {
                 self.rounded_backdrop_radius = None;
-                if self.rounded_backdrop.take().is_some() {
+                if self.rounded_backdrop.take().is_some() && !self.disable_direct_composition {
                     // We tore down the DComp target when entering rounded mode;
                     // rebuild it so plain transparency keeps working.
                     self.rebuild_direct_composition()

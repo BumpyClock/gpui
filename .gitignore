@@ -3,3 +3,6 @@ target/
 **/*.rs.bk
 bk_gpui/
 .pi-lens/
+.pi-subagents/
+.pi/artifacts/
+.clawpatch/

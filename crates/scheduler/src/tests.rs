@@ -912,10 +912,31 @@ fn test_spawn_dedicated_thread_closure_panic_reaches_caller() {
 }
 
 #[test]
+fn test_spawn_dedicated_child_panic_does_not_stop_thread() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+
+    let result = block_on(spawn_dedicated_thread(
+        SessionId::new(1),
+        scheduler,
+        |executor| async move {
+            executor
+                .spawn(async {
+                    panic!("dedicated child task exploded");
+                })
+                .detach();
+
+            executor.spawn(async { 42 }).await
+        },
+    ));
+
+    assert_eq!(result, 42);
+}
+
+#[test]
 fn test_spawn_dedicated_determinism_under_many() {
     use parking_lot::Mutex;
 
-    let outcomes = TestScheduler::many(if cfg!(miri) { 4 } else { 20 }, async |scheduler| {
+    async fn run_once(scheduler: Arc<TestScheduler>) -> (Vec<u32>, Vec<u32>) {
         let trace = Arc::new(Mutex::new(Vec::<u32>::new()));
 
         let background = scheduler.background();
@@ -938,32 +959,10 @@ fn test_spawn_dedicated_determinism_under_many() {
         }
 
         (trace.lock().clone(), outputs)
-    });
+    }
 
-    let outcomes_replay = TestScheduler::many(if cfg!(miri) { 4 } else { 20 }, async |scheduler| {
-        let trace = Arc::new(Mutex::new(Vec::<u32>::new()));
-
-        let background = scheduler.background();
-        let mut tasks = Vec::new();
-        for id in 0..4_u32 {
-            let trace = trace.clone();
-            let task = background.spawn_dedicated(move |executor| async move {
-                for step in 0..3 {
-                    trace.lock().push(id * 100 + step);
-                    executor.spawn(async {}).await;
-                }
-                id
-            });
-            tasks.push(task);
-        }
-
-        let mut outputs = Vec::new();
-        for task in tasks {
-            outputs.push(task.await);
-        }
-
-        (trace.lock().clone(), outputs)
-    });
+    let outcomes = TestScheduler::many(if cfg!(miri) { 4 } else { 20 }, run_once);
+    let outcomes_replay = TestScheduler::many(if cfg!(miri) { 4 } else { 20 }, run_once);
 
     assert_eq!(
         outcomes, outcomes_replay,

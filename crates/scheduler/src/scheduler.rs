@@ -166,7 +166,10 @@ where
             drop(executor);
 
             while let Ok(runnable) = runnable_receiver.recv() {
-                runnable.run();
+                // Keep the dedicated thread alive if one task panics. The
+                // standard panic hook has already reported the panic before
+                // catch_unwind returns.
+                let _ = panic::catch_unwind(AssertUnwindSafe(|| runnable.run()));
             }
         })
         .expect("failed to spawn dedicated thread");
