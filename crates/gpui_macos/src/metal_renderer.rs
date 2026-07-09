@@ -3133,3 +3133,68 @@ pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::Corners;
+
+    fn scene_with_retained_primitive(primitive: impl Into<gpui::Primitive>) -> Scene {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(100.0), ScaledPixels(100.0)),
+        );
+        let mut scene = Scene::default();
+        scene.insert_primitive(primitive);
+        scene.retained_layers.push(RetainedLayer {
+            id: GlobalElementId::default(),
+            content_revision: 1.into(),
+            content_dirty: true,
+            bounds,
+            content_mask: ContentMask { bounds },
+            transform: TransformationMatrix::unit(),
+            opacity: 1.0,
+            paint_range: 0..scene.paint_operation_count(),
+        });
+        scene
+    }
+
+    #[test]
+    fn retained_layer_with_backdrop_blur_is_excluded_from_metal_cache() {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(100.0), ScaledPixels(100.0)),
+        );
+        let scene = scene_with_retained_primitive(BackdropBlur {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::all(ScaledPixels(8.0)),
+            blur_radius: ScaledPixels(16.0),
+            source_origin_x: 0.0,
+            source_origin_y: 0.0,
+            source_width: 1.0,
+            source_height: 1.0,
+            pad2: 0,
+        });
+
+        assert!(MetalRenderer::retained_layers_for_scene(&scene).is_empty());
+    }
+
+    #[test]
+    fn retained_layer_without_backdrop_blur_remains_cacheable_by_metal() {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(100.0), ScaledPixels(100.0)),
+        );
+        let scene = scene_with_retained_primitive(Quad {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Default::default()
+        });
+
+        assert_eq!(MetalRenderer::retained_layers_for_scene(&scene).len(), 1);
+    }
+}

@@ -1108,6 +1108,7 @@ impl PathVertex<Pixels> {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::{align_of, offset_of, size_of};
     use std::sync::Arc;
 
     use super::*;
@@ -1122,6 +1123,92 @@ mod tests {
 
     fn test_global_id() -> GlobalElementId {
         GlobalElementId(Arc::from([ElementId::from("layer")]))
+    }
+
+    fn test_backdrop_blur(order: DrawOrder) -> BackdropBlur {
+        let bounds = test_bounds();
+        BackdropBlur {
+            order,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::all(ScaledPixels(2.0)),
+            blur_radius: ScaledPixels(12.0),
+            source_origin_x: 0.0,
+            source_origin_y: 0.0,
+            source_width: 1.0,
+            source_height: 1.0,
+            pad2: 0,
+        }
+    }
+
+    #[test]
+    fn backdrop_blur_gpu_layout_matches_shader_storage_contract() {
+        assert_eq!(align_of::<BackdropBlur>(), 4);
+        assert_eq!(size_of::<BackdropBlur>(), 80);
+        assert_eq!(offset_of!(BackdropBlur, order), 0);
+        assert_eq!(offset_of!(BackdropBlur, bounds), 8);
+        assert_eq!(offset_of!(BackdropBlur, content_mask), 24);
+        assert_eq!(offset_of!(BackdropBlur, corner_radii), 40);
+        assert_eq!(offset_of!(BackdropBlur, blur_radius), 56);
+        assert_eq!(offset_of!(BackdropBlur, source_origin_x), 60);
+        assert_eq!(offset_of!(BackdropBlur, source_height), 72);
+        assert_eq!(offset_of!(BackdropBlur, pad2), 76);
+    }
+
+    #[test]
+    fn backdrop_blurs_sort_and_batch_between_surrounding_primitives() {
+        let bounds = test_bounds();
+        let mut scene = Scene::default();
+        scene.backdrop_blurs = vec![test_backdrop_blur(3), test_backdrop_blur(2)];
+        scene.quads = vec![
+            Quad {
+                order: 4,
+                bounds,
+                content_mask: ContentMask { bounds },
+                ..Default::default()
+            },
+            Quad {
+                order: 1,
+                bounds,
+                content_mask: ContentMask { bounds },
+                ..Default::default()
+            },
+        ];
+
+        scene.finish();
+
+        assert_eq!(
+            scene
+                .backdrop_blurs
+                .iter()
+                .map(|blur| blur.order)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            scene
+                .quads
+                .iter()
+                .map(|quad| quad.order)
+                .collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+
+        let mut batches = scene.batches();
+        assert!(matches!(
+            batches.next(),
+            Some(PrimitiveBatch::Quads(range)) if range == (0..1)
+        ));
+        assert!(matches!(
+            batches.next(),
+            Some(PrimitiveBatch::BackdropBlurs(range)) if range == (0..2)
+        ));
+        assert!(matches!(
+            batches.next(),
+            Some(PrimitiveBatch::Quads(range)) if range == (1..2)
+        ));
+        assert!(batches.next().is_none());
     }
 
     #[test]

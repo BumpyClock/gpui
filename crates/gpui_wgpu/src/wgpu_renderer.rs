@@ -1407,7 +1407,7 @@ impl WgpuRenderer {
                 }
 
                 let layer_scene = scene.clone_paint_range(layer.paint_range.clone());
-                if !layer_scene.backdrop_blurs.is_empty() {
+                if Self::retained_scene_contains_backdrop_blurs(&layer_scene) {
                     return None;
                 }
 
@@ -1445,6 +1445,10 @@ impl WgpuRenderer {
         }
 
         prepared
+    }
+
+    fn retained_scene_contains_backdrop_blurs(scene: &Scene) -> bool {
+        !scene.backdrop_blurs.is_empty()
     }
 
     fn top_level_retained_layer_indices(layers: &[RetainedLayer]) -> Vec<usize> {
@@ -2672,6 +2676,29 @@ impl WgpuRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Corners;
+
+    fn scene_with_retained_primitive(
+        primitive: impl Into<gpui::Primitive>,
+    ) -> (Scene, RetainedLayer) {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(100.0), ScaledPixels(100.0)),
+        );
+        let mut scene = Scene::default();
+        scene.insert_primitive(primitive);
+        let layer = RetainedLayer {
+            id: GlobalElementId::default(),
+            content_revision: 1.into(),
+            content_dirty: true,
+            bounds,
+            content_mask: ContentMask { bounds },
+            transform: TransformationMatrix::unit(),
+            opacity: 1.0,
+            paint_range: 0..scene.paint_operation_count(),
+        };
+        (scene, layer)
+    }
 
     #[test]
     fn select_present_mode_accepts_auto_modes_without_surface_advertising_them() {
@@ -2697,6 +2724,51 @@ mod tests {
             select_present_mode(Some(wgpu::PresentMode::Mailbox), &[wgpu::PresentMode::Fifo]),
             wgpu::PresentMode::Fifo
         );
+    }
+
+    #[test]
+    fn retained_layer_with_backdrop_blur_is_excluded_from_wgpu_cache() {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(100.0), ScaledPixels(100.0)),
+        );
+        let (scene, layer) = scene_with_retained_primitive(BackdropBlur {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::all(ScaledPixels(8.0)),
+            blur_radius: ScaledPixels(16.0),
+            source_origin_x: 0.0,
+            source_origin_y: 0.0,
+            source_width: 1.0,
+            source_height: 1.0,
+            pad2: 0,
+        });
+
+        let retained_scene = scene.clone_paint_range(layer.paint_range);
+        assert!(WgpuRenderer::retained_scene_contains_backdrop_blurs(
+            &retained_scene
+        ));
+    }
+
+    #[test]
+    fn retained_layer_without_backdrop_blur_remains_cacheable_by_wgpu() {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(100.0), ScaledPixels(100.0)),
+        );
+        let (scene, layer) = scene_with_retained_primitive(Quad {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Default::default()
+        });
+
+        let retained_scene = scene.clone_paint_range(layer.paint_range);
+        assert!(!WgpuRenderer::retained_scene_contains_backdrop_blurs(
+            &retained_scene
+        ));
     }
 }
 

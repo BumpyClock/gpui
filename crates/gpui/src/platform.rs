@@ -2207,19 +2207,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn overlay_surface_options_preserve_blurred_rounded_background() {
+    fn overlay_surface_options_preserve_overlay_window_contract() {
+        let bounds = WindowBounds::Windowed(Bounds::new(
+            point(px(10.), px(20.)),
+            size(px(360.), px(72.)),
+        ));
         let options = OverlaySurfaceOptions {
+            window_bounds: Some(bounds),
+            show: true,
+            focus: true,
             window_background: WindowBackgroundAppearance::Blurred {
                 corner_radius: px(12.),
             },
+            has_shadow: Some(false),
+            app_id: Some("com.example.overlay".into()),
+            window_min_size: Some(size(px(180.), px(36.))),
+            input_mode: OverlayInputMode::ClickThrough,
             ..Default::default()
         };
+
+        assert_eq!(options.input_mode, OverlayInputMode::ClickThrough);
         let window_options = options.into_window_options();
+
+        assert_eq!(window_options.window_bounds, Some(bounds));
+        assert_eq!(window_options.kind, WindowKind::PopUp);
+        assert!(window_options.titlebar.is_none());
+        assert!(window_options.show);
+        assert!(window_options.focus);
+        assert!(!window_options.is_movable);
+        assert!(!window_options.is_resizable);
+        assert!(!window_options.is_minimizable);
         assert_eq!(
             window_options.window_background,
             WindowBackgroundAppearance::Blurred {
                 corner_radius: px(12.)
             }
         );
+        assert_eq!(window_options.has_shadow, Some(false));
+        assert_eq!(
+            window_options.app_id.as_deref(),
+            Some("com.example.overlay")
+        );
+        assert_eq!(
+            window_options.window_min_size,
+            Some(size(px(180.), px(36.)))
+        );
+        assert!(window_options.window_decorations.is_none());
+        assert!(window_options.tabbing_identifier.is_none());
+    }
+
+    #[test]
+    fn overlay_surface_defaults_to_interactive_transparency() {
+        let options = OverlaySurfaceOptions::default();
+
+        assert_eq!(options.input_mode, OverlayInputMode::Interactive);
+        assert_eq!(
+            options.window_background,
+            WindowBackgroundAppearance::Transparent
+        );
+        assert!(!options.show);
+        assert!(!options.focus);
     }
 }
