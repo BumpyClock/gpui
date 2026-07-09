@@ -4,12 +4,14 @@ use accesskit::{NodeId, TreeUpdate};
 use collections::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
+#[derive(Clone)]
 pub(crate) struct A11yNodeBuilder {
     ids_stack: SmallVec<[NodeId; 16]>,
     nodes_stack: SmallVec<[accesskit::Node; 16]>,
     suppression_stack: SmallVec<[bool; 16]>,
     ambient_suppression_depth: usize,
     all_nodes: Vec<(NodeId, accesskit::Node)>,
+    emitted_node_indices: FxHashMap<NodeId, usize>,
     seen_ids: FxHashSet<NodeId>,
     focus: NodeId,
     #[cfg(debug_assertions)]
@@ -17,24 +19,12 @@ pub(crate) struct A11yNodeBuilder {
 }
 
 pub(crate) struct A11yPrepaintSnapshot {
-    pub(super) nodes: A11yNodeBuilderPrepaintSnapshot,
+    pub(super) nodes: A11yNodeBuilder,
     pub(super) node_ids: FxHashMap<GlobalElementId, NodeId>,
     pub(super) visited_global_ids: FxHashSet<GlobalElementId>,
     pub(super) next_node_id: u64,
     pub(super) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(super) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
-}
-
-pub(super) struct A11yNodeBuilderPrepaintSnapshot {
-    ids_stack: SmallVec<[NodeId; 16]>,
-    nodes_stack: SmallVec<[accesskit::Node; 16]>,
-    suppression_stack: SmallVec<[bool; 16]>,
-    ambient_suppression_depth: usize,
-    all_nodes: Vec<(NodeId, accesskit::Node)>,
-    seen_ids: FxHashSet<NodeId>,
-    focus: NodeId,
-    #[cfg(debug_assertions)]
-    has_set_focus: bool,
 }
 
 impl A11yNodeBuilder {
@@ -45,6 +35,7 @@ impl A11yNodeBuilder {
             suppression_stack: SmallVec::new(),
             ambient_suppression_depth: 0,
             all_nodes: Vec::new(),
+            emitted_node_indices: FxHashMap::default(),
             seen_ids: FxHashSet::default(),
             focus: ROOT_NODE_ID,
             #[cfg(debug_assertions)]
@@ -81,6 +72,7 @@ impl A11yNodeBuilder {
 
     pub(super) fn begin_frame(&mut self) {
         self.all_nodes.clear();
+        self.emitted_node_indices.clear();
         self.ids_stack.clear();
         self.nodes_stack.clear();
         self.suppression_stack.clear();
@@ -120,32 +112,12 @@ impl A11yNodeBuilder {
         self.focus = id;
     }
 
-    pub(super) fn prepaint_snapshot(&self) -> A11yNodeBuilderPrepaintSnapshot {
-        A11yNodeBuilderPrepaintSnapshot {
-            ids_stack: self.ids_stack.clone(),
-            nodes_stack: self.nodes_stack.clone(),
-            suppression_stack: self.suppression_stack.clone(),
-            ambient_suppression_depth: self.ambient_suppression_depth,
-            all_nodes: self.all_nodes.clone(),
-            seen_ids: self.seen_ids.clone(),
-            focus: self.focus,
-            #[cfg(debug_assertions)]
-            has_set_focus: self.has_set_focus,
-        }
+    pub(super) fn prepaint_snapshot(&self) -> A11yNodeBuilder {
+        self.clone()
     }
 
-    pub(super) fn restore_prepaint_snapshot(&mut self, snapshot: A11yNodeBuilderPrepaintSnapshot) {
-        self.ids_stack = snapshot.ids_stack;
-        self.nodes_stack = snapshot.nodes_stack;
-        self.suppression_stack = snapshot.suppression_stack;
-        self.ambient_suppression_depth = snapshot.ambient_suppression_depth;
-        self.all_nodes = snapshot.all_nodes;
-        self.seen_ids = snapshot.seen_ids;
-        self.focus = snapshot.focus;
-        #[cfg(debug_assertions)]
-        {
-            self.has_set_focus = snapshot.has_set_focus;
-        }
+    pub(super) fn restore_prepaint_snapshot(&mut self, snapshot: A11yNodeBuilder) {
+        *self = snapshot;
     }
 
     pub(crate) fn update_current_node_bounds(
@@ -225,8 +197,11 @@ impl A11yNodeBuilder {
             self.pop_any();
         }
 
+        let nodes = std::mem::take(&mut self.all_nodes);
+        self.emitted_node_indices.clear();
+
         let update = TreeUpdate {
-            nodes: std::mem::take(&mut self.all_nodes),
+            nodes,
             tree: Some(accesskit::Tree::new(ROOT_NODE_ID)),
             tree_id: accesskit::TreeId::ROOT,
             focus: self.focus,
@@ -258,17 +233,14 @@ impl A11yNodeBuilder {
         if let Some(current_node) = self.nodes_stack.last() {
             let mut pending = current_node.children().to_vec();
             if !pending.is_empty() {
-                let emitted_nodes_by_id = self
-                    .all_nodes
-                    .iter()
-                    .map(|(node_id, node)| (*node_id, node))
-                    .collect::<FxHashMap<_, _>>();
                 while let Some(child_id) = pending.pop() {
                     if !pruned_ids.insert(child_id) {
                         continue;
                     }
 
-                    if let Some(child_node) = emitted_nodes_by_id.get(&child_id) {
+                    if let Some(index) = self.emitted_node_indices.get(&child_id).copied()
+                        && let Some((_, child_node)) = self.all_nodes.get(index)
+                    {
                         pending.extend(child_node.children().iter().copied());
                     }
                 }
@@ -285,6 +257,7 @@ impl A11yNodeBuilder {
 
         self.all_nodes
             .retain(|(node_id, _)| !pruned_ids.contains(node_id));
+        self.rebuild_emitted_node_indices();
 
         for (_, node) in &mut self.all_nodes {
             Self::remove_child_refs(node, &pruned_ids);
@@ -292,6 +265,16 @@ impl A11yNodeBuilder {
         for node in &mut self.nodes_stack {
             Self::remove_child_refs(node, &pruned_ids);
         }
+    }
+
+    fn rebuild_emitted_node_indices(&mut self) {
+        self.emitted_node_indices.clear();
+        self.emitted_node_indices.extend(
+            self.all_nodes
+                .iter()
+                .enumerate()
+                .map(|(index, (node_id, _))| (*node_id, index)),
+        );
     }
 
     fn remove_child_refs(node: &mut accesskit::Node, removed_ids: &FxHashSet<NodeId>) {
@@ -327,6 +310,7 @@ impl A11yNodeBuilder {
                     parent.push_child(id);
                 }
             }
+            self.emitted_node_indices.insert(id, self.all_nodes.len());
             self.all_nodes.push((id, node));
         }
     }

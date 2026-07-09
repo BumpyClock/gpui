@@ -230,3 +230,31 @@ fn restores_prepaint_snapshot_for_builder_state() {
     assert_eq!(node(&update, ROOT_NODE_ID).children(), &[NodeId(1)]);
     assert_eq!(node(&update, NodeId(1)).children(), &[NodeId(2)]);
 }
+
+#[test]
+fn restored_snapshot_keeps_emitted_node_index_consistent() {
+    let mut builder = A11yNodeBuilder::new();
+    builder.begin_frame();
+
+    assert!(builder.push(NodeId(1), accesskit::Node::new(accesskit::Role::Button)));
+    assert!(builder.push(NodeId(2), accesskit::Node::new(accesskit::Role::Label)));
+    assert!(builder.push(NodeId(3), accesskit::Node::new(accesskit::Role::Label)));
+    builder.pop();
+    builder.pop();
+    let snapshot = builder.prepaint_snapshot();
+
+    assert!(builder.push(NodeId(4), accesskit::Node::new(accesskit::Role::Label)));
+    builder.pop();
+    builder.restore_prepaint_snapshot(snapshot);
+
+    assert!(builder.suppress_current_node(NodeId(1)));
+    builder.pop();
+
+    let update = builder.finalize();
+    assert_eq!(update.nodes.len(), 1);
+    assert_eq!(node(&update, ROOT_NODE_ID).children(), &[]);
+    assert!(!has_update_node(&update, NodeId(1)));
+    assert!(!has_update_node(&update, NodeId(2)));
+    assert!(!has_update_node(&update, NodeId(3)));
+    assert!(!has_update_node(&update, NodeId(4)));
+}

@@ -14,7 +14,7 @@ use gpui::{
 use itertools::Itertools;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, cell::RefCell, sync::Arc};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
     zeno::{Format, Vector},
@@ -522,7 +522,18 @@ impl CosmicTextSystemState {
                 spans
             } else {
                 let loaded_fonts = &self.loaded_fonts;
-                let covers = |id: FontId, ch: char| charmap_covers(loaded_fonts, id, ch);
+                let coverage_cache = RefCell::new(HashMap::default());
+                let covers = |id: FontId, ch: char| {
+                    let key = (id, ch);
+                    let mut cache = coverage_cache.borrow_mut();
+                    if let Some(covers) = cache.get(&key).copied() {
+                        return covers;
+                    }
+
+                    let covers = charmap_covers(loaded_fonts, id, ch);
+                    cache.insert(key, covers);
+                    covers
+                };
                 compute_run_spans(text, offs, run.len, run.font_id, &fallback_chain, &covers)
             };
 

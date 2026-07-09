@@ -111,6 +111,11 @@ impl TestWindow {
 
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
         let mut lock = self.0.lock();
+        if matches!(event, PlatformInput::MouseMove(_))
+            && let Some(platform) = lock.platform.upgrade()
+        {
+            platform.simulate_mouse_move();
+        }
         let Some(mut callback) = lock.input_callback.take() else {
             return false;
         };
@@ -340,6 +345,25 @@ impl TestAtlas {
             next_id: 0,
             tiles: HashMap::default(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Modifiers, TestAppContext, point, px};
+
+    #[gpui::test]
+    fn mouse_move_restores_cursor_visibility(cx: &mut TestAppContext) {
+        let mut cx = cx.add_empty_window();
+
+        cx.update(|_, cx| {
+            cx.platform.hide_cursor_until_mouse_moves();
+            assert!(!cx.is_cursor_visible());
+        });
+
+        cx.simulate_mouse_move(point(px(10.), px(10.)), None, Modifiers::default());
+
+        cx.update(|_, cx| assert!(cx.is_cursor_visible()));
     }
 }
 

@@ -985,11 +985,11 @@ impl WaylandWindowStatePtr {
             state.update_accesskit_window_bounds();
             let device_bounds = state.bounds.to_device_pixels(state.scale);
             state.renderer.update_drawable_size(device_bounds.size);
-            // A rounded blur region depends on the window size, so it must be
+            // A blurred region depends on the window size, so it must be
             // rebuilt on resize. Capture the flag before dropping the borrow.
             let needs_blur_update = matches!(
                 state.background_appearance,
-                WindowBackgroundAppearance::Blurred { corner_radius } if corner_radius > px(0.)
+                WindowBackgroundAppearance::Blurred { .. }
             );
             (state.bounds.size, state.scale, needs_blur_update)
         };

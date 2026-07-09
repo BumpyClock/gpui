@@ -912,6 +912,27 @@ fn test_spawn_dedicated_thread_closure_panic_reaches_caller() {
 }
 
 #[test]
+fn test_spawn_dedicated_child_panic_does_not_stop_thread() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+
+    let result = block_on(spawn_dedicated_thread(
+        SessionId::new(1),
+        scheduler,
+        |executor| async move {
+            executor
+                .spawn(async {
+                    panic!("dedicated child task exploded");
+                })
+                .detach();
+
+            executor.spawn(async { 42 }).await
+        },
+    ));
+
+    assert_eq!(result, 42);
+}
+
+#[test]
 fn test_spawn_dedicated_determinism_under_many() {
     use parking_lot::Mutex;
 
