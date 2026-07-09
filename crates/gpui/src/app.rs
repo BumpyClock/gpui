@@ -129,6 +129,30 @@ impl Drop for AppRefMut<'_> {
 /// You won't interact with this type much outside of initial configuration and startup.
 pub struct Application(Rc<AppCell>);
 
+/// A strong handle to an [`Application`] started with [`Application::run_embedded`].
+///
+/// Dropping this handle releases the app, so an embedder must hold it for as long as the
+/// app should run. While held, it is the embedder's entry point back into GPUI each time
+/// the external run loop gives it control.
+pub struct ApplicationHandle {
+    app: Rc<AppCell>,
+}
+
+impl ApplicationHandle {
+    /// Invoke `f` with the app context.
+    ///
+    /// This must not be called re-entrantly from code that is already inside an update.
+    pub fn update<R>(&self, f: impl FnOnce(&mut App) -> R) -> R {
+        let cx = &mut *self.app.borrow_mut();
+        f(cx)
+    }
+
+    /// Return an async-friendly weak handle to the application.
+    pub fn to_async(&self) -> AsyncApp {
+        self.update(|cx| cx.to_async())
+    }
+}
+
 /// Represents an application before it is fully launched. Once your app is
 /// configured, you'll start the app with `App::run`.
 impl Application {
@@ -192,6 +216,24 @@ impl Application {
         }));
     }
 
+    /// Start the application for an embedder that drives the run loop itself.
+    ///
+    /// Embedded platforms invoke the launch callback and return immediately from
+    /// [`Platform::run`]. The returned handle keeps the application alive and lets the
+    /// embedder re-enter it when its external run loop yields control.
+    pub fn run_embedded<F>(self, on_finish_launching: F) -> ApplicationHandle
+    where
+        F: 'static + FnOnce(&mut App),
+    {
+        let this = self.0.clone();
+        let platform = self.0.borrow().platform.clone();
+        platform.run(Box::new(move || {
+            let cx = &mut *this.borrow_mut();
+            on_finish_launching(cx);
+        }));
+        ApplicationHandle { app: self.0 }
+    }
+
     /// Register a handler to be invoked when the platform instructs the application
     /// to open one or more URLs.
     pub fn on_open_urls<F>(&self, mut callback: F) -> &Self
@@ -214,6 +256,23 @@ impl Application {
                 callback(&mut app.borrow_mut());
             }
         }));
+        self
+    }
+
+    /// Invoke a handler when the system wakes from sleep.
+    pub fn on_system_wake<F>(&self, mut callback: F) -> &Self
+    where
+        F: 'static + FnMut(&mut App),
+    {
+        let this = Rc::downgrade(&self.0);
+        self.0
+            .borrow_mut()
+            .platform
+            .on_system_wake(Box::new(move || {
+                if let Some(app) = this.upgrade() {
+                    callback(&mut app.borrow_mut());
+                }
+            }));
         self
     }
 
@@ -2740,9 +2799,59 @@ impl<'a, T> Drop for GpuiBorrow<'a, T> {
 
 #[cfg(test)]
 mod test {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        sync::Arc,
+    };
 
-    use crate::{AppContext, Context, Empty, Entity, Render, TestAppContext, Window};
+    use crate::{
+        AppContext, Application, BackgroundExecutor, Context, Empty, Entity, ForegroundExecutor,
+        Global, Render, TestAppContext, TestDispatcher, TestPlatform, Window,
+    };
+
+    #[derive(Default)]
+    struct EmbeddedState(u32);
+
+    impl Global for EmbeddedState {}
+
+    fn test_application() -> (Application, Rc<TestPlatform>) {
+        let dispatcher = Arc::new(TestDispatcher::new(0));
+        let background_executor = BackgroundExecutor::new(dispatcher.clone());
+        let foreground_executor = ForegroundExecutor::new(dispatcher);
+        let platform = TestPlatform::new(background_executor, foreground_executor);
+        (Application::with_platform(platform.clone()), platform)
+    }
+
+    #[test]
+    fn embedded_application_runs_launch_callback_and_keeps_app_alive() {
+        let (application, _) = test_application();
+        let launched = Rc::new(Cell::new(false));
+        let launched_for_callback = launched.clone();
+
+        let handle = application.run_embedded(move |cx| {
+            launched_for_callback.set(true);
+            cx.set_global(EmbeddedState(1));
+        });
+
+        assert!(launched.get());
+        handle.update(|cx| cx.global_mut::<EmbeddedState>().0 += 1);
+        let async_app = handle.to_async();
+        async_app.update(|cx| cx.global_mut::<EmbeddedState>().0 += 1);
+        assert_eq!(handle.update(|cx| cx.global::<EmbeddedState>().0), 3);
+    }
+
+    #[test]
+    fn test_platform_simulates_system_wake() {
+        let (application, platform) = test_application();
+        application.on_system_wake(|cx| cx.global_mut::<EmbeddedState>().0 += 1);
+        let handle = application.run_embedded(|cx| cx.set_global(EmbeddedState::default()));
+
+        platform.simulate_system_wake();
+        platform.simulate_system_wake();
+
+        assert_eq!(handle.update(|cx| cx.global::<EmbeddedState>().0), 2);
+    }
 
     #[test]
     fn test_gpui_borrow() {

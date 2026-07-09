@@ -35,6 +35,7 @@ pub(crate) struct TestPlatform {
     pub opened_url: RefCell<Option<String>>,
     pub text_system: Arc<dyn PlatformTextSystem>,
     pub expect_restart: RefCell<Option<oneshot::Sender<Option<PathBuf>>>>,
+    system_wake_callback: RefCell<Option<Box<dyn FnMut()>>>,
     headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
     weak: Weak<Self>,
 }
@@ -125,6 +126,7 @@ impl TestPlatform {
             active_display: Rc::new(TestDisplay::new()),
             active_window: Default::default(),
             expect_restart: Default::default(),
+            system_wake_callback: Default::default(),
             current_clipboard_item: Mutex::new(None),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             current_primary_item: Mutex::new(None),
@@ -233,6 +235,15 @@ impl TestPlatform {
     pub(crate) fn simulate_mouse_move(&self) {
         *self.cursor_hidden_until_mouse_moves.lock() = false;
     }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_system_wake(&self) {
+        let Some(mut callback) = self.system_wake_callback.borrow_mut().take() else {
+            return;
+        };
+        callback();
+        *self.system_wake_callback.borrow_mut() = Some(callback);
+    }
 }
 
 impl Platform for TestPlatform {
@@ -264,8 +275,8 @@ impl Platform for TestPlatform {
         ThermalState::Nominal
     }
 
-    fn run(&self, _on_finish_launching: Box<dyn FnOnce()>) {
-        unimplemented!()
+    fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+        on_finish_launching()
     }
 
     fn quit(&self) {}
@@ -385,6 +396,10 @@ impl Platform for TestPlatform {
 
     fn on_reopen(&self, _callback: Box<dyn FnMut()>) {
         unimplemented!()
+    }
+
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        *self.system_wake_callback.borrow_mut() = Some(callback);
     }
 
     fn set_menus(&self, _menus: Vec<crate::Menu>, _keymap: &Keymap) {}
