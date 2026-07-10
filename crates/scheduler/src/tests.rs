@@ -257,6 +257,10 @@ fn test_timer_ordering() {
 }
 
 #[test]
+#[allow(
+    clippy::await_holding_refcell_ref,
+    reason = "the test verifies that foreground tasks may intentionally retain a local borrow while suspended"
+)]
 fn test_foreground_task_can_hold_mut_borrow_across_await() {
     TestScheduler::once(async |scheduler| {
         let foreground = scheduler.foreground();
