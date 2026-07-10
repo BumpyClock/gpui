@@ -6,6 +6,9 @@ mod keystroke;
 #[expect(missing_docs)]
 pub mod layer_shell;
 
+/// Types for configuring parent-anchored popup windows such as menus, dropdowns and tooltips.
+pub mod popup;
+
 #[cfg(any(test, feature = "bench"))]
 mod bench_dispatcher;
 
@@ -573,6 +576,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn show_window_menu(&self, _position: Point<Pixels>) {}
     fn start_window_move(&self) {}
     fn start_window_resize(&self, _edge: ResizeEdge) {}
+    fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
     }
@@ -1580,6 +1584,14 @@ pub enum WindowKind {
     /// use sparingly!
     PopUp,
 
+    /// A parent-anchored, platform-native popup window for menus, comboboxes, context menus and
+    /// tooltips. Unlike [`WindowKind::PopUp`], it is positioned relative to a parent window.
+    ///
+    /// The popup's size comes from [`WindowOptions::window_bounds`], whose origin is ignored.
+    /// See [`popup::PopupOptions`] for the placement options. Platforms without a native
+    /// implementation reject it with [`popup::PopupNotSupportedError`].
+    AnchoredPopup(popup::PopupOptions),
+
     /// A floating window that appears on top of its parent window
     Floating,
 
@@ -2297,5 +2309,23 @@ mod tests {
         );
         assert!(!options.show);
         assert!(!options.focus);
+        assert_eq!(options.into_window_options().kind, WindowKind::PopUp);
+    }
+
+    #[gpui::test]
+    fn anchored_popup_is_distinct_from_overlay_popup(cx: &mut TestAppContext) {
+        let parent: AnyWindowHandle = cx.add_window(|_, _| Empty).into();
+        let kind = WindowKind::AnchoredPopup(popup::PopupOptions {
+            parent,
+            anchor_rect: Bounds::new(point(px(10.), px(12.)), size(px(80.), px(24.))),
+            anchor: popup::PopupAnchor::BottomLeft,
+            gravity: popup::PopupGravity::BottomRight,
+            constraint_adjustment: popup::PopupConstraintAdjustment::FLIP_Y,
+            offset: point(px(0.), px(4.)),
+            grab: true,
+        });
+
+        assert!(matches!(kind, WindowKind::AnchoredPopup(_)));
+        assert_ne!(kind, WindowKind::PopUp);
     }
 }

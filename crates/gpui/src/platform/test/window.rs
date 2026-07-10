@@ -31,6 +31,7 @@ pub(crate) struct TestWindowState {
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
+    input_region: Option<Vec<Bounds<Pixels>>>,
     is_fullscreen: bool,
 }
 
@@ -82,8 +83,13 @@ impl TestWindow {
             resize_callback: None,
             moved_callback: None,
             input_handler: None,
+            input_region: None,
             is_fullscreen: false,
         })))
+    }
+
+    pub(crate) fn input_region(&self) -> Option<Vec<Bounds<Pixels>>> {
+        self.0.lock().input_region.clone()
     }
 
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
@@ -323,6 +329,10 @@ impl PlatformWindow for TestWindow {
 
     fn start_window_move(&self) {
         unimplemented!()
+    }
+
+    fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
+        self.0.lock().input_region = region.map(<[_]>::to_vec);
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}

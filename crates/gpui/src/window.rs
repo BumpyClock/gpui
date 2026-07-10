@@ -1898,6 +1898,16 @@ impl Window {
         self.platform_window.start_window_resize(edge);
     }
 
+    /// Linux (Wayland) only: Set the window's input region, the area that receives pointer
+    /// and touch input. Events outside it pass through to whatever is below the window.
+    ///
+    /// - `Some(rects)` restricts input to the union of `rects`, in window coordinates.
+    /// - `Some(&[])` is an empty region, so the window receives no pointer or touch input.
+    /// - `None` resets the region to the default, so the whole window receives input again.
+    pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
+        self.platform_window.set_input_region(region);
+    }
+
     /// Return the `WindowBounds` to indicate that how a window should be opened
     /// after it has been closed
     pub fn window_bounds(&self) -> WindowBounds {
@@ -6119,7 +6129,9 @@ impl From<&'static core::panic::Location<'static>> for ElementId {
 
 #[cfg(test)]
 mod bounds_change_tests {
-    use crate::{Empty, Modifiers, Point, TestAppContext, VisualTestContext, point, px, size};
+    use crate::{
+        Bounds, Empty, Modifiers, Point, TestAppContext, VisualTestContext, point, px, size,
+    };
 
     #[gpui::test]
     fn bounds_changed_refreshes_mouse_position_from_platform(cx: &mut TestAppContext) {
@@ -6140,6 +6152,31 @@ mod bounds_change_tests {
             cx.update(|window, _| window.mouse_position()),
             Point::default()
         );
+    }
+
+    #[gpui::test]
+    fn input_region_is_forwarded_to_the_platform(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let region = [Bounds::new(
+            point(px(12.), px(16.)),
+            size(px(120.), px(48.)),
+        )];
+        let platform_window = cx.test_window(*window);
+
+        window
+            .update(cx, |_, window, _| window.set_input_region(Some(&region)))
+            .expect("test window should remain open");
+        assert_eq!(platform_window.input_region(), Some(region.to_vec()));
+
+        window
+            .update(cx, |_, window, _| window.set_input_region(Some(&[])))
+            .expect("test window should remain open");
+        assert_eq!(platform_window.input_region(), Some(Vec::new()));
+
+        window
+            .update(cx, |_, window, _| window.set_input_region(None))
+            .expect("test window should remain open");
+        assert_eq!(platform_window.input_region(), None);
     }
 }
 
