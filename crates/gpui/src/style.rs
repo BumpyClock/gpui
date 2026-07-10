@@ -1575,7 +1575,7 @@ mod tests {
             legacy_shadow,
             BoxShadow {
                 inset: false,
-                ..shadow.clone()
+                ..shadow
             }
         );
 

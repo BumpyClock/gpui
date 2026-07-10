@@ -4697,7 +4697,6 @@ mod tests {
         let focus_handle = cx.update(|_, cx| cx.focus_handle());
 
         let update = draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
-            let focus_handle = focus_handle.clone();
             move |_, _| {
                 div().invisible().child(
                     div()

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{point, px, size};
 
-fn node<'a>(update: &'a TreeUpdate, id: NodeId) -> &'a accesskit::Node {
+fn node(update: &TreeUpdate, id: NodeId) -> &accesskit::Node {
     update
         .nodes
         .iter()

@@ -619,13 +619,10 @@ mod tests {
         let (mut async_cx, _) = open_async_window_context(cx);
         let builder_invoked = Rc::new(Cell::new(false));
 
-        let entity = {
-            let builder_invoked = builder_invoked.clone();
-            async_cx.new(|_| {
-                builder_invoked.set(true);
-                42usize
-            })
-        };
+        let entity = async_cx.new(|_| {
+            builder_invoked.set(true);
+            42usize
+        });
 
         assert!(builder_invoked.get());
         assert_eq!(async_cx.read_entity(&entity, |value, _| *value), 42);
