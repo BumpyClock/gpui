@@ -31,6 +31,7 @@ pub(crate) struct TestWindowState {
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
+    input_region: Option<Vec<Bounds<Pixels>>>,
     is_fullscreen: bool,
 }
 
@@ -82,8 +83,14 @@ impl TestWindow {
             resize_callback: None,
             moved_callback: None,
             input_handler: None,
+            input_region: None,
             is_fullscreen: false,
         })))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn input_region(&self) -> Option<Vec<Bounds<Pixels>>> {
+        self.0.lock().input_region.clone()
     }
 
     pub fn simulate_resize(&mut self, size: Size<Pixels>) {
@@ -111,6 +118,11 @@ impl TestWindow {
 
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
         let mut lock = self.0.lock();
+        if matches!(event, PlatformInput::MouseMove(_))
+            && let Some(platform) = lock.platform.upgrade()
+        {
+            platform.simulate_mouse_move();
+        }
         let Some(mut callback) = lock.input_callback.take() else {
             return false;
         };
@@ -320,6 +332,10 @@ impl PlatformWindow for TestWindow {
         unimplemented!()
     }
 
+    fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
+        self.0.lock().input_region = region.map(<[_]>::to_vec);
+    }
+
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
@@ -340,6 +356,25 @@ impl TestAtlas {
             next_id: 0,
             tiles: HashMap::default(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Modifiers, TestAppContext, point, px};
+
+    #[gpui::test]
+    fn mouse_move_restores_cursor_visibility(cx: &mut TestAppContext) {
+        let mut cx = cx.add_empty_window();
+
+        cx.update(|_, cx| {
+            cx.platform.hide_cursor_until_mouse_moves();
+            assert!(!cx.is_cursor_visible());
+        });
+
+        cx.simulate_mouse_move(point(px(10.), px(10.)), None, Modifiers::default());
+
+        cx.update(|_, cx| assert!(cx.is_cursor_visible()));
     }
 }
 

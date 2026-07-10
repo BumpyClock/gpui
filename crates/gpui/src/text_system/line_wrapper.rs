@@ -10,6 +10,8 @@ pub enum TruncateFrom {
     Start,
     /// Truncate text from the end.
     End,
+    /// Truncate text from the middle, preserving the start and end.
+    Middle,
 }
 
 /// The GPUI line wrapper, used to wrap lines of text to a given width.
@@ -180,9 +182,66 @@ impl LineWrapper {
                     }
                 }
             }
+            TruncateFrom::Middle => {}
         }
 
         None
+    }
+
+    fn should_truncate_line_middle(
+        &mut self,
+        line: &str,
+        truncate_width: Pixels,
+        truncation_affix: &str,
+    ) -> Option<(usize, usize)> {
+        let affix_width = truncation_affix
+            .chars()
+            .map(|c| self.width_for_char(c))
+            .fold(px(0.0), |width, char_width| width + char_width);
+        let total_width = line
+            .chars()
+            .map(|c| self.width_for_char(c))
+            .fold(px(0.0), |width, char_width| width + char_width);
+
+        if total_width <= truncate_width {
+            return None;
+        }
+
+        let content_budget = truncate_width - affix_width;
+        if content_budget <= px(0.) {
+            return Some((0, line.len()));
+        }
+
+        let front_budget = content_budget * (2.0 / 3.0);
+        let back_budget = content_budget - front_budget;
+
+        let mut front_width = px(0.);
+        let mut front_end_ix = 0;
+        for (ix, c) in line.char_indices() {
+            let char_width = self.width_for_char(c);
+            if front_width + char_width > front_budget {
+                break;
+            }
+            front_width += char_width;
+            front_end_ix = ix + c.len_utf8();
+        }
+
+        let mut back_width = px(0.);
+        let mut back_start_ix = line.len();
+        for (ix, c) in line.char_indices().rev() {
+            let char_width = self.width_for_char(c);
+            if back_width + char_width > back_budget {
+                break;
+            }
+            back_width += char_width;
+            back_start_ix = ix;
+        }
+
+        if front_end_ix >= back_start_ix {
+            return Some((0, line.len()));
+        }
+
+        Some((front_end_ix, back_start_ix))
     }
 
     /// Truncate a line of text to the given width with this wrapper's font and font size.
@@ -194,6 +253,28 @@ impl LineWrapper {
         runs: &'a [TextRun],
         truncate_from: TruncateFrom,
     ) -> (SharedString, Cow<'a, [TextRun]>) {
+        if truncate_from == TruncateFrom::Middle {
+            if let Some((front_end_ix, back_start_ix)) =
+                self.should_truncate_line_middle(&line, truncate_width, truncation_affix)
+            {
+                let result = SharedString::from(format!(
+                    "{}{truncation_affix}{}",
+                    &line[..front_end_ix],
+                    &line[back_start_ix..]
+                ));
+                let mut runs = runs.to_vec();
+                update_runs_after_middle_truncation(
+                    truncation_affix,
+                    &mut runs,
+                    front_end_ix,
+                    back_start_ix,
+                );
+                return (result, Cow::Owned(runs));
+            }
+
+            return (line, Cow::Borrowed(runs));
+        }
+
         if let Some(truncate_ix) =
             self.should_truncate_line(&line, truncate_width, truncation_affix, truncate_from)
         {
@@ -218,6 +299,16 @@ impl LineWrapper {
     ) -> (SharedString, Cow<'a, [TextRun]>) {
         if max_lines == 0 {
             return (SharedString::from(""), Cow::Owned(Vec::new()));
+        }
+
+        if truncate_from == TruncateFrom::Middle {
+            return self.truncate_wrapped_line_middle(
+                text,
+                wrap_width,
+                max_lines,
+                truncation_affix,
+                runs,
+            );
         }
 
         if max_lines <= 1 {
@@ -358,6 +449,61 @@ impl LineWrapper {
         (text, Cow::Borrowed(runs))
     }
 
+    fn truncate_wrapped_line_middle<'a>(
+        &mut self,
+        text: SharedString,
+        wrap_width: Pixels,
+        max_lines: usize,
+        truncation_affix: &str,
+        runs: &'a [TextRun],
+    ) -> (SharedString, Cow<'a, [TextRun]>) {
+        if self.wrapped_line_count(&text, wrap_width) <= max_lines {
+            return (text, Cow::Borrowed(runs));
+        }
+
+        let mut boundaries = Vec::with_capacity(text.chars().count() + 1);
+        boundaries.push(0);
+        boundaries.extend(text.char_indices().map(|(ix, c)| ix + c.len_utf8()));
+        let character_count = boundaries.len() - 1;
+
+        let candidate = |retained_characters: usize| {
+            let front_characters = retained_characters.saturating_mul(2).div_ceil(3);
+            let back_characters = retained_characters - front_characters;
+            let front_end_ix = boundaries[front_characters];
+            let back_start_ix = boundaries[character_count - back_characters];
+            let result = SharedString::from(format!(
+                "{}{truncation_affix}{}",
+                &text[..front_end_ix],
+                &text[back_start_ix..]
+            ));
+            (result, front_end_ix, back_start_ix)
+        };
+
+        // The line-count check keeps hard newlines and word wrapping authoritative;
+        // multiplying the one-line width by `max_lines` does not model either.
+        let mut low = 0;
+        let mut high = character_count.saturating_sub(1);
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            let (result, _, _) = candidate(mid);
+            if self.wrapped_line_count(&result, wrap_width) <= max_lines {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        let (result, front_end_ix, back_start_ix) = candidate(low);
+        let mut runs = runs.to_vec();
+        update_runs_after_middle_truncation(
+            truncation_affix,
+            &mut runs,
+            front_end_ix,
+            back_start_ix,
+        );
+        (result, Cow::Owned(runs))
+    }
+
     fn truncate_single_wrapped_line<'a>(
         &mut self,
         text: SharedString,
@@ -462,6 +608,9 @@ impl LineWrapper {
                         "{}{truncation_affix}",
                         trim_end_before_truncation_affix(&line[..truncate_ix], truncation_affix)
                     ))
+                }
+                TruncateFrom::Middle => {
+                    unreachable!("middle truncation is handled before wrapped-line truncation")
                 }
             }
         }
@@ -575,7 +724,10 @@ impl LineWrapper {
         // is included so it stays attached to the preceding word when wrapping.
         matches!(c, '-' | '_' | '.' | '\'' | '\u{2018}' | '\u{2019}' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';') ||
         // `⋯` character is special used in Zed, to keep this at the end of the line.
-        matches!(c, '⋯')
+        matches!(c, '⋯') ||
+
+        // Non-breaking glue characters
+        matches!(c, '\u{202F}' | '\u{00A0}' | '\u{2011}')
     }
 
     #[inline(always)]
@@ -617,6 +769,7 @@ fn truncated_line_text(
             "{}{truncation_affix}",
             trim_end_before_truncation_affix(&line[..truncate_ix], truncation_affix)
         )),
+        TruncateFrom::Middle => unreachable!("middle truncation is handled by truncate_line"),
     }
 }
 
@@ -708,8 +861,65 @@ fn update_runs_after_truncation(
                 runs.truncate(run_index + 1);
             }
         }
+        TruncateFrom::Middle => {
+            unreachable!("middle truncation updates runs through its dedicated helper")
+        }
     }
     runs.retain(|run| run.len > 0);
+}
+
+fn update_runs_after_middle_truncation(
+    ellipsis: &str,
+    runs: &mut Vec<TextRun>,
+    front_end_ix: usize,
+    back_start_ix: usize,
+) {
+    let original_runs = std::mem::take(runs);
+    let mut result_runs = Vec::with_capacity(original_runs.len());
+
+    let mut front_remaining = front_end_ix;
+    let mut front_done = false;
+    for run in &original_runs {
+        if front_done {
+            break;
+        }
+        if run.len <= front_remaining {
+            result_runs.push(run.clone());
+            front_remaining -= run.len;
+        } else {
+            let mut partial = run.clone();
+            partial.len = front_remaining + ellipsis.len();
+            result_runs.push(partial);
+            front_done = true;
+        }
+    }
+    if !front_done {
+        if let Some(last) = result_runs.last_mut() {
+            last.len += ellipsis.len();
+        } else if let Some(first) = original_runs.first() {
+            let mut affix_run = first.clone();
+            affix_run.len = ellipsis.len();
+            result_runs.push(affix_run);
+        }
+    }
+
+    let mut byte_pos = 0;
+    for run in &original_runs {
+        let run_end = byte_pos + run.len;
+        if run_end > back_start_ix {
+            if byte_pos < back_start_ix {
+                let mut partial = run.clone();
+                partial.len = run_end - back_start_ix;
+                result_runs.push(partial);
+            } else {
+                result_runs.push(run.clone());
+            }
+        }
+        byte_pos = run_end;
+    }
+
+    result_runs.retain(|run| run.len > 0);
+    *runs = result_runs;
 }
 
 /// A fragment of a line that can be wrapped.
@@ -841,6 +1051,16 @@ mod tests {
                 Boundary::new(12, 0),
                 Boundary::new(18, 0)
             ],
+        );
+
+        assert_eq!(
+            wrapper
+                .wrap_line(
+                    &[LineFragment::text("a\u{202f}b\u{00a0}c\u{2011}d e")],
+                    px(72.0)
+                )
+                .collect::<Vec<_>>(),
+            &[Boundary::new(12, 0)],
         );
         assert_eq!(
             wrapper
@@ -1416,6 +1636,90 @@ mod tests {
     }
 
     #[test]
+    fn test_truncate_line_middle() {
+        let mut wrapper = build_wrapper();
+
+        let short_text = "hello world";
+        let runs = generate_test_runs(&[short_text.len()]);
+        let (result, result_runs) = wrapper.truncate_line(
+            short_text.into(),
+            px(10000.),
+            "…",
+            &runs,
+            TruncateFrom::Middle,
+        );
+        assert_eq!(result.as_ref(), short_text);
+        assert!(matches!(result_runs, Cow::Borrowed(_)));
+
+        let long_text = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz";
+        let runs = generate_test_runs(&[long_text.len()]);
+        let (result, _) =
+            wrapper.truncate_line(long_text.into(), px(100.), "…", &runs, TruncateFrom::Middle);
+        assert!(result.contains('…'));
+        assert!(result.chars().count() < long_text.chars().count());
+        assert_eq!(result.chars().next(), long_text.chars().next());
+        assert_eq!(result.chars().last(), long_text.chars().last());
+
+        let text = "abcdef";
+        let runs = generate_test_runs(&[text.len()]);
+        let (result, result_runs) =
+            wrapper.truncate_line(text.into(), px(1.), "…", &runs, TruncateFrom::Middle);
+        assert_eq!(result.as_ref(), "…");
+        assert_eq!(
+            result_runs.iter().map(|run| run.len).sum::<usize>(),
+            "…".len()
+        );
+
+        let runs = generate_test_runs(&[20, 20, long_text.len() - 40]);
+        let (result, result_runs) =
+            wrapper.truncate_line(long_text.into(), px(100.), "…", &runs, TruncateFrom::Middle);
+        assert_eq!(
+            result_runs.iter().map(|run| run.len).sum::<usize>(),
+            result.len()
+        );
+    }
+
+    #[test]
+    fn test_wrapped_middle_truncation_respects_max_lines() {
+        let mut wrapper = build_wrapper();
+        let text = "beginning alpha beta gamma\nmiddle delta epsilon zeta\nending eta theta omega";
+        let wrap_width = px(72.);
+        let max_lines = 2;
+        let runs = generate_test_runs(&[10, 15, text.len() - 25]);
+
+        let (result, result_runs) = wrapper.truncate_wrapped_line(
+            text.into(),
+            wrap_width,
+            max_lines,
+            "…",
+            &runs,
+            TruncateFrom::Middle,
+        );
+
+        assert_eq!(result.chars().next(), text.chars().next());
+        assert_eq!(result.chars().last(), text.chars().last());
+        assert!(result.contains('…'));
+        assert!(wrapped_line_count(&mut wrapper, &result, wrap_width) <= max_lines);
+        assert_eq!(
+            result_runs.iter().map(|run| run.len).sum::<usize>(),
+            result.len()
+        );
+        assert!(result_runs.iter().all(|run| run.len > 0));
+    }
+
+    #[test]
+    fn test_middle_truncation_drops_empty_boundary_runs() {
+        let mut runs = generate_test_runs(&[4, 4, 4]);
+
+        update_runs_after_middle_truncation("", &mut runs, 4, 8);
+
+        assert_eq!(
+            runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![4, 4]
+        );
+    }
+
+    #[test]
     fn test_multiline_truncation_trailing_newline() {
         let mut wrapper = build_wrapper();
         let text = "hello\nworld\n";
@@ -1608,6 +1912,10 @@ mod tests {
         assert_not_word("こんにちは");
         assert_not_word("😀😁😂");
         assert_not_word("()[]{}<>");
+
+        assert_word("\u{202f}");
+        assert_word("\u{00a0}");
+        assert_word("\u{2011}");
     }
 
     // For compatibility with the test macro

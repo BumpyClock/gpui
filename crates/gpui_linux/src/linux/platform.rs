@@ -5,19 +5,14 @@ use std::{
     sync::Arc,
 };
 #[cfg(any(feature = "wayland", feature = "x11"))]
-use std::{
-    ffi::OsString,
-    fs::File,
-    io::Read as _,
-    os::fd::{AsFd, FromRawFd, IntoRawFd},
-    time::Duration,
-};
+use std::{ffi::OsString, fs::File, os::fd::AsFd, time::Duration};
+#[cfg(feature = "wayland")]
+use std::{io::Read as _, os::fd::AsRawFd};
 
 use anyhow::{Context as _, anyhow};
-use calloop::LoopSignal;
+use calloop::{LoopSignal, channel::Sender};
 use futures::channel::oneshot;
-use util::ResultExt as _;
-use util::command::{new_command, new_std_command};
+use gpui_util::{ResultExt as _, new_std_command};
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use xkbcommon::xkb::{self, Keycode, Keysym, State};
 
@@ -45,50 +40,6 @@ pub(crate) const KEYRING_LABEL: &str = "zed-github-account";
 #[cfg(any(feature = "wayland", feature = "x11"))]
 const FILE_PICKER_PORTAL_MISSING: &str =
     "Couldn't open file picker due to missing xdg-desktop-portal implementation.";
-
-#[cfg(any(feature = "x11", feature = "wayland"))]
-pub trait ResultExt {
-    type Ok;
-
-    fn notify_err(self, msg: &'static str) -> Self::Ok;
-}
-
-#[cfg(any(feature = "x11", feature = "wayland"))]
-impl<T> ResultExt for anyhow::Result<T> {
-    type Ok = T;
-
-    fn notify_err(self, msg: &'static str) -> T {
-        match self {
-            Ok(v) => v,
-            Err(e) => {
-                use ashpd::desktop::notification::{Notification, NotificationProxy, Priority};
-                use futures::executor::block_on;
-
-                let proxy = block_on(NotificationProxy::new()).expect(msg);
-
-                let notification_id = "dev.zed.Oops";
-                block_on(
-                    proxy.add_notification(
-                        notification_id,
-                        Notification::new("Zed failed to launch")
-                            .body(Some(
-                                format!(
-                                    "{e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
-                                )
-                                .as_str(),
-                            ))
-                            .priority(Priority::High)
-                            .icon(ashpd::desktop::Icon::with_names(&[
-                                "dialog-question-symbolic",
-                            ])),
-                    )
-                ).expect(msg);
-
-                panic!("{msg}");
-            }
-        }
-    }
-}
 
 pub(crate) trait LinuxClient {
     fn compositor_name(&self) -> &'static str;
@@ -135,6 +86,21 @@ pub(crate) trait LinuxClient {
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>>;
     fn run(&self);
 
+    fn handle_system_wake(&self) {
+        let Some(mut callback) = self.with_common(|common| common.callbacks.system_wake.take())
+        else {
+            return;
+        };
+
+        callback();
+
+        self.with_common(|common| {
+            if common.callbacks.system_wake.is_none() {
+                common.callbacks.system_wake = Some(callback);
+            }
+        });
+    }
+
     #[cfg(any(feature = "wayland", feature = "x11"))]
     fn window_identifier(
         &self,
@@ -152,6 +118,7 @@ pub(crate) struct PlatformHandlers {
     pub(crate) will_open_app_menu: Option<Box<dyn FnMut()>>,
     pub(crate) validate_app_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     pub(crate) keyboard_layout_change: Option<Box<dyn FnMut()>>,
+    pub(crate) system_wake: Option<Box<dyn FnMut()>>,
 }
 
 pub(crate) struct LinuxCommon {
@@ -163,11 +130,24 @@ pub(crate) struct LinuxCommon {
     pub(crate) callbacks: PlatformHandlers,
     pub(crate) signal: LoopSignal,
     pub(crate) menus: Vec<OwnedMenu>,
+    #[cfg_attr(
+        not(all(target_os = "linux", any(feature = "wayland", feature = "x11"))),
+        allow(dead_code)
+    )]
+    wake_sender: Sender<()>,
+    wake_listener_started: bool,
 }
 
 impl LinuxCommon {
-    pub fn new(signal: LoopSignal) -> (Self, PriorityQueueCalloopReceiver<RunnableVariant>) {
+    pub fn new(
+        signal: LoopSignal,
+    ) -> (
+        Self,
+        PriorityQueueCalloopReceiver<RunnableVariant>,
+        calloop::channel::Channel<()>,
+    ) {
         let (main_sender, main_receiver) = PriorityQueueCalloopReceiver::new();
+        let (wake_sender, wake_receiver) = calloop::channel::channel();
 
         #[cfg(any(feature = "wayland", feature = "x11"))]
         let text_system = Arc::new(crate::linux::CosmicTextSystem::new());
@@ -189,10 +169,50 @@ impl LinuxCommon {
             callbacks,
             signal,
             menus: Vec::new(),
+            wake_sender,
+            wake_listener_started: false,
         };
 
-        (common, main_receiver)
+        (common, main_receiver, wake_receiver)
     }
+
+    pub(crate) fn start_wake_listener(&mut self) {
+        if self.wake_listener_started {
+            return;
+        }
+        #[cfg(all(target_os = "linux", any(feature = "wayland", feature = "x11")))]
+        smol::spawn({
+            let wake_sender = self.wake_sender.clone();
+            async move {
+                if let Err(error) = listen_for_system_wake(wake_sender).await {
+                    log::debug!("failed to listen for system wake events: {error:?}");
+                }
+            }
+        })
+        .detach();
+        self.wake_listener_started = true;
+    }
+}
+
+#[cfg(all(target_os = "linux", any(feature = "wayland", feature = "x11")))]
+async fn listen_for_system_wake(wake_sender: Sender<()>) -> anyhow::Result<()> {
+    use futures::StreamExt as _;
+
+    let connection = ashpd::zbus::Connection::system().await?;
+    let proxy = ashpd::zbus::Proxy::new(
+        &connection,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await?;
+    let mut sleep_events = proxy.receive_signal("PrepareForSleep").await?;
+    while let Some(message) = sleep_events.next().await {
+        if !message.body().deserialize::<bool>()? {
+            wake_sender.send(()).ok();
+        }
+    }
+    Ok(())
 }
 
 pub(crate) struct LinuxPlatform<P> {
@@ -412,7 +432,9 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
                         response
                             .uris()
                             .iter()
-                            .filter_map(|uri| uri.to_file_path().ok())
+                            .filter_map(|uri| {
+                                url::Url::parse(uri.as_str()).ok()?.to_file_path().ok()
+                            })
                             .collect::<Vec<_>>(),
                     )),
                     Err(ashpd::Error::Response(_)) => Ok(None),
@@ -471,10 +493,9 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
                     };
 
                     let result = match request.response() {
-                        Ok(response) => Ok(response
-                            .uris()
-                            .first()
-                            .and_then(|uri| uri.to_file_path().ok())),
+                        Ok(response) => Ok(response.uris().first().and_then(|uri| {
+                            url::Url::parse(uri.as_str()).ok()?.to_file_path().ok()
+                        })),
                         Err(ashpd::Error::Response(_)) => Ok(None),
                         Err(e) => Err(e.into()),
                     };
@@ -499,15 +520,15 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         let path = path.to_owned();
         self.background_executor()
             .spawn(async move {
-                let _ = new_command("xdg-open")
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "running on a background thread, so blocking is fine"
+                )]
+                new_std_command("xdg-open")
                     .arg(path)
-                    .spawn()
-                    .context("invoking xdg-open")
-                    .log_err()?
                     .status()
-                    .await
-                    .log_err()?;
-                Some(())
+                    .context("invoking xdg-open")
+                    .log_err();
             })
             .detach();
     }
@@ -521,6 +542,13 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         self.inner.with_common(|common| {
             common.callbacks.reopen = Some(callback);
+        });
+    }
+
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        self.inner.with_common(|common| {
+            common.callbacks.system_wake = Some(callback);
+            common.start_wake_listener();
         });
     }
 
@@ -683,7 +711,7 @@ pub(super) fn open_uri_internal(
     uri: &str,
     activation_token: Option<String>,
 ) {
-    if let Some(uri) = ashpd::url::Url::parse(uri).log_err() {
+    if let Some(uri) = ashpd::Uri::parse(uri).log_err() {
         executor
             .spawn(async move {
                 let mut xdg_open_failed = false;
@@ -785,12 +813,61 @@ pub(super) fn get_xkb_compose_state(cx: &xkb::Context) -> Option<xkb::compose::S
     state
 }
 
-#[cfg(any(feature = "wayland", feature = "x11"))]
-pub(super) unsafe fn read_fd(fd: filedescriptor::FileDescriptor) -> Result<Vec<u8>> {
-    let mut file = unsafe { File::from_raw_fd(fd.into_raw_fd()) };
+#[cfg(feature = "wayland")]
+pub(super) const PIPE_READ_TIMEOUT: Duration = Duration::from_secs(4);
+
+#[cfg(feature = "wayland")]
+const MAX_PIPE_READ_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(feature = "wayland")]
+pub(super) fn read_fd_with_timeout(
+    fd: filedescriptor::FileDescriptor,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    read_fd_with_timeout_and_limit(fd, timeout, MAX_PIPE_READ_BYTES)
+}
+
+#[cfg(feature = "wayland")]
+fn read_fd_with_timeout_and_limit(
+    mut fd: filedescriptor::FileDescriptor,
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    fd.set_non_blocking(true)?;
     let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-    Ok(buffer)
+    let mut chunk = [0u8; 8192];
+    loop {
+        let mut poll_fds = [filedescriptor::pollfd {
+            fd: fd.as_raw_fd(),
+            events: filedescriptor::POLLIN,
+            revents: 0,
+        }];
+        let ready = match filedescriptor::poll(&mut poll_fds, Some(timeout)) {
+            Ok(ready) => ready,
+            Err(filedescriptor::Error::Poll(err))
+                if err.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if ready == 0 {
+            anyhow::bail!("timed out waiting for data on pipe after {timeout:?}");
+        }
+        match fd.read(&mut chunk) {
+            Ok(0) => return Ok(buffer),
+            Ok(len) => {
+                if buffer.len().saturating_add(len) > max_bytes {
+                    anyhow::bail!("pipe payload exceeds {max_bytes} byte limit");
+                }
+                buffer.extend_from_slice(&chunk[..len]);
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
@@ -1146,10 +1223,14 @@ pub(super) fn compositor_gpu_hint_from_dev_t(dev: u64) -> Option<gpui_wgpu::Comp
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "wayland", feature = "x11"))]
     use super::*;
+    use crate::linux::HeadlessClient;
+    #[cfg(any(feature = "wayland", feature = "x11"))]
     use gpui::{Point, px};
 
     #[test]
+    #[cfg(any(feature = "wayland", feature = "x11"))]
     fn test_is_within_click_distance() {
         let zero = Point::new(px(0.0), px(0.0));
         assert!(is_within_click_distance(zero, Point::new(px(5.0), px(5.0))));
@@ -1165,5 +1246,58 @@ mod tests {
             zero,
             Point::new(px(5.0), px(5.1))
         ),);
+    }
+
+    #[test]
+    fn system_wake_callback_can_reenter_client_state() {
+        let client = HeadlessClient::new();
+        let callback_client = client.clone();
+        client.with_common(|common| {
+            common.callbacks.system_wake = Some(Box::new(move || {
+                callback_client.with_common(|common| common.auto_hide_scrollbars = true);
+            }));
+        });
+
+        client.handle_system_wake();
+
+        assert!(client.with_common(|common| common.auto_hide_scrollbars));
+    }
+
+    #[cfg(feature = "wayland")]
+    #[test]
+    fn read_fd_with_timeout_reads_until_close() {
+        use std::io::Write as _;
+
+        let mut pipe = filedescriptor::Pipe::new().unwrap();
+        pipe.write.write_all(b"clipboard").unwrap();
+        drop(pipe.write);
+
+        assert_eq!(
+            read_fd_with_timeout(pipe.read, PIPE_READ_TIMEOUT).unwrap(),
+            b"clipboard"
+        );
+    }
+
+    #[cfg(feature = "wayland")]
+    #[test]
+    fn read_fd_with_timeout_rejects_stalled_writer() {
+        let pipe = filedescriptor::Pipe::new().unwrap();
+        let _writer = pipe.write;
+
+        let error = read_fd_with_timeout(pipe.read, Duration::from_millis(20)).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[cfg(feature = "wayland")]
+    #[test]
+    fn read_fd_with_timeout_rejects_oversized_payload() {
+        use std::io::Write as _;
+
+        let mut pipe = filedescriptor::Pipe::new().unwrap();
+        pipe.write.write_all(b"too-large").unwrap();
+        drop(pipe.write);
+
+        let error = read_fd_with_timeout_and_limit(pipe.read, PIPE_READ_TIMEOUT, 4).unwrap_err();
+        assert!(error.to_string().contains("exceeds 4 byte limit"));
     }
 }

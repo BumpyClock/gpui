@@ -63,6 +63,16 @@
 //! [`.on_click()`][StatefulInteractiveElement::on_click] adds an
 //! [`AccessibleAction::Click`] handler that calls the click handler.
 //!
+//! ## Synthetic children
+//!
+//! A custom [`Element`] can represent accessibility nodes that do not each
+//! correspond to a GPUI element by implementing
+//! [`Element::a11y_synthetic_children`]. The callback receives an
+//! [`A11ySubtreeBuilder`] after prepaint, so it may use prepaint state to append
+//! synthetic leaf nodes or update the parent node. Use
+//! [`A11ySubtreeBuilder::synthetic_node_id`] with keys that are unique among a
+//! parent's synthetic children to derive IDs that remain stable across frames.
+//!
 //! ## Further reading
 //!
 //! - [AccessKit]: The cross-platform accessibility toolkit GPUI uses

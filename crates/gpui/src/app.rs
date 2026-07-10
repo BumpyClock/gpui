@@ -23,7 +23,9 @@ use slotmap::SlotMap;
 
 use crate::util::{ResultExt, debug_panic};
 pub use async_context::*;
-use collections::{FxHashMap, FxHashSet, HashMap, VecDeque};
+#[cfg(feature = "bench")]
+pub use bench_context::{BenchAppContext, BenchReport, BenchWindowContext, bench_platform};
+use collections::{FxHashMap, FxHashSet, HashMap, TypeIdHashMap, TypeIdHashSet, VecDeque};
 pub use context::*;
 pub use entity_map::*;
 use http_client::{HttpClient, Url};
@@ -50,6 +52,8 @@ use crate::{
 };
 
 mod async_context;
+#[cfg(feature = "bench")]
+mod bench_context;
 mod context;
 mod entity_map;
 #[cfg(any(test, feature = "test-support"))]
@@ -129,6 +133,29 @@ impl Drop for AppRefMut<'_> {
 /// You won't interact with this type much outside of initial configuration and startup.
 pub struct Application(Rc<AppCell>);
 
+/// A strong handle to an [`Application`] started with [`Application::run_embedded`].
+///
+/// Dropping this handle releases the app, so an embedder must hold it for as long as the
+/// app should run. While held, it is the embedder's entry point back into GPUI each time
+/// the external run loop gives it control.
+pub struct ApplicationHandle {
+    app: Rc<AppCell>,
+}
+
+impl ApplicationHandle {
+    /// Invoke `f` with the app context.
+    ///
+    /// This must not be called re-entrantly from code that is already inside an update.
+    pub fn update<R>(&self, f: impl FnOnce(&mut App) -> R) -> R {
+        self.app.borrow_mut().update(f)
+    }
+
+    /// Return an async-friendly weak handle to the application.
+    pub fn to_async(&self) -> AsyncApp {
+        self.update(|cx| cx.to_async())
+    }
+}
+
 /// Represents an application before it is fully launched. Once your app is
 /// configured, you'll start the app with `App::run`.
 impl Application {
@@ -192,6 +219,24 @@ impl Application {
         }));
     }
 
+    /// Start the application for an embedder that drives the run loop itself.
+    ///
+    /// Embedded platforms invoke the launch callback and return immediately from
+    /// [`Platform::run`]. The returned handle keeps the application alive and lets the
+    /// embedder re-enter it when its external run loop yields control.
+    pub fn run_embedded<F>(self, on_finish_launching: F) -> ApplicationHandle
+    where
+        F: 'static + FnOnce(&mut App),
+    {
+        let this = self.0.clone();
+        let platform = self.0.borrow().platform.clone();
+        platform.run(Box::new(move || {
+            let cx = &mut *this.borrow_mut();
+            on_finish_launching(cx);
+        }));
+        ApplicationHandle { app: self.0 }
+    }
+
     /// Register a handler to be invoked when the platform instructs the application
     /// to open one or more URLs.
     pub fn on_open_urls<F>(&self, mut callback: F) -> &Self
@@ -214,6 +259,23 @@ impl Application {
                 callback(&mut app.borrow_mut());
             }
         }));
+        self
+    }
+
+    /// Invoke a handler when the system wakes from sleep.
+    pub fn on_system_wake<F>(&self, mut callback: F) -> &Self
+    where
+        F: 'static + FnMut(&mut App),
+    {
+        let this = Rc::downgrade(&self.0);
+        self.0
+            .borrow_mut()
+            .platform
+            .on_system_wake(Box::new(move || {
+                if let Some(app) = this.upgrade() {
+                    callback(&mut app.borrow_mut());
+                }
+            }));
         self
     }
 
@@ -613,7 +675,7 @@ pub struct App {
     pub(crate) keyboard_layout: Box<dyn PlatformKeyboardLayout>,
     pub(crate) keyboard_mapper: Rc<dyn PlatformKeyboardMapper>,
     pub(crate) global_action_listeners:
-        FxHashMap<TypeId, Vec<Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Self)>>>,
+        TypeIdHashMap<Vec<Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Self)>>>,
     pending_effects: VecDeque<Effect>,
 
     pub(crate) observers: SubscriberSet<EntityId, Handler>,
@@ -638,7 +700,7 @@ pub struct App {
     // callbacks are marked cancelled at this point as this will also shutdown
     // the tokio runtime. As any task attempting to spawn a blocking tokio task,
     // might panic.
-    pub(crate) globals_by_type: FxHashMap<TypeId, Box<dyn Any>>,
+    pub(crate) globals_by_type: TypeIdHashMap<Box<dyn Any>>,
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
@@ -648,7 +710,7 @@ pub struct App {
 
     // below is plain data, the drop order is insignificant here
     pub(crate) pending_notifications: FxHashSet<EntityId>,
-    pub(crate) pending_global_notifications: FxHashSet<TypeId>,
+    pub(crate) pending_global_notifications: TypeIdHashSet,
     pub(crate) restart_path: Option<PathBuf>,
     pub(crate) layout_id_buffer: Vec<LayoutId>, // We recycle this memory across layout requests.
     pub(crate) propagate_event: bool,
@@ -720,7 +782,7 @@ impl App {
                 loading_assets: Default::default(),
                 asset_source,
                 http_client,
-                globals_by_type: FxHashMap::default(),
+                globals_by_type: Default::default(),
                 entities,
                 new_entity_observers: SubscriberSet::new(),
                 windows: SlotMap::with_key(),
@@ -730,10 +792,10 @@ impl App {
                 keymap: Rc::new(RefCell::new(Keymap::default())),
                 keyboard_layout,
                 keyboard_mapper,
-                global_action_listeners: FxHashMap::default(),
+                global_action_listeners: Default::default(),
                 pending_effects: VecDeque::new(),
                 pending_notifications: FxHashSet::default(),
-                pending_global_notifications: FxHashSet::default(),
+                pending_global_notifications: Default::default(),
                 observers: SubscriberSet::new(),
                 tracked_entities: FxHashMap::default(),
                 window_invalidators_by_entity: FxHashMap::default(),
@@ -1449,7 +1511,7 @@ impl App {
                     }
                 }
             } else {
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(any(test, feature = "test-support", feature = "bench"))]
                 for window in self
                     .windows
                     .values()
@@ -2740,9 +2802,73 @@ impl<'a, T> Drop for GpuiBorrow<'a, T> {
 
 #[cfg(test)]
 mod test {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        sync::Arc,
+    };
 
-    use crate::{AppContext, Context, Empty, Entity, Render, TestAppContext, Window};
+    use crate::{
+        AppContext, Application, BackgroundExecutor, Context, Empty, Entity, ForegroundExecutor,
+        Global, Render, TestAppContext, TestDispatcher, TestPlatform, Window,
+    };
+
+    #[derive(Default)]
+    struct EmbeddedState(u32);
+
+    impl Global for EmbeddedState {}
+
+    fn test_application() -> (Application, Rc<TestPlatform>) {
+        let dispatcher = Arc::new(TestDispatcher::new(0));
+        let background_executor = BackgroundExecutor::new(dispatcher.clone());
+        let foreground_executor = ForegroundExecutor::new(dispatcher);
+        let platform = TestPlatform::new(background_executor, foreground_executor);
+        (Application::with_platform(platform.clone()), platform)
+    }
+
+    #[test]
+    fn embedded_application_runs_launch_callback_and_keeps_app_alive() {
+        let (application, _) = test_application();
+        let launched = Rc::new(Cell::new(false));
+        let launched_for_callback = launched.clone();
+
+        let handle = application.run_embedded(move |cx| {
+            launched_for_callback.set(true);
+            cx.set_global(EmbeddedState(1));
+        });
+
+        assert!(launched.get());
+        handle.update(|cx| cx.global_mut::<EmbeddedState>().0 += 1);
+        let async_app = handle.to_async();
+        async_app.update(|cx| cx.global_mut::<EmbeddedState>().0 += 1);
+        assert_eq!(handle.update(|cx| cx.global::<EmbeddedState>().0), 3);
+    }
+
+    #[test]
+    fn embedded_application_update_flushes_effects_before_returning() {
+        let (application, _) = test_application();
+        let handle = application.run_embedded(|_| {});
+        let deferred = Rc::new(Cell::new(false));
+
+        handle.update({
+            let deferred = deferred.clone();
+            move |cx| cx.defer(move |_| deferred.set(true))
+        });
+
+        assert!(deferred.get());
+    }
+
+    #[test]
+    fn test_platform_simulates_system_wake() {
+        let (application, platform) = test_application();
+        application.on_system_wake(|cx| cx.global_mut::<EmbeddedState>().0 += 1);
+        let handle = application.run_embedded(|cx| cx.set_global(EmbeddedState::default()));
+
+        platform.simulate_system_wake();
+        platform.simulate_system_wake();
+
+        assert_eq!(handle.update(|cx| cx.global::<EmbeddedState>().0), 2);
+    }
 
     #[test]
     fn test_gpui_borrow() {

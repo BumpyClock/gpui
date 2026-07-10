@@ -23,6 +23,34 @@ pub struct CompositorGpuHint {
 impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn new(compositor_gpu: Option<CompositorGpuHint>) -> anyhow::Result<Self> {
+        Self::new_internal(Self::instance(), None, compositor_gpu, false)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_for_surface(
+        instance: wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+        compositor_gpu: Option<CompositorGpuHint>,
+    ) -> anyhow::Result<Self> {
+        Self::new_internal(instance, Some(surface), compositor_gpu, false)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_for_surface_rejecting_software(
+        instance: wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+        compositor_gpu: Option<CompositorGpuHint>,
+    ) -> anyhow::Result<Self> {
+        Self::new_internal(instance, Some(surface), compositor_gpu, true)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn new_internal(
+        instance: wgpu::Instance,
+        compatible_surface: Option<&wgpu::Surface<'_>>,
+        compositor_gpu: Option<CompositorGpuHint>,
+        reject_software: bool,
+    ) -> anyhow::Result<Self> {
         let device_id_filter = match std::env::var("ZED_DEVICE_ID") {
             Ok(val) => parse_pci_id(&val)
                 .context("Failed to parse device ID from `ZED_DEVICE_ID` environment variable")
@@ -35,53 +63,20 @@ impl WgpuContext {
             }
         };
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-            flags: wgpu::InstanceFlags::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            display: None,
-        });
-
-        let adapter = pollster::block_on(Self::select_adapter(
-            &instance,
-            device_id_filter,
-            compositor_gpu.as_ref(),
-        ))?;
+        let (adapter, device, queue, dual_source_blending_available) =
+            pollster::block_on(Self::select_adapter_and_device(
+                &instance,
+                device_id_filter,
+                compositor_gpu.as_ref(),
+                compatible_surface,
+                reject_software,
+            ))?;
 
         log::info!(
             "Selected GPU adapter: {:?} ({:?})",
             adapter.get_info().name,
             adapter.get_info().backend
         );
-
-        let dual_source_blending_available = adapter
-            .features()
-            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
-
-        let mut required_features = wgpu::Features::empty();
-        if dual_source_blending_available {
-            required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
-        } else {
-            log::warn!(
-                "Dual-source blending not available on this GPU. \
-                Subpixel text antialiasing will be disabled."
-            );
-        }
-
-        let (device, queue) = pollster::block_on(
-            adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("gpui_device"),
-                required_features,
-                required_limits: wgpu::Limits::default()
-                    .using_resolution(adapter.limits())
-                    .using_alignment(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::Off,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            }),
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?;
 
         let device_lost = Arc::new(AtomicBool::new(false));
         device.set_device_lost_callback({
@@ -101,6 +96,17 @@ impl WgpuContext {
             queue: Arc::new(queue),
             dual_source_blending: dual_source_blending_available,
             device_lost,
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub fn instance() -> wgpu::Instance {
+        wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
         })
     }
 
@@ -179,11 +185,13 @@ impl WgpuContext {
     }
 
     #[cfg(not(target_family = "wasm"))]
-    async fn select_adapter(
+    async fn select_adapter_and_device(
         instance: &wgpu::Instance,
         device_id_filter: Option<u32>,
         compositor_gpu: Option<&CompositorGpuHint>,
-    ) -> anyhow::Result<wgpu::Adapter> {
+        compatible_surface: Option<&wgpu::Surface<'_>>,
+        reject_software: bool,
+    ) -> anyhow::Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue, bool)> {
         let mut adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
 
         if adapters.is_empty() {
@@ -262,12 +270,134 @@ impl WgpuContext {
             );
         }
 
-        // Return the first (highest priority) adapter
-        Ok(adapters.into_iter().next().unwrap())
+        for adapter in adapters {
+            let info = adapter.get_info();
+            if reject_software && info.device_type == wgpu::DeviceType::Cpu {
+                log::info!(
+                    "Skipping software renderer: {} ({:?})",
+                    info.name,
+                    info.backend
+                );
+                continue;
+            }
+
+            let result = if let Some(surface) = compatible_surface {
+                Self::try_adapter_with_surface(&adapter, surface).await
+            } else {
+                Self::create_device(&adapter).await
+            };
+            match result {
+                Ok((device, queue, dual_source_blending)) => {
+                    if !dual_source_blending {
+                        log::warn!(
+                            "Dual-source blending not available on this GPU. \
+                             Subpixel text antialiasing will be disabled."
+                        );
+                    }
+                    return Ok((adapter, device, queue, dual_source_blending));
+                }
+                Err(error) => {
+                    log::info!(
+                        "Adapter {} ({:?}) failed: {error:#}; trying next",
+                        info.name,
+                        info.backend
+                    );
+                }
+            }
+        }
+
+        anyhow::bail!("No GPU adapter found that can configure the display surface")
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    async fn create_device(
+        adapter: &wgpu::Adapter,
+    ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool)> {
+        let dual_source_blending = adapter
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+        let required_features = if dual_source_blending {
+            wgpu::Features::DUAL_SOURCE_BLENDING
+        } else {
+            wgpu::Features::empty()
+        };
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("gpui_device"),
+                required_features,
+                required_limits: wgpu::Limits::downlevel_defaults()
+                    .using_resolution(adapter.limits())
+                    .using_alignment(adapter.limits()),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to create wgpu device: {error}"))?;
+        Ok((device, queue, dual_source_blending))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    async fn try_adapter_with_surface(
+        adapter: &wgpu::Adapter,
+        surface: &wgpu::Surface<'_>,
+    ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool)> {
+        let capabilities = surface.get_capabilities(adapter);
+        let format = capabilities
+            .formats
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("no compatible surface formats"))?;
+        let alpha_mode = capabilities
+            .alpha_modes
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("no compatible alpha modes"))?;
+        let present_mode = if capabilities
+            .present_modes
+            .contains(&wgpu::PresentMode::Fifo)
+        {
+            wgpu::PresentMode::Fifo
+        } else {
+            capabilities
+                .present_modes
+                .first()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("no compatible present modes"))?
+        };
+
+        let (device, queue, dual_source_blending) = Self::create_device(adapter).await?;
+        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        surface.configure(
+            &device,
+            &wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: 64,
+                height: 64,
+                present_mode,
+                desired_maximum_frame_latency: 2,
+                alpha_mode,
+                view_formats: vec![],
+            },
+        );
+        if let Some(error) = error_scope.pop().await {
+            anyhow::bail!("surface configuration failed: {error}");
+        }
+        Ok((device, queue, dual_source_blending))
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {
         self.dual_source_blending
+    }
+
+    pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
+        let capabilities = surface.get_capabilities(&self.adapter);
+        anyhow::ensure!(
+            !capabilities.formats.is_empty() && !capabilities.alpha_modes.is_empty(),
+            "shared GPU adapter is incompatible with the window surface"
+        );
+        Ok(())
     }
 
     /// Returns true if the GPU device was lost (e.g., due to driver crash, suspend/resume).

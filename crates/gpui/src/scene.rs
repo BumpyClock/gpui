@@ -22,6 +22,17 @@ pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
 
+/// A boolean stored as an initialized `u32` for padding-free GPU buffer layouts.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct PaddedBool32(u32);
+
+impl From<bool> for PaddedBool32 {
+    fn from(value: bool) -> Self {
+        Self(value as u32)
+    }
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
@@ -654,7 +665,7 @@ pub struct Underline {
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
     pub thickness: ScaledPixels,
-    pub wavy: u32,
+    pub wavy: PaddedBool32,
 }
 
 impl From<Underline> for Primitive {
@@ -907,7 +918,7 @@ impl From<SubpixelSprite> for Primitive {
 pub struct PolychromeSprite {
     pub order: DrawOrder,
     pub pad: u32,
-    pub grayscale: bool,
+    pub grayscale: PaddedBool32,
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
@@ -1108,6 +1119,7 @@ impl PathVertex<Pixels> {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::{align_of, offset_of, size_of};
     use std::sync::Arc;
 
     use super::*;
@@ -1122,6 +1134,125 @@ mod tests {
 
     fn test_global_id() -> GlobalElementId {
         GlobalElementId(Arc::from([ElementId::from("layer")]))
+    }
+
+    fn test_backdrop_blur(order: DrawOrder) -> BackdropBlur {
+        let bounds = test_bounds();
+        BackdropBlur {
+            order,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::all(ScaledPixels(2.0)),
+            blur_radius: ScaledPixels(12.0),
+            source_origin_x: 0.0,
+            source_origin_y: 0.0,
+            source_width: 1.0,
+            source_height: 1.0,
+            pad2: 0,
+        }
+    }
+
+    #[test]
+    fn backdrop_blur_gpu_layout_matches_shader_storage_contract() {
+        assert_eq!(align_of::<BackdropBlur>(), 4);
+        assert_eq!(size_of::<BackdropBlur>(), 80);
+        assert_eq!(offset_of!(BackdropBlur, order), 0);
+        assert_eq!(offset_of!(BackdropBlur, bounds), 8);
+        assert_eq!(offset_of!(BackdropBlur, content_mask), 24);
+        assert_eq!(offset_of!(BackdropBlur, corner_radii), 40);
+        assert_eq!(offset_of!(BackdropBlur, blur_radius), 56);
+        assert_eq!(offset_of!(BackdropBlur, source_origin_x), 60);
+        assert_eq!(offset_of!(BackdropBlur, source_height), 72);
+        assert_eq!(offset_of!(BackdropBlur, pad2), 76);
+    }
+
+    #[test]
+    fn padded_bool32_has_initialized_u32_representation() {
+        assert_eq!(size_of::<PaddedBool32>(), size_of::<u32>());
+        assert_eq!(align_of::<PaddedBool32>(), align_of::<u32>());
+        assert_eq!(PaddedBool32::from(false).0, 0);
+        assert_eq!(PaddedBool32::from(true).0, 1);
+    }
+
+    #[test]
+    fn underline_gpu_layout_matches_shader_storage_contract() {
+        assert_eq!(align_of::<Underline>(), 4);
+        assert_eq!(size_of::<Underline>(), 64);
+        assert_eq!(offset_of!(Underline, order), 0);
+        assert_eq!(offset_of!(Underline, bounds), 8);
+        assert_eq!(offset_of!(Underline, content_mask), 24);
+        assert_eq!(offset_of!(Underline, color), 40);
+        assert_eq!(offset_of!(Underline, thickness), 56);
+        assert_eq!(offset_of!(Underline, wavy), 60);
+    }
+
+    #[test]
+    fn polychrome_sprite_gpu_layout_matches_shader_storage_contract() {
+        assert_eq!(align_of::<PolychromeSprite>(), 4);
+        assert_eq!(size_of::<PolychromeSprite>(), 96);
+        assert_eq!(offset_of!(PolychromeSprite, order), 0);
+        assert_eq!(offset_of!(PolychromeSprite, grayscale), 8);
+        assert_eq!(offset_of!(PolychromeSprite, opacity), 12);
+        assert_eq!(offset_of!(PolychromeSprite, bounds), 16);
+        assert_eq!(offset_of!(PolychromeSprite, content_mask), 32);
+        assert_eq!(offset_of!(PolychromeSprite, corner_radii), 48);
+        assert_eq!(offset_of!(PolychromeSprite, tile), 64);
+    }
+
+    #[test]
+    fn backdrop_blurs_sort_and_batch_between_surrounding_primitives() {
+        let bounds = test_bounds();
+        let mut scene = Scene::default();
+        scene.backdrop_blurs = vec![test_backdrop_blur(3), test_backdrop_blur(2)];
+        scene.quads = vec![
+            Quad {
+                order: 4,
+                bounds,
+                content_mask: ContentMask { bounds },
+                ..Default::default()
+            },
+            Quad {
+                order: 1,
+                bounds,
+                content_mask: ContentMask { bounds },
+                ..Default::default()
+            },
+        ];
+
+        scene.finish();
+
+        assert_eq!(
+            scene
+                .backdrop_blurs
+                .iter()
+                .map(|blur| blur.order)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            scene
+                .quads
+                .iter()
+                .map(|quad| quad.order)
+                .collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+
+        let mut batches = scene.batches();
+        assert!(matches!(
+            batches.next(),
+            Some(PrimitiveBatch::Quads(range)) if range == (0..1)
+        ));
+        assert!(matches!(
+            batches.next(),
+            Some(PrimitiveBatch::BackdropBlurs(range)) if range == (0..2)
+        ));
+        assert!(matches!(
+            batches.next(),
+            Some(PrimitiveBatch::Quads(range)) if range == (1..2)
+        ));
+        assert!(batches.next().is_none());
     }
 
     #[test]

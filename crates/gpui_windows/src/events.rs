@@ -1,7 +1,7 @@
 use std::{rc::Rc, sync::atomic::Ordering};
 
-use ::util::ResultExt;
 use anyhow::Context as _;
+use gpui_util::ResultExt;
 use windows::{
     Win32::{
         Foundation::*,
@@ -761,24 +761,27 @@ impl WindowsWindowInner {
             this.state.cursor_visible.store(true, Ordering::Release);
         }
 
+        // Windows does not always send key-up events to a window that loses focus. Refresh the
+        // modifier snapshot before notifying activation listeners so they cannot observe stale
+        // Alt/Shift state after an Alt-Tab round trip.
+        if activated {
+            this.state.last_reported_modifiers.set(None);
+            this.state.last_reported_capslock.set(None);
+
+            if let Some(mut func) = this.state.callbacks.input.take() {
+                func(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                    modifiers: current_modifiers(),
+                    capslock: current_capslock(),
+                }));
+                this.state.callbacks.input.set(Some(func));
+            }
+        }
+
         self.executor
             .spawn(async move {
                 if let Some(mut func) = this.state.callbacks.active_status_change.take() {
                     func(activated);
                     this.state.callbacks.active_status_change.set(Some(func));
-                }
-
-                if activated {
-                    this.state.last_reported_modifiers.set(None);
-                    this.state.last_reported_capslock.set(None);
-
-                    if let Some(mut func) = this.state.callbacks.input.take() {
-                        func(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
-                            modifiers: current_modifiers(),
-                            capslock: current_capslock(),
-                        }));
-                        this.state.callbacks.input.set(Some(func));
-                    }
                 }
             })
             .detach();
@@ -895,7 +898,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_hit_test_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
-        if !self.is_movable || self.state.is_fullscreen() {
+        if self.state.is_fullscreen() {
             return None;
         }
 
@@ -906,16 +909,14 @@ impl WindowsWindowInner {
                 .callbacks
                 .hit_test_window_control
                 .set(Some(callback));
-            if let Some(area) = area {
-                match area {
-                    WindowControlArea::Drag => Some(HTCAPTION as _),
-                    WindowControlArea::Close => return Some(HTCLOSE as _),
-                    WindowControlArea::Max => return Some(HTMAXBUTTON as _),
-                    WindowControlArea::Min => return Some(HTMINBUTTON as _),
-                }
-            } else {
-                None
-            }
+            area.and_then(|area| {
+                window_control_hit_target(
+                    area,
+                    self.is_movable,
+                    self.is_resizable,
+                    self.is_minimizable,
+                )
+            })
         } else {
             None
         };
@@ -936,7 +937,11 @@ impl WindowsWindowInner {
         };
 
         unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
-        if !self.state.is_maximized() && 0 <= cursor_point.y && cursor_point.y <= frame_y {
+        if self.is_resizable
+            && !self.state.is_maximized()
+            && 0 <= cursor_point.y
+            && cursor_point.y <= frame_y
+        {
             // x-axis actually goes from -frame_x to 0
             return Some(if cursor_point.x <= 0 {
                 HTTOPLEFT
@@ -945,7 +950,7 @@ impl WindowsWindowInner {
                 unsafe { GetWindowRect(handle, &mut rect) }.log_err();
                 // right and bottom bounds of RECT are exclusive, thus `-1`
                 let right = rect.right - rect.left - 1;
-                // the bounds include the padding frames, so accomodate for both of them
+                // the bounds include the padding frames, so accommodate for both of them
                 if right - 2 * frame_x <= cursor_point.x {
                     HTTOPRIGHT
                 } else {
@@ -1062,11 +1067,12 @@ impl WindowsWindowInner {
             && let Some(last_pressed) = last_pressed
         {
             let handled = match (wparam.0 as u32, last_pressed) {
-                (HTMINBUTTON, HTMINBUTTON) => {
+                (HTMINBUTTON, HTMINBUTTON) if self.is_minimizable => {
                     unsafe { ShowWindowAsync(handle, SW_MINIMIZE).ok().log_err() };
                     true
                 }
-                (HTMAXBUTTON, HTMAXBUTTON) => {
+                (HTMINBUTTON, HTMINBUTTON) => true,
+                (HTMAXBUTTON, HTMAXBUTTON) if self.is_resizable => {
                     if self.state.is_maximized() {
                         unsafe { ShowWindowAsync(handle, SW_NORMAL).ok().log_err() };
                     } else {
@@ -1074,6 +1080,7 @@ impl WindowsWindowInner {
                     }
                     true
                 }
+                (HTMAXBUTTON, HTMAXBUTTON) => true,
                 (HTCLOSE, HTCLOSE) => {
                     unsafe {
                         PostMessageW(Some(handle), WM_CLOSE, WPARAM::default(), LPARAM::default())
@@ -1215,12 +1222,13 @@ impl WindowsWindowInner {
         {
             panic!("Device lost: {err}");
         }
+        self.state.force_render_after_recovery.set(true);
         Some(0)
     }
 
     fn handle_dm_pointer_hit_test(&self, wparam: WPARAM) -> Option<isize> {
         self.state.direct_manipulation.on_pointer_hit_test(wparam);
-        Some(0)
+        None
     }
 
     #[inline]
@@ -1239,10 +1247,12 @@ impl WindowsWindowInner {
             self.state.callbacks.input.set(Some(func));
         }
 
-        // we are instructing gpui to force render a frame, this will
-        // re-populate all the gpu textures for us so we can resume drawing in
-        // case we disabled drawing earlier due to a device loss
-        self.state.renderer.borrow_mut().mark_drawable();
+        let force_render = force_render || self.state.force_render_after_recovery.take();
+        if force_render {
+            // A forced render rebuilds the scene with fresh atlas textures and resumes drawing
+            // after device-loss recovery.
+            self.state.renderer.borrow_mut().mark_drawable();
+        }
         request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render,
@@ -1648,6 +1658,25 @@ pub(crate) fn current_capslock() -> Capslock {
     Capslock { on }
 }
 
+fn window_control_hit_target(
+    area: WindowControlArea,
+    is_movable: bool,
+    is_resizable: bool,
+    is_minimizable: bool,
+) -> Option<isize> {
+    match area {
+        WindowControlArea::Drag if is_movable => Some(HTCAPTION as _),
+        WindowControlArea::Drag => None,
+        WindowControlArea::Close => Some(HTCLOSE as _),
+        WindowControlArea::Max if is_resizable => Some(HTMAXBUTTON as _),
+        WindowControlArea::Max if is_movable => Some(HTCAPTION as _),
+        WindowControlArea::Max => Some(HTNOWHERE as _),
+        WindowControlArea::Min if is_minimizable => Some(HTMINBUTTON as _),
+        WindowControlArea::Min if is_movable => Some(HTCAPTION as _),
+        WindowControlArea::Min => Some(HTNOWHERE as _),
+    }
+}
+
 // there is some additional non-visible space when talking about window
 // borders on Windows:
 // - SM_CXSIZEFRAME: The resize handle.
@@ -1684,5 +1713,44 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOZORDER,
         )
         .log_err();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_control_hit_target;
+    use gpui::WindowControlArea;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HTCAPTION, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTNOWHERE,
+    };
+
+    const CAPTION: isize = HTCAPTION as isize;
+    const CLOSE: isize = HTCLOSE as isize;
+    const MAX_BUTTON: isize = HTMAXBUTTON as isize;
+    const MIN_BUTTON: isize = HTMINBUTTON as isize;
+    const NOWHERE: isize = HTNOWHERE as isize;
+
+    #[test]
+    fn window_control_hit_targets_respect_window_capabilities() {
+        use WindowControlArea::{Close, Drag, Max, Min};
+
+        let cases: &[(WindowControlArea, bool, bool, bool, Option<isize>)] = &[
+            (Drag, false, true, true, None),
+            (Close, false, false, false, Some(CLOSE)),
+            (Max, true, false, true, Some(CAPTION)),
+            (Max, false, false, true, Some(NOWHERE)),
+            (Min, true, true, false, Some(CAPTION)),
+            (Min, false, true, false, Some(NOWHERE)),
+            (Max, false, true, false, Some(MAX_BUTTON)),
+            (Min, false, false, true, Some(MIN_BUTTON)),
+        ];
+
+        for &(area, movable, resizable, minimizable, expected) in cases {
+            assert_eq!(
+                window_control_hit_target(area, movable, resizable, minimizable),
+                expected,
+                "unexpected hit target for area={area:?} movable={movable} resizable={resizable} minimizable={minimizable}"
+            );
+        }
     }
 }

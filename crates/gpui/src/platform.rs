@@ -6,6 +6,12 @@ mod keystroke;
 #[expect(missing_docs)]
 pub mod layer_shell;
 
+/// Types for configuring parent-anchored popup windows such as menus, dropdowns and tooltips.
+pub mod popup;
+
+#[cfg(any(test, feature = "bench"))]
+mod bench_dispatcher;
+
 #[cfg(any(test, feature = "test-support"))]
 mod test;
 
@@ -32,10 +38,10 @@ use crate::util;
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
-    ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
-    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task,
-    ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
+    ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout, Pixels,
+    PlatformInput, Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer,
+    SystemWindowTab, Task, ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -74,6 +80,9 @@ pub(crate) use test::*;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
+
+#[cfg(any(test, feature = "bench"))]
+pub use bench_dispatcher::BenchDispatcher;
 
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test::VisualTestPlatform;
@@ -174,6 +183,7 @@ pub trait Platform: 'static {
 
     fn on_quit(&self, callback: Box<dyn FnMut()>);
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
+    fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {}
 
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
@@ -543,6 +553,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_edited(&mut self, _edited: bool) {}
     fn set_document_path(&self, _path: Option<&std::path::Path>) {}
+    #[cfg(target_os = "macos")]
+    fn set_traffic_light_position(&self, _position: Point<Pixels>) {}
     fn show_character_palette(&self) {}
     fn titlebar_double_click(&self) {}
     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
@@ -566,6 +578,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn show_window_menu(&self, _position: Point<Pixels>) {}
     fn start_window_move(&self) {}
     fn start_window_resize(&self, _edge: ResizeEdge) {}
+    fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
     }
@@ -638,12 +651,24 @@ pub type RunnableVariant = Runnable<RunnableMeta>;
 #[doc(hidden)]
 pub type TimerResolutionGuard = util::Deferred<Box<dyn FnOnce() + Send>>;
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TasksIncluded {
+    OnlyCompleted,
+    CompletedAndRunning,
+}
+
 /// This type is public so that our test macro can generate and use it, but it should not
 /// be considered part of our public API.
 #[doc(hidden)]
 pub trait PlatformDispatcher: Send + Sync {
-    fn get_all_timings(&self) -> Vec<ThreadTaskTimings>;
-    fn get_current_thread_timings(&self) -> ThreadTaskTimings;
+    fn get_all_timings(&self) -> Vec<ThreadTaskTimings> {
+        crate::profiler::get_all_timings(TasksIncluded::OnlyCompleted)
+    }
+
+    fn get_current_thread_timings(&self) -> ThreadTaskTimings {
+        crate::profiler::get_current_thread_timings(TasksIncluded::OnlyCompleted)
+    }
     fn is_main_thread(&self) -> bool;
     fn dispatch(&self, runnable: RunnableVariant, priority: Priority);
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority);
@@ -661,6 +686,11 @@ pub trait PlatformDispatcher: Send + Sync {
 
     #[cfg(any(test, feature = "test-support"))]
     fn as_test(&self) -> Option<&TestDispatcher> {
+        None
+    }
+
+    #[cfg(any(test, feature = "bench"))]
+    fn as_bench(&self) -> Option<&BenchDispatcher> {
         None
     }
 }
@@ -693,6 +723,10 @@ pub trait PlatformTextSystem: Send + Sync {
     /// Returns the recommended text rendering mode for the given font and size.
     fn recommended_rendering_mode(&self, _font_id: FontId, _font_size: Pixels)
     -> TextRenderingMode;
+    /// Returns the dilation level to use for a glyph painted in the given color.
+    fn glyph_dilation_for_color(&self, _color: Hsla) -> u8 {
+        0
+    }
 }
 
 #[expect(missing_docs)]
@@ -1123,17 +1157,49 @@ impl PlatformInputHandler {
         self.handler.replace_text_in_range(None, input, window, cx);
     }
 
-    pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
-        let selection = self.handler.selected_text_range(true, window, cx)?;
-        self.handler.bounds_for_range(
-            if selection.reversed {
-                selection.range.start..selection.range.start
+    pub fn compute_ime_candidate_bounds(
+        marked_range: Option<Range<usize>>,
+        selection: &UTF16Selection,
+        mut bounds_for_range: impl FnMut(Range<usize>) -> Option<Bounds<Pixels>>,
+    ) -> Option<Bounds<Pixels>> {
+        if let Some(marked_range) = marked_range {
+            let mut line_start = marked_range.start;
+            let caret = selection.range.end;
+            if let Some(caret_bounds) = bounds_for_range(caret..caret) {
+                for index in (marked_range.start..caret).rev() {
+                    if let Some(bounds) = bounds_for_range(index..index)
+                        && (bounds.origin.y - caret_bounds.origin.y).abs() > px(0.1)
+                    {
+                        line_start = index + 1;
+                        break;
+                    }
+                }
+            }
+            bounds_for_range(line_start..line_start)
+        } else {
+            let offset = if selection.reversed {
+                selection.range.start
             } else {
-                selection.range.end..selection.range.end
-            },
-            window,
-            cx,
-        )
+                selection.range.end
+            };
+            bounds_for_range(offset..offset)
+        }
+    }
+
+    pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
+        let marked_range = self.handler.marked_text_range(window, cx);
+        let selection = self.handler.selected_text_range(true, window, cx)?;
+        Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
+            self.handler.bounds_for_range(range, window, cx)
+        })
+    }
+
+    pub fn ime_candidate_bounds(&mut self) -> Option<Bounds<Pixels>> {
+        let marked_range = self.marked_text_range();
+        let selection = self.selected_text_range(true)?;
+        Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
+            self.bounds_for_range(range)
+        })
     }
 
     #[allow(unused)]
@@ -1448,6 +1514,8 @@ pub struct WindowParams {
     #[cfg_attr(feature = "wayland", allow(dead_code))]
     pub display_id: Option<DisplayId>,
 
+    pub app_id: Option<String>,
+
     pub window_min_size: Option<Size<Pixels>>,
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
@@ -1555,6 +1623,14 @@ pub enum WindowKind {
     /// A window that appears above all other windows, usually used for alerts or popups
     /// use sparingly!
     PopUp,
+
+    /// A parent-anchored, platform-native popup window for menus, comboboxes, context menus and
+    /// tooltips. Unlike [`WindowKind::PopUp`], it is positioned relative to a parent window.
+    ///
+    /// The popup's size comes from [`WindowOptions::window_bounds`], whose origin is ignored.
+    /// See [`popup::PopupOptions`] for the placement options. Platforms without a native
+    /// implementation reject it with [`popup::PopupNotSupportedError`].
+    AnchoredPopup(popup::PopupOptions),
 
     /// A floating window that appears on top of its parent window
     Floating,
@@ -1721,7 +1797,7 @@ impl PromptButton {
 impl From<&str> for PromptButton {
     fn from(value: &str) -> Self {
         match value.to_lowercase().as_str() {
-            "ok" => PromptButton::Ok("Ok".into()),
+            "ok" => PromptButton::Ok("OK".into()),
             "cancel" => PromptButton::Cancel("Cancel".into()),
             _ => PromptButton::Other(SharedString::from(value.to_owned())),
         }
@@ -2205,21 +2281,131 @@ impl From<String> for ClipboardString {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Empty, TestAppContext};
 
     #[test]
-    fn overlay_surface_options_preserve_blurred_rounded_background() {
+    fn canonical_ok_prompt_button_uses_standard_capitalization() {
+        assert_eq!(PromptButton::from("ok").label().as_ref(), "OK");
+        assert_eq!(PromptButton::from("OK").label().as_ref(), "OK");
+    }
+
+    #[test]
+    fn overlay_surface_options_preserve_overlay_window_contract() {
+        let bounds = WindowBounds::Windowed(Bounds::new(
+            point(px(10.), px(20.)),
+            size(px(360.), px(72.)),
+        ));
         let options = OverlaySurfaceOptions {
+            window_bounds: Some(bounds),
+            show: true,
+            focus: true,
             window_background: WindowBackgroundAppearance::Blurred {
                 corner_radius: px(12.),
             },
+            has_shadow: Some(false),
+            app_id: Some("com.example.overlay".into()),
+            window_min_size: Some(size(px(180.), px(36.))),
+            input_mode: OverlayInputMode::ClickThrough,
             ..Default::default()
         };
+
+        assert_eq!(options.input_mode, OverlayInputMode::ClickThrough);
         let window_options = options.into_window_options();
+
+        assert_eq!(window_options.window_bounds, Some(bounds));
+        assert_eq!(window_options.kind, WindowKind::PopUp);
+        assert!(window_options.titlebar.is_none());
+        assert!(window_options.show);
+        assert!(window_options.focus);
+        assert!(!window_options.is_movable);
+        assert!(!window_options.is_resizable);
+        assert!(!window_options.is_minimizable);
         assert_eq!(
             window_options.window_background,
             WindowBackgroundAppearance::Blurred {
                 corner_radius: px(12.)
             }
         );
+        assert_eq!(window_options.has_shadow, Some(false));
+        assert_eq!(
+            window_options.app_id.as_deref(),
+            Some("com.example.overlay")
+        );
+        assert_eq!(
+            window_options.window_min_size,
+            Some(size(px(180.), px(36.)))
+        );
+        assert!(window_options.window_decorations.is_none());
+        assert!(window_options.tabbing_identifier.is_none());
+    }
+
+    #[test]
+    fn overlay_surface_defaults_to_interactive_transparency() {
+        let options = OverlaySurfaceOptions::default();
+
+        assert_eq!(options.input_mode, OverlayInputMode::Interactive);
+        assert_eq!(
+            options.window_background,
+            WindowBackgroundAppearance::Transparent
+        );
+        assert!(!options.show);
+        assert!(!options.focus);
+        assert_eq!(options.into_window_options().kind, WindowKind::PopUp);
+    }
+
+    #[gpui::test]
+    fn anchored_popup_is_distinct_from_overlay_popup(cx: &mut TestAppContext) {
+        let parent: AnyWindowHandle = cx.add_window(|_, _| Empty).into();
+        let kind = WindowKind::AnchoredPopup(popup::PopupOptions {
+            parent,
+            anchor_rect: Bounds::new(point(px(10.), px(12.)), size(px(80.), px(24.))),
+            anchor: popup::PopupAnchor::BottomLeft,
+            gravity: popup::PopupGravity::BottomRight,
+            constraint_adjustment: popup::PopupConstraintAdjustment::FLIP_Y,
+            offset: point(px(0.), px(4.)),
+            grab: true,
+        });
+
+        assert!(matches!(kind, WindowKind::AnchoredPopup(_)));
+        assert_ne!(kind, WindowKind::PopUp);
+    }
+
+    #[test]
+    fn ime_candidate_bounds_use_the_caret_end_without_composition() {
+        let selection = UTF16Selection {
+            range: 3..7,
+            reversed: false,
+        };
+
+        let bounds =
+            PlatformInputHandler::compute_ime_candidate_bounds(None, &selection, |range| {
+                Some(Bounds::new(
+                    point(px(range.start as f32), px(0.)),
+                    size(px(1.), px(1.)),
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(bounds.origin.x, px(7.));
+    }
+
+    #[test]
+    fn ime_candidate_bounds_use_the_current_composition_line() {
+        let selection = UTF16Selection {
+            range: 2..8,
+            reversed: false,
+        };
+
+        let bounds =
+            PlatformInputHandler::compute_ime_candidate_bounds(Some(2..8), &selection, |range| {
+                let y = if range.start < 5 { px(0.) } else { px(20.) };
+                Some(Bounds::new(
+                    point(px(range.start as f32), y),
+                    size(px(1.), px(1.)),
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(bounds.origin, point(px(5.), px(20.)));
     }
 }

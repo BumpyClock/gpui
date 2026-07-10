@@ -102,6 +102,28 @@ pub enum SvgSize {
     ScaleFactor(f32),
 }
 
+const MAX_PIXMAP_DIMENSION: f32 = 8192.;
+
+fn capped_pixmap_scale(width: f32, height: f32, mut scale: f32) -> f32 {
+    let scaled_width = width * scale;
+    if scaled_width > MAX_PIXMAP_DIMENSION {
+        scale *= MAX_PIXMAP_DIMENSION / scaled_width;
+    }
+
+    let scaled_height = height * scale;
+    if scaled_height > MAX_PIXMAP_DIMENSION {
+        scale *= MAX_PIXMAP_DIMENSION / scaled_height;
+    }
+    scale
+}
+
+fn pixmap_dimensions(width: f32, height: f32, scale: f32) -> (u32, u32) {
+    (
+        (width * scale).max(1.) as u32,
+        (height * scale).max(1.) as u32,
+    )
+}
+
 impl SvgRenderer {
     /// Creates a new SVG renderer with the provided asset source.
     pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
@@ -229,17 +251,23 @@ impl SvgRenderer {
     fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {
         let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
         let svg_size = tree.size();
-        let scale = match size {
+        let requested_scale = match size {
             SvgSize::Size(size) => size.width.0 as f32 / svg_size.width(),
             SvgSize::ScaleFactor(scale) => scale,
         };
+        let scale = capped_pixmap_scale(svg_size.width(), svg_size.height(), requested_scale);
+        if scale < requested_scale {
+            log::warn!(
+                "Capping SVG pixmap from {}x{} to at most {MAX_PIXMAP_DIMENSION} pixels per dimension",
+                svg_size.width() * requested_scale,
+                svg_size.height() * requested_scale,
+            );
+        }
 
         // Render the SVG to a pixmap with the specified width and height.
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(
-            (svg_size.width() * scale) as u32,
-            (svg_size.height() * scale) as u32,
-        )
-        .ok_or(usvg::Error::InvalidSize)?;
+        let (width, height) = pixmap_dimensions(svg_size.width(), svg_size.height(), scale);
+        let mut pixmap =
+            resvg::tiny_skia::Pixmap::new(width, height).ok_or(usvg::Error::InvalidSize)?;
 
         let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
 
@@ -291,5 +319,51 @@ fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IBM_PLEX_REGULAR: &[u8] =
+        include_bytes!("../../gpui_web/assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+    const LILEX_REGULAR: &[u8] =
+        include_bytes!("../../gpui_web/assets/fonts/lilex/Lilex-Regular.ttf");
+
+    #[test]
+    fn pixmap_scale_caps_each_dimension_at_8192() {
+        assert_eq!(capped_pixmap_scale(100., 200., 2.), 2.);
+        assert_eq!(capped_pixmap_scale(16_384., 4_096., 1.), 0.5);
+        assert_eq!(capped_pixmap_scale(4_096., 16_384., 1.), 0.5);
+        assert_eq!(capped_pixmap_scale(16_384., 32_768., 1.), 0.25);
+    }
+
+    #[test]
+    fn pixmap_dimensions_preserve_extreme_aspect_ratios() {
+        let scale = capped_pixmap_scale(1_000_000., 1., 1.);
+        assert_eq!(pixmap_dimensions(1_000_000., 1., scale), (8192, 1));
+
+        let scale = capped_pixmap_scale(1., 1_000_000., 1.);
+        assert_eq!(pixmap_dimensions(1., 1_000_000., scale), (1, 8192));
+    }
+
+    #[test]
+    fn text_with_split_glyph_clusters_in_mixed_fonts_does_not_panic() {
+        let mut db = usvg::fontdb::Database::new();
+        db.load_font_data(IBM_PLEX_REGULAR.to_vec());
+        db.load_font_data(LILEX_REGULAR.to_vec());
+        let options = usvg::Options {
+            fontdb: std::sync::Arc::new(db),
+            ..Default::default()
+        };
+
+        let zalgo = "e\u{0301}\u{0302}\u{0303}\u{0304}\u{0306}\u{0307}\u{0308}\u{030a}";
+        let svg = format!(
+            r#"<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg"><text font-family="Lilex" font-size="32">{zalgo}<tspan font-family="IBM Plex Sans">{zalgo}</tspan></text></svg>"#
+        );
+
+        usvg::Tree::from_data(svg.as_bytes(), &options)
+            .expect("SVG with mixed-font text should parse");
     }
 }

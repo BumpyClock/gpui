@@ -5,6 +5,7 @@ use crate::linux::X11ClientStatePtr;
 use crate::linux::accesskit_shims::{
     TrivialActionHandler, TrivialActivationHandler, TrivialDeactivationHandler,
 };
+use gpui::popup::PopupNotSupportedError;
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     OverlayInputMode, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
@@ -12,11 +13,11 @@ use gpui::{
     ScaledPixels, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowDecorations, WindowKind, WindowParams, px,
 };
-use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{CompositorGpuHint, GpuContext, WgpuRenderer, WgpuSurfaceConfig};
 
 use collections::FxHashSet;
+use gpui_util::{ResultExt, maybe};
 use raw_window_handle as rwh;
-use util::{ResultExt, maybe};
 use x11rb::{
     connection::Connection,
     cookie::{Cookie, VoidCookie},
@@ -292,6 +293,35 @@ impl X11WindowState {
     fn is_transparent(&self) -> bool {
         self.background_appearance != WindowBackgroundAppearance::Opaque
     }
+
+    fn update_accesskit_window_bounds(&mut self) {
+        let scale = self.scale_factor;
+        let bounds = self.bounds;
+        let [left, right, top, bottom] = self.last_insets;
+
+        let x = f32::from(bounds.origin.x);
+        let y = f32::from(bounds.origin.y);
+        let width = f32::from(bounds.size.width);
+        let height = f32::from(bounds.size.height);
+
+        let outer = accesskit::Rect {
+            x0: (x * scale) as f64,
+            y0: (y * scale) as f64,
+            x1: ((x + width) * scale) as f64,
+            y1: ((y + height) * scale) as f64,
+        };
+
+        let inner = accesskit::Rect {
+            x0: (x * scale) as f64 + left as f64,
+            y0: (y * scale) as f64 + top as f64,
+            x1: ((x + width) * scale) as f64 - right as f64,
+            y1: ((y + height) * scale) as f64 - bottom as f64,
+        };
+
+        if let Some(adapter) = self.accesskit_adapter.as_mut() {
+            adapter.set_root_window_bounds(outer, inner);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -419,7 +449,8 @@ impl X11WindowState {
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
         executor: ForegroundExecutor,
-        gpu_context: &WgpuContext,
+        gpu_context: GpuContext,
+        compositor_gpu: Option<CompositorGpuHint>,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
@@ -432,6 +463,10 @@ impl X11WindowState {
         supports_xinput_gestures: bool,
         is_bgr: bool,
     ) -> anyhow::Result<Self> {
+        if matches!(params.kind, WindowKind::AnchoredPopup(_)) {
+            return Err(PopupNotSupportedError.into());
+        }
+
         let x_screen_index = match params.display_id {
             Some(did) => {
                 let index = usize::try_from(u64::from(did))
@@ -746,7 +781,7 @@ impl X11WindowState {
                     transparent: false,
                     preferred_present_mode: None,
                 };
-                WgpuRenderer::new(gpu_context, &raw_window, config)?
+                WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
             };
             renderer.set_subpixel_layout(is_bgr);
 
@@ -872,7 +907,8 @@ impl X11Window {
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
         executor: ForegroundExecutor,
-        gpu_context: &WgpuContext,
+        gpu_context: GpuContext,
+        compositor_gpu: Option<CompositorGpuHint>,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
@@ -891,6 +927,7 @@ impl X11Window {
                 client,
                 executor,
                 gpu_context,
+                compositor_gpu,
                 params,
                 xcb,
                 client_side_decorations_supported,
@@ -1247,6 +1284,7 @@ impl X11WindowStatePtr {
             } else {
                 state.bounds = bounds;
             }
+            state.update_accesskit_window_bounds();
 
             let gpu_size = query_render_extent(&self.xcb, self.x_window)?;
             if true {
@@ -1433,7 +1471,11 @@ impl PlatformWindow for X11Window {
         )
         .log_err()
         .map_or(Point::new(Pixels::ZERO, Pixels::ZERO), |reply| {
-            Point::new((reply.root_x as u32).into(), (reply.root_y as u32).into())
+            let scale_factor = self.0.state.borrow().scale_factor;
+            Point::new(
+                px(reply.win_x as f32 / scale_factor),
+                px(reply.win_y as f32 / scale_factor),
+            )
         })
     }
 
@@ -1584,14 +1626,8 @@ impl PlatformWindow for X11Window {
         self.0
             .state
             .borrow()
-            .client
-            .0
-            .upgrade()
-            .map(|ref_cell| {
-                let state = ref_cell.borrow();
-                state.gpu_context.supports_dual_source_blending()
-            })
-            .unwrap_or_default()
+            .renderer
+            .supports_dual_source_blending()
     }
 
     fn minimize(&self) {
@@ -1682,7 +1718,18 @@ impl PlatformWindow for X11Window {
 
     fn draw(&self, scene: &Scene) {
         let mut inner = self.0.state.borrow_mut();
+        if inner.renderer.device_lost() {
+            if let Err(error) = inner.renderer.recover() {
+                log::warn!("failed to recover lost wgpu device; will retry: {error:#}");
+            }
+            let _ = inner.renderer.needs_redraw();
+            inner.force_render_after_recovery = true;
+            return;
+        }
         inner.renderer.draw(scene);
+        if inner.renderer.needs_redraw() {
+            inner.force_render_after_recovery = true;
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -1795,6 +1842,7 @@ impl PlatformWindow for X11Window {
 
         if state.last_insets != insets {
             state.last_insets = insets;
+            state.update_accesskit_window_bounds();
 
             check_reply(
                 || "X11 ChangeProperty for _GTK_FRAME_EXTENTS failed.",
@@ -1911,32 +1959,6 @@ impl PlatformWindow for X11Window {
     }
 
     fn a11y_update_window_bounds(&self) {
-        let mut state = self.0.state.borrow_mut();
-        let scale = state.scale_factor;
-        let bounds = state.bounds;
-        let [left, right, top, bottom] = state.last_insets;
-
-        let x = f32::from(bounds.origin.x);
-        let y = f32::from(bounds.origin.y);
-        let width = f32::from(bounds.size.width);
-        let height = f32::from(bounds.size.height);
-
-        let outer = accesskit::Rect {
-            x0: (x * scale) as f64,
-            y0: (y * scale) as f64,
-            x1: ((x + width) * scale) as f64,
-            y1: ((y + height) * scale) as f64,
-        };
-
-        let inner = accesskit::Rect {
-            x0: (x * scale) as f64 + left as f64,
-            y0: (y * scale) as f64 + top as f64,
-            x1: ((x + width) * scale) as f64 - right as f64,
-            y1: ((y + height) * scale) as f64 - bottom as f64,
-        };
-
-        if let Some(adapter) = state.accesskit_adapter.as_mut() {
-            adapter.set_root_window_bounds(outer, inner);
-        }
+        self.0.state.borrow_mut().update_accesskit_window_bounds();
     }
 }

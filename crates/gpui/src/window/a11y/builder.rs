@@ -1,40 +1,29 @@
 use super::ROOT_NODE_ID;
-use crate::{Bounds, FocusId, GlobalElementId, Pixels};
+use crate::{Bounds, FocusId, GlobalElementId, Pixels, SharedString};
 use accesskit::{NodeId, TreeUpdate};
 use collections::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
+#[derive(Clone)]
 pub(crate) struct A11yNodeBuilder {
     ids_stack: SmallVec<[NodeId; 16]>,
     nodes_stack: SmallVec<[accesskit::Node; 16]>,
     suppression_stack: SmallVec<[bool; 16]>,
     ambient_suppression_depth: usize,
     all_nodes: Vec<(NodeId, accesskit::Node)>,
+    emitted_node_indices: FxHashMap<NodeId, usize>,
     seen_ids: FxHashSet<NodeId>,
-    focus: NodeId,
-    #[cfg(debug_assertions)]
-    has_set_focus: bool,
+    focus: Option<NodeId>,
+    active_descendant: Option<NodeId>,
 }
 
 pub(crate) struct A11yPrepaintSnapshot {
-    pub(super) nodes: A11yNodeBuilderPrepaintSnapshot,
+    pub(super) nodes: A11yNodeBuilder,
     pub(super) node_ids: FxHashMap<GlobalElementId, NodeId>,
     pub(super) visited_global_ids: FxHashSet<GlobalElementId>,
     pub(super) next_node_id: u64,
     pub(super) focus_ids: FxHashMap<NodeId, FocusId>,
     pub(super) node_bounds: FxHashMap<NodeId, Bounds<Pixels>>,
-}
-
-pub(super) struct A11yNodeBuilderPrepaintSnapshot {
-    ids_stack: SmallVec<[NodeId; 16]>,
-    nodes_stack: SmallVec<[accesskit::Node; 16]>,
-    suppression_stack: SmallVec<[bool; 16]>,
-    ambient_suppression_depth: usize,
-    all_nodes: Vec<(NodeId, accesskit::Node)>,
-    seen_ids: FxHashSet<NodeId>,
-    focus: NodeId,
-    #[cfg(debug_assertions)]
-    has_set_focus: bool,
 }
 
 impl A11yNodeBuilder {
@@ -45,14 +34,14 @@ impl A11yNodeBuilder {
             suppression_stack: SmallVec::new(),
             ambient_suppression_depth: 0,
             all_nodes: Vec::new(),
+            emitted_node_indices: FxHashMap::default(),
             seen_ids: FxHashSet::default(),
-            focus: ROOT_NODE_ID,
-            #[cfg(debug_assertions)]
-            has_set_focus: false,
+            focus: None,
+            active_descendant: None,
         }
     }
 
-    pub(crate) fn push(&mut self, id: NodeId, node: accesskit::Node) -> bool {
+    fn can_push(&mut self, id: NodeId) -> bool {
         debug_assert!(!self.ids_stack.is_empty(), "push called before begin_frame");
 
         if self.is_suppressed() {
@@ -67,9 +56,31 @@ impl A11yNodeBuilder {
             return false;
         }
 
+        true
+    }
+
+    pub(crate) fn push(&mut self, id: NodeId, node: accesskit::Node) -> bool {
+        if !self.can_push(id) {
+            return false;
+        }
+
         self.ids_stack.push(id);
         self.nodes_stack.push(node);
         self.suppression_stack.push(false);
+        true
+    }
+
+    pub(crate) fn push_leaf(&mut self, id: NodeId, node: accesskit::Node) -> bool {
+        if !self.can_push(id) {
+            return false;
+        }
+
+        let Some(parent) = self.nodes_stack.last_mut() else {
+            return false;
+        };
+        parent.push_child(id);
+        self.emitted_node_indices.insert(id, self.all_nodes.len());
+        self.all_nodes.push((id, node));
         true
     }
 
@@ -79,28 +90,27 @@ impl A11yNodeBuilder {
         self.pop_any();
     }
 
-    pub(super) fn begin_frame(&mut self) {
+    pub(super) fn begin_frame(&mut self, window_title: Option<&SharedString>) {
         self.all_nodes.clear();
+        self.emitted_node_indices.clear();
         self.ids_stack.clear();
         self.nodes_stack.clear();
         self.suppression_stack.clear();
         self.ambient_suppression_depth = 0;
         self.seen_ids.clear();
         self.seen_ids.insert(ROOT_NODE_ID);
-        #[cfg(debug_assertions)]
-        {
-            self.has_set_focus = false;
-        }
-
         self.ids_stack.push(ROOT_NODE_ID);
-        self.nodes_stack
-            .push(accesskit::Node::new(accesskit::Role::Window));
+        let mut root = accesskit::Node::new(accesskit::Role::Window);
+        if let Some(title) = window_title {
+            root.set_label(title.to_string());
+        }
+        self.nodes_stack.push(root);
         self.suppression_stack.push(false);
-        self.focus = ROOT_NODE_ID;
+        self.focus = None;
+        self.active_descendant = None;
     }
 
-    #[cfg(test)]
-    fn has_node(&self, id: NodeId) -> bool {
+    pub(crate) fn has_node(&self, id: NodeId) -> bool {
         id == ROOT_NODE_ID || self.seen_ids.contains(&id)
     }
 
@@ -108,44 +118,54 @@ impl A11yNodeBuilder {
         self.ids_stack.last().copied() == Some(id) && !self.is_suppressed()
     }
 
+    pub(crate) fn node_is_focused(&self, id: NodeId) -> bool {
+        self.focus == Some(id)
+    }
+
+    pub(crate) fn focus_is_ancestor_of_current(&self) -> bool {
+        let Some(focus) = self.focus else {
+            return false;
+        };
+
+        let ancestor_count = self.ids_stack.len().saturating_sub(1);
+        self.ids_stack[..ancestor_count].contains(&focus)
+    }
+
+    pub(crate) fn set_active_descendant(&mut self, id: NodeId) {
+        if self
+            .active_descendant
+            .is_some_and(|existing| existing != id)
+        {
+            if cfg!(debug_assertions) {
+                panic!("active descendant claimed by multiple nodes in one frame");
+            } else {
+                log::warn!(
+                    "a11y: multiple nodes claimed the active descendant this frame; using last-wins ({id:?})"
+                );
+            }
+        }
+        self.active_descendant = Some(id);
+    }
+
     pub(crate) fn set_focus(&mut self, id: NodeId) {
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(
-                !self.has_set_focus,
-                "set_focus called more than once in a single frame"
-            );
-            self.has_set_focus = true;
+        if self.focus.is_some() {
+            if cfg!(debug_assertions) {
+                panic!("set_focus called more than once in a single frame");
+            } else {
+                log::warn!(
+                    "a11y: set_focus called more than once in a single frame; using last-wins ({id:?})"
+                );
+            }
         }
-        self.focus = id;
+        self.focus = Some(id);
     }
 
-    pub(super) fn prepaint_snapshot(&self) -> A11yNodeBuilderPrepaintSnapshot {
-        A11yNodeBuilderPrepaintSnapshot {
-            ids_stack: self.ids_stack.clone(),
-            nodes_stack: self.nodes_stack.clone(),
-            suppression_stack: self.suppression_stack.clone(),
-            ambient_suppression_depth: self.ambient_suppression_depth,
-            all_nodes: self.all_nodes.clone(),
-            seen_ids: self.seen_ids.clone(),
-            focus: self.focus,
-            #[cfg(debug_assertions)]
-            has_set_focus: self.has_set_focus,
-        }
+    pub(super) fn prepaint_snapshot(&self) -> A11yNodeBuilder {
+        self.clone()
     }
 
-    pub(super) fn restore_prepaint_snapshot(&mut self, snapshot: A11yNodeBuilderPrepaintSnapshot) {
-        self.ids_stack = snapshot.ids_stack;
-        self.nodes_stack = snapshot.nodes_stack;
-        self.suppression_stack = snapshot.suppression_stack;
-        self.ambient_suppression_depth = snapshot.ambient_suppression_depth;
-        self.all_nodes = snapshot.all_nodes;
-        self.seen_ids = snapshot.seen_ids;
-        self.focus = snapshot.focus;
-        #[cfg(debug_assertions)]
-        {
-            self.has_set_focus = snapshot.has_set_focus;
-        }
+    pub(super) fn restore_prepaint_snapshot(&mut self, snapshot: A11yNodeBuilder) {
+        *self = snapshot;
     }
 
     pub(crate) fn update_current_node_bounds(
@@ -154,7 +174,7 @@ impl A11yNodeBuilder {
         bounds: Bounds<Pixels>,
         scale_factor: f32,
     ) -> bool {
-        let Some(node) = self.current_node_mut(id) else {
+        let Some(node) = self.current_node_mut_for_id(id) else {
             return false;
         };
 
@@ -225,17 +245,41 @@ impl A11yNodeBuilder {
             self.pop_any();
         }
 
+        let focus = match self.active_descendant {
+            Some(id) if self.has_node(id) => id,
+            Some(id) => {
+                if cfg!(debug_assertions) {
+                    panic!("active_descendant set to {id:?}, which is not in the tree");
+                } else {
+                    log::warn!("active_descendant set to {id:?}, which is not in the tree");
+                    self.focus.unwrap_or(ROOT_NODE_ID)
+                }
+            }
+            None => self.focus.unwrap_or(ROOT_NODE_ID),
+        };
+
+        let nodes = std::mem::take(&mut self.all_nodes);
+        self.emitted_node_indices.clear();
+
         let update = TreeUpdate {
-            nodes: std::mem::take(&mut self.all_nodes),
+            nodes,
             tree: Some(accesskit::Tree::new(ROOT_NODE_ID)),
             tree_id: accesskit::TreeId::ROOT,
-            focus: self.focus,
+            focus,
         };
 
         Self::repair_tree_update(update)
     }
 
-    fn current_node_mut(&mut self, id: NodeId) -> Option<&mut accesskit::Node> {
+    pub(crate) fn current_node_mut(&mut self) -> Option<&mut accesskit::Node> {
+        if self.is_suppressed() {
+            None
+        } else {
+            self.nodes_stack.last_mut()
+        }
+    }
+
+    fn current_node_mut_for_id(&mut self, id: NodeId) -> Option<&mut accesskit::Node> {
         if self.ids_stack.len() <= 1
             || self.ids_stack.last().copied() != Some(id)
             || self.suppression_stack.last().copied().unwrap_or(true)
@@ -258,17 +302,14 @@ impl A11yNodeBuilder {
         if let Some(current_node) = self.nodes_stack.last() {
             let mut pending = current_node.children().to_vec();
             if !pending.is_empty() {
-                let emitted_nodes_by_id = self
-                    .all_nodes
-                    .iter()
-                    .map(|(node_id, node)| (*node_id, node))
-                    .collect::<FxHashMap<_, _>>();
                 while let Some(child_id) = pending.pop() {
                     if !pruned_ids.insert(child_id) {
                         continue;
                     }
 
-                    if let Some(child_node) = emitted_nodes_by_id.get(&child_id) {
+                    if let Some(index) = self.emitted_node_indices.get(&child_id).copied()
+                        && let Some((_, child_node)) = self.all_nodes.get(index)
+                    {
                         pending.extend(child_node.children().iter().copied());
                     }
                 }
@@ -279,12 +320,19 @@ impl A11yNodeBuilder {
             self.seen_ids.remove(node_id);
         }
 
-        if pruned_ids.contains(&self.focus) {
-            self.focus = ROOT_NODE_ID;
+        if self.focus.is_some_and(|focus| pruned_ids.contains(&focus)) {
+            self.focus = None;
+        }
+        if self
+            .active_descendant
+            .is_some_and(|active| pruned_ids.contains(&active))
+        {
+            self.active_descendant = None;
         }
 
         self.all_nodes
             .retain(|(node_id, _)| !pruned_ids.contains(node_id));
+        self.rebuild_emitted_node_indices();
 
         for (_, node) in &mut self.all_nodes {
             Self::remove_child_refs(node, &pruned_ids);
@@ -292,6 +340,16 @@ impl A11yNodeBuilder {
         for node in &mut self.nodes_stack {
             Self::remove_child_refs(node, &pruned_ids);
         }
+    }
+
+    fn rebuild_emitted_node_indices(&mut self) {
+        self.emitted_node_indices.clear();
+        self.emitted_node_indices.extend(
+            self.all_nodes
+                .iter()
+                .enumerate()
+                .map(|(index, (node_id, _))| (*node_id, index)),
+        );
     }
 
     fn remove_child_refs(node: &mut accesskit::Node, removed_ids: &FxHashSet<NodeId>) {
@@ -327,6 +385,7 @@ impl A11yNodeBuilder {
                     parent.push_child(id);
                 }
             }
+            self.emitted_node_indices.insert(id, self.all_nodes.len());
             self.all_nodes.push((id, node));
         }
     }

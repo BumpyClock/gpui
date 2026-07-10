@@ -245,10 +245,11 @@ impl UniformListScrollHandle {
             return None;
         }
         let offset = state.base_handle.offset();
+        let threshold = px(1.);
         Some(if state.y_flipped {
-            offset.y == px(0.)
+            offset.y >= -threshold
         } else {
-            -offset.y >= max_offset.height
+            -offset.y >= max_offset.height - threshold
         })
     }
 
@@ -778,7 +779,7 @@ mod test {
         assert_eq!(handle.is_scrolled_to_end(), Some(false));
 
         let base_handle = handle.0.borrow().base_handle.clone();
-        base_handle.set_offset(point(px(0.), -base_handle.max_offset().height));
+        base_handle.set_offset(point(px(0.), -base_handle.max_offset().height + px(0.5)));
 
         assert_eq!(handle.is_scrolled_to_end(), Some(true));
     }
@@ -795,7 +796,7 @@ mod test {
 
         assert_eq!(handle.is_scrolled_to_end(), Some(false));
 
-        base_handle.set_offset(point(px(0.), px(0.)));
+        base_handle.set_offset(point(px(0.), px(-0.5)));
 
         assert_eq!(handle.is_scrolled_to_end(), Some(true));
     }

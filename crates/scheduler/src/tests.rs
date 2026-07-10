@@ -73,6 +73,20 @@ fn test_scheduler_drops_with_stalled_detached_background_task() {
 }
 
 #[test]
+fn test_scheduler_drops_with_never_polled_dedicated_task() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+    let weak_scheduler = Arc::downgrade(&scheduler);
+
+    scheduler
+        .background()
+        .spawn_dedicated(|_executor| async move {})
+        .detach();
+
+    drop(scheduler);
+    assert!(weak_scheduler.upgrade().is_none());
+}
+
+#[test]
 fn test_scheduler_drops_with_queued_detached_foreground_task() {
     let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
     let weak_scheduler = Arc::downgrade(&scheduler);
@@ -243,6 +257,10 @@ fn test_timer_ordering() {
 }
 
 #[test]
+#[allow(
+    clippy::await_holding_refcell_ref,
+    reason = "the test verifies that foreground tasks may intentionally retain a local borrow while suspended"
+)]
 fn test_foreground_task_can_hold_mut_borrow_across_await() {
     TestScheduler::once(async |scheduler| {
         let foreground = scheduler.foreground();
@@ -909,6 +927,27 @@ fn test_spawn_dedicated_thread_closure_panic_reaches_caller() {
         "expected caller panic to include the dedicated closure panic, got: {}",
         panic_message
     );
+}
+
+#[test]
+fn test_spawn_dedicated_child_panic_does_not_stop_thread() {
+    let scheduler = Arc::new(TestScheduler::new(TestSchedulerConfig::default()));
+
+    let result = block_on(spawn_dedicated_thread(
+        SessionId::new(1),
+        scheduler,
+        |executor| async move {
+            executor
+                .spawn(async {
+                    panic!("dedicated child task exploded");
+                })
+                .detach();
+
+            executor.spawn(async { 42 }).await
+        },
+    ));
+
+    assert_eq!(result, 42);
 }
 
 #[test]

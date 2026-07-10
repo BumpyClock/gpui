@@ -1,4 +1,4 @@
-use crate::{WgpuAtlas, WgpuContext};
+use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, GlobalElementId,
@@ -9,10 +9,12 @@ use gpui::{
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 const BACKDROP_BLUR_RADIUS_PER_LEVEL: f32 = 6.0;
@@ -33,6 +35,51 @@ fn select_present_mode(
             ) || supported.contains(mode)
         })
         .unwrap_or(wgpu::PresentMode::Fifo)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn recovery_requires_new_context(context_device_lost: Option<bool>) -> bool {
+    context_device_lost.is_none_or(|device_lost| device_lost)
+}
+
+fn surface_usage(surface_usages: wgpu::TextureUsages) -> (wgpu::TextureUsages, bool) {
+    let supports_copy_src = surface_usages.contains(wgpu::TextureUsages::COPY_SRC);
+    let usage = if supports_copy_src {
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+    } else {
+        wgpu::TextureUsages::RENDER_ATTACHMENT
+    };
+    (usage, supports_copy_src)
+}
+
+#[derive(Default)]
+struct FrameFailureStreak {
+    count: u32,
+    recovery_frame_pending: bool,
+}
+
+impl FrameFailureStreak {
+    fn record_error(&mut self) -> u32 {
+        self.count += 1;
+        self.count
+    }
+
+    fn begin_recovery(&mut self) {
+        self.recovery_frame_pending = true;
+    }
+
+    fn record_no_error(&mut self) {
+        // Recovery returns before submitting a replacement frame. The next draw
+        // therefore has no prior error to report, but it is not evidence that
+        // the GPU recovered successfully.
+        if !std::mem::take(&mut self.recovery_frame_pending) {
+            self.count = 0;
+        }
+    }
+
+    fn transfer_to(&mut self, replacement: &mut Self) {
+        *replacement = std::mem::take(self);
+    }
 }
 
 #[repr(C)]
@@ -129,6 +176,25 @@ pub struct WgpuSurfaceConfig {
     pub preferred_present_mode: Option<wgpu::PresentMode>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DesiredSurfaceState {
+    size: Size<DevicePixels>,
+    transparent: bool,
+    preferred_present_mode: Option<wgpu::PresentMode>,
+    is_bgr: bool,
+}
+
+impl DesiredSurfaceState {
+    #[cfg(not(target_family = "wasm"))]
+    fn renderer_config(self) -> WgpuSurfaceConfig {
+        WgpuSurfaceConfig {
+            size: self.size,
+            transparent: self.transparent,
+            preferred_present_mode: self.preferred_present_mode,
+        }
+    }
+}
+
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
@@ -187,27 +253,30 @@ enum DrawCommand {
     },
 }
 
-/// Shared GPU context reference, kept for API compatibility with upstream GPUI.
-pub type GpuContext = std::rc::Rc<std::cell::RefCell<Option<WgpuContext>>>;
+/// Shared GPU context reference, used to coordinate recovery across windows.
+pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 
-pub struct WgpuRenderer {
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy)]
+struct SurfaceHandles {
+    display: raw_window_handle::RawDisplayHandle,
+    window: raw_window_handle::RawWindowHandle,
+}
+
+/// Every handle tied to a particular device is dropped as one unit on loss.
+#[doc(hidden)]
+pub struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     surface: wgpu::Surface<'static>,
-    surface_config: wgpu::SurfaceConfiguration,
     surface_supports_copy_src: bool,
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
-    atlas: Arc<WgpuAtlas>,
     atlas_sampler: wgpu::Sampler,
     globals_buffer: wgpu::Buffer,
-    path_globals_offset: u64,
-    gamma_offset: u64,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
-    instance_buffer_capacity: u64,
-    storage_buffer_alignment: u64,
     path_intermediate_texture: Option<wgpu::Texture>,
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
@@ -217,6 +286,37 @@ pub struct WgpuRenderer {
     backdrop_view: Option<wgpu::TextureView>,
     backdrop_size: Option<Size<DevicePixels>>,
     retained_layers: HashMap<RetainedLayerCacheKey, WgpuRetainedLayer>,
+}
+
+impl WgpuResources {
+    fn invalidate_cached_gpu_state(&mut self) {
+        self.path_intermediate_texture = None;
+        self.path_intermediate_view = None;
+        self.path_msaa_texture = None;
+        self.path_msaa_view = None;
+        self.path_intermediate_size = None;
+        self.backdrop_texture = None;
+        self.backdrop_view = None;
+        self.backdrop_size = None;
+        self.retained_layers.clear();
+    }
+}
+
+pub struct WgpuRenderer {
+    #[allow(dead_code)]
+    context: Option<GpuContext>,
+    #[allow(dead_code)]
+    compositor_gpu: Option<CompositorGpuHint>,
+    resources: Option<WgpuResources>,
+    #[cfg(not(target_family = "wasm"))]
+    surface_handles: Option<SurfaceHandles>,
+    surface_config: wgpu::SurfaceConfiguration,
+    atlas: Arc<WgpuAtlas>,
+    path_globals_offset: u64,
+    gamma_offset: u64,
+    instance_buffer_capacity: u64,
+    storage_buffer_alignment: u64,
+    desired: DesiredSurfaceState,
     rendering_params: RenderingParameters,
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
@@ -224,8 +324,27 @@ pub struct WgpuRenderer {
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
     max_texture_size: u32,
     last_error: Arc<Mutex<Option<String>>>,
-    failed_frame_count: u32,
+    frame_failure_streak: FrameFailureStreak,
     device_lost: Arc<std::sync::atomic::AtomicBool>,
+    needs_redraw: bool,
+}
+
+impl std::ops::Deref for WgpuRenderer {
+    type Target = WgpuResources;
+
+    fn deref(&self) -> &Self::Target {
+        self.resources
+            .as_ref()
+            .expect("GPU resources not available")
+    }
+}
+
+impl std::ops::DerefMut for WgpuRenderer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.resources
+            .as_mut()
+            .expect("GPU resources not available")
+    }
 }
 
 impl WgpuRenderer {
@@ -240,9 +359,10 @@ impl WgpuRenderer {
     /// of the returned renderer.
     #[cfg(not(target_family = "wasm"))]
     pub fn new<W: HasWindowHandle + HasDisplayHandle>(
-        context: &WgpuContext,
+        gpu_context: GpuContext,
         window: &W,
         config: WgpuSurfaceConfig,
+        compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
         let window_handle = window
             .window_handle()
@@ -251,22 +371,49 @@ impl WgpuRenderer {
             .display_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get display handle: {e}"))?;
 
-        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            raw_display_handle: Some(display_handle.as_raw()),
-            raw_window_handle: window_handle.as_raw(),
+        let surface_handles = SurfaceHandles {
+            display: display_handle.as_raw(),
+            window: window_handle.as_raw(),
         };
+
+        let instance = gpu_context
+            .borrow()
+            .as_ref()
+            .map(|context| context.instance.clone())
+            .unwrap_or_else(WgpuContext::instance);
 
         // Safety: The caller guarantees that the window handle is valid for the
         // lifetime of this renderer. In practice, the RawWindow struct is created
         // from the native window handles and the surface is dropped before the window.
         let surface = unsafe {
-            context
-                .instance
-                .create_surface_unsafe(target)
+            instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(surface_handles.display),
+                    raw_window_handle: surface_handles.window,
+                })
                 .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?
         };
 
-        Self::from_surface(context, surface, config)
+        if gpu_context.borrow().is_none() {
+            *gpu_context.borrow_mut() = Some(WgpuContext::new_for_surface(
+                instance,
+                &surface,
+                compositor_gpu,
+            )?);
+        }
+        let context_ref = gpu_context.borrow();
+        let context = context_ref.as_ref().expect("context was initialized");
+        context.check_compatible_with_surface(&surface)?;
+
+        Self::from_surface_internal(
+            context,
+            surface,
+            config,
+            Some(Rc::clone(&gpu_context)),
+            compositor_gpu,
+            None,
+            Some(surface_handles),
+        )
     }
 
     #[cfg(target_family = "wasm")]
@@ -283,10 +430,32 @@ impl WgpuRenderer {
         Self::from_surface(context, surface, config)
     }
 
+    #[cfg(target_family = "wasm")]
     fn from_surface(
         context: &WgpuContext,
         surface: wgpu::Surface<'static>,
         config: WgpuSurfaceConfig,
+    ) -> anyhow::Result<Self> {
+        Self::from_surface_internal(
+            context,
+            surface,
+            config,
+            None,
+            None,
+            None,
+            #[cfg(not(target_family = "wasm"))]
+            None,
+        )
+    }
+
+    fn from_surface_internal(
+        context: &WgpuContext,
+        surface: wgpu::Surface<'static>,
+        config: WgpuSurfaceConfig,
+        gpu_context: Option<GpuContext>,
+        compositor_gpu: Option<CompositorGpuHint>,
+        atlas: Option<Arc<WgpuAtlas>>,
+        #[cfg(not(target_family = "wasm"))] surface_handles: Option<SurfaceHandles>,
     ) -> anyhow::Result<Self> {
         let surface_caps = surface.get_capabilities(&context.adapter);
         let preferred_formats = [
@@ -298,26 +467,28 @@ impl WgpuRenderer {
             .find(|f| surface_caps.formats.contains(f))
             .copied()
             .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
-            .unwrap_or(surface_caps.formats[0]);
+            .or_else(|| surface_caps.formats.first().copied())
+            .ok_or_else(|| anyhow::anyhow!("Surface reports no supported texture formats"))?;
 
         let pick_alpha_mode =
-            |preferences: &[wgpu::CompositeAlphaMode]| -> wgpu::CompositeAlphaMode {
+            |preferences: &[wgpu::CompositeAlphaMode]| -> anyhow::Result<wgpu::CompositeAlphaMode> {
                 preferences
                     .iter()
                     .find(|p| surface_caps.alpha_modes.contains(p))
                     .copied()
-                    .unwrap_or(surface_caps.alpha_modes[0])
+                    .or_else(|| surface_caps.alpha_modes.first().copied())
+                    .ok_or_else(|| anyhow::anyhow!("Surface reports no supported alpha modes"))
             };
 
         let transparent_alpha_mode = pick_alpha_mode(&[
             wgpu::CompositeAlphaMode::PreMultiplied,
             wgpu::CompositeAlphaMode::Inherit,
-        ]);
+        ])?;
 
         let opaque_alpha_mode = pick_alpha_mode(&[
             wgpu::CompositeAlphaMode::Opaque,
             wgpu::CompositeAlphaMode::Inherit,
-        ]);
+        ])?;
 
         let alpha_mode = if config.transparent {
             transparent_alpha_mode
@@ -338,6 +509,11 @@ impl WgpuRenderer {
             transparent_alpha_mode,
             opaque_alpha_mode,
             config,
+            gpu_context,
+            compositor_gpu,
+            atlas,
+            #[cfg(not(target_family = "wasm"))]
+            surface_handles,
         )
     }
 
@@ -351,6 +527,10 @@ impl WgpuRenderer {
         transparent_alpha_mode: wgpu::CompositeAlphaMode,
         opaque_alpha_mode: wgpu::CompositeAlphaMode,
         config: WgpuSurfaceConfig,
+        gpu_context: Option<GpuContext>,
+        compositor_gpu: Option<CompositorGpuHint>,
+        atlas: Option<Arc<WgpuAtlas>>,
+        #[cfg(not(target_family = "wasm"))] surface_handles: Option<SurfaceHandles>,
     ) -> anyhow::Result<Self> {
         let device = Arc::clone(&context.device);
         let max_texture_size = device.limits().max_texture_dimension_2d;
@@ -368,16 +548,12 @@ impl WgpuRenderer {
             );
         }
 
-        let surface_supports_copy_src = surface_usages.contains(wgpu::TextureUsages::COPY_SRC);
+        let (surface_usage, surface_supports_copy_src) = surface_usage(surface_usages);
         if !surface_supports_copy_src {
             warn!("WGPU surface lacks COPY_SRC usage; backdrop blur is disabled");
         }
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: if surface_supports_copy_src {
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
-            } else {
-                wgpu::TextureUsages::RENDER_ATTACHMENT
-            },
+            usage: surface_usage,
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -401,7 +577,8 @@ impl WgpuRenderer {
             dual_source_blending,
         );
 
-        let atlas = Arc::new(WgpuAtlas::new(Arc::clone(&device), Arc::clone(&queue)));
+        let atlas = atlas
+            .unwrap_or_else(|| Arc::new(WgpuAtlas::new(Arc::clone(&device), Arc::clone(&queue))));
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -485,24 +662,18 @@ impl WgpuRenderer {
             *guard = Some(error.to_string());
         }));
 
-        Ok(Self {
+        let resources = WgpuResources {
             device,
             queue,
             surface,
-            surface_config,
             surface_supports_copy_src,
             pipelines,
             bind_group_layouts,
-            atlas,
             atlas_sampler,
             globals_buffer,
-            path_globals_offset,
-            gamma_offset,
             globals_bind_group,
             path_globals_bind_group,
             instance_buffer,
-            instance_buffer_capacity: INITIAL_INSTANCE_BUFFER_SIZE,
-            storage_buffer_alignment,
             path_intermediate_texture: None,
             path_intermediate_view: None,
             path_msaa_texture: None,
@@ -512,6 +683,26 @@ impl WgpuRenderer {
             backdrop_view: None,
             backdrop_size: None,
             retained_layers: HashMap::default(),
+        };
+
+        Ok(Self {
+            context: gpu_context,
+            compositor_gpu,
+            resources: Some(resources),
+            #[cfg(not(target_family = "wasm"))]
+            surface_handles,
+            surface_config,
+            atlas,
+            path_globals_offset,
+            gamma_offset,
+            instance_buffer_capacity: INITIAL_INSTANCE_BUFFER_SIZE,
+            storage_buffer_alignment,
+            desired: DesiredSurfaceState {
+                size: config.size,
+                transparent: config.transparent,
+                preferred_present_mode: config.preferred_present_mode,
+                is_bgr: false,
+            },
             rendering_params,
             dual_source_blending,
             adapter_info,
@@ -519,8 +710,9 @@ impl WgpuRenderer {
             opaque_alpha_mode,
             max_texture_size,
             last_error,
-            failed_frame_count: 0,
+            frame_failure_streak: FrameFailureStreak::default(),
             device_lost: context.device_lost_flag(),
+            needs_redraw: false,
         })
     }
 
@@ -978,6 +1170,10 @@ impl WgpuRenderer {
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
+        self.desired.size = size;
+        if self.resources.is_none() {
+            return;
+        }
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
 
@@ -1165,6 +1361,10 @@ impl WgpuRenderer {
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
+        self.desired.transparent = transparent;
+        if self.resources.is_none() {
+            return;
+        }
         let new_alpha_mode = if transparent {
             self.transparent_alpha_mode
         } else {
@@ -1190,7 +1390,7 @@ impl WgpuRenderer {
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
-        self.rendering_params.is_bgr = is_bgr;
+        self.desired.is_bgr = is_bgr;
     }
 
     #[allow(dead_code)]
@@ -1214,19 +1414,33 @@ impl WgpuRenderer {
         }
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    /// Draws a frame and returns whether a surface buffer was presented.
+    pub fn draw(&mut self, scene: &Scene) -> bool {
+        if self.resources.is_none() {
+            self.needs_redraw = true;
+            return false;
+        }
         let last_error = self.last_error.lock().unwrap().take();
         if let Some(error) = last_error {
-            self.failed_frame_count += 1;
+            let failed_frame_count = self.frame_failure_streak.record_error();
             log::error!(
                 "GPU error during frame (failure {} of 20): {error}",
-                self.failed_frame_count
+                failed_frame_count
             );
-            if self.failed_frame_count > 20 {
+            if failed_frame_count > 20 {
                 panic!("Too many consecutive GPU errors. Last error: {error}");
+            } else if failed_frame_count > 5 {
+                self.resources
+                    .as_mut()
+                    .expect("GPU resources checked above")
+                    .invalidate_cached_gpu_state();
+                self.atlas.clear();
+                self.needs_redraw = true;
+                self.frame_failure_streak.begin_recovery();
+                return false;
             }
         } else {
-            self.failed_frame_count = 0;
+            self.frame_failure_streak.record_no_error();
         }
 
         self.atlas.before_frame();
@@ -1247,19 +1461,19 @@ impl WgpuRenderer {
                 // Textures must be destroyed before the surface can be reconfigured.
                 drop(frame);
                 self.surface.configure(&self.device, &self.surface_config);
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.surface_config);
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 *self.last_error.lock().unwrap() =
                     Some("Surface texture validation error".to_string());
-                return;
+                return false;
             }
         };
 
@@ -1368,11 +1582,12 @@ impl WgpuRenderer {
                     self.instance_buffer_capacity
                 );
                 frame.present();
-                return;
+                return true;
             }
 
             frame.present();
         }
+        true
     }
 
     fn prepare_retained_layers(&mut self, scene: &Scene) -> Vec<PreparedRetainedLayer> {
@@ -1407,7 +1622,7 @@ impl WgpuRenderer {
                 }
 
                 let layer_scene = scene.clone_paint_range(layer.paint_range.clone());
-                if !layer_scene.backdrop_blurs.is_empty() {
+                if Self::retained_scene_contains_backdrop_blurs(&layer_scene) {
                     return None;
                 }
 
@@ -1445,6 +1660,10 @@ impl WgpuRenderer {
         }
 
         prepared
+    }
+
+    fn retained_scene_contains_backdrop_blurs(scene: &Scene) -> bool {
+        !scene.backdrop_blurs.is_empty()
     }
 
     fn top_level_retained_layer_indices(layers: &[RetainedLayer]) -> Vec<usize> {
@@ -1619,7 +1838,7 @@ impl WgpuRenderer {
             gamma_ratios: self.rendering_params.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
             subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
-            is_bgr: self.rendering_params.is_bgr as u32,
+            is_bgr: self.desired.is_bgr as u32,
             _pad: 0,
         };
         let globals = GlobalParams {
@@ -2641,37 +2860,120 @@ impl WgpuRenderer {
     pub fn destroy(&mut self) {
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
-        if let Some(ref texture) = self.path_intermediate_texture {
-            texture.destroy();
-        }
-        self.path_intermediate_texture = None;
-        self.path_intermediate_view = None;
-        if let Some(ref texture) = self.path_msaa_texture {
-            texture.destroy();
-        }
-        self.path_msaa_texture = None;
-        self.path_msaa_view = None;
-        self.path_intermediate_size = None;
-        if let Some(ref texture) = self.backdrop_texture {
-            texture.destroy();
-        }
-        self.backdrop_texture = None;
-        self.backdrop_view = None;
-        self.backdrop_size = None;
-        for (_, layer) in self.retained_layers.drain() {
-            layer.texture.destroy();
-        }
+        self.resources.take();
     }
 
     /// Returns true if the GPU device was lost and recovery is needed.
     pub fn device_lost(&self) -> bool {
         self.device_lost.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Returns and clears the flag indicating that cached GPU state was discarded.
+    pub fn needs_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.needs_redraw)
+    }
+
+    /// Recreates this window's device-owned resource graph after device loss.
+    /// The first window recreates the shared context; later windows adopt it.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn recover(&mut self) -> anyhow::Result<()> {
+        // The current scene was built against atlas IDs from the lost device.
+        // Always request a fresh scene, including when this recovery attempt fails.
+        self.needs_redraw = true;
+        let gpu_context = Rc::clone(
+            self.context
+                .as_ref()
+                .expect("native renderer recovery requires a shared context"),
+        );
+        let handles = self
+            .surface_handles
+            .expect("native renderer recovery requires surface handles");
+        let needs_new_context = recovery_requires_new_context(
+            gpu_context.borrow().as_ref().map(WgpuContext::device_lost),
+        );
+
+        // Drop every Arc/device child and the old surface before replacing the context.
+        self.resources.take();
+        let surface = if needs_new_context {
+            *gpu_context.borrow_mut() = None;
+            std::thread::sleep(std::time::Duration::from_millis(350));
+            let instance = WgpuContext::instance();
+            let surface = unsafe {
+                instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(handles.display),
+                    raw_window_handle: handles.window,
+                })?
+            };
+            let context = WgpuContext::new_for_surface_rejecting_software(
+                instance,
+                &surface,
+                self.compositor_gpu,
+            )?;
+            *gpu_context.borrow_mut() = Some(context);
+            surface
+        } else {
+            let context_ref = gpu_context.borrow();
+            let context = context_ref.as_ref().expect("context was recovered");
+            unsafe {
+                context
+                    .instance
+                    .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                        raw_display_handle: Some(handles.display),
+                        raw_window_handle: handles.window,
+                    })?
+            }
+        };
+        let context_ref = gpu_context.borrow();
+        let context = context_ref.as_ref().expect("context was recovered");
+        let config = self.desired.renderer_config();
+        let atlas = Arc::clone(&self.atlas);
+        let is_bgr = self.desired.is_bgr;
+        atlas.handle_device_lost(Arc::clone(&context.device), Arc::clone(&context.queue));
+
+        let mut recovered = Self::from_surface_internal(
+            context,
+            surface,
+            config,
+            Some(Rc::clone(&gpu_context)),
+            self.compositor_gpu,
+            Some(atlas),
+            Some(handles),
+        )?;
+        recovered.desired.is_bgr = is_bgr;
+        self.frame_failure_streak
+            .transfer_to(&mut recovered.frame_failure_streak);
+        recovered.needs_redraw = true;
+        *self = recovered;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Corners;
+
+    fn scene_with_retained_primitive(
+        primitive: impl Into<gpui::Primitive>,
+    ) -> (Scene, RetainedLayer) {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(100.0), ScaledPixels(100.0)),
+        );
+        let mut scene = Scene::default();
+        scene.insert_primitive(primitive);
+        let layer = RetainedLayer {
+            id: GlobalElementId::default(),
+            content_revision: 1.into(),
+            content_dirty: true,
+            bounds,
+            content_mask: ContentMask { bounds },
+            transform: TransformationMatrix::unit(),
+            opacity: 1.0,
+            paint_range: 0..scene.paint_operation_count(),
+        };
+        (scene, layer)
+    }
 
     #[test]
     fn select_present_mode_accepts_auto_modes_without_surface_advertising_them() {
@@ -2698,6 +3000,118 @@ mod tests {
             wgpu::PresentMode::Fifo
         );
     }
+
+    #[test]
+    fn recovery_state_preserves_requested_surface_and_subpixel_settings() {
+        let desired = DesiredSurfaceState {
+            size: Size::new(DevicePixels(1440), DevicePixels(900)),
+            transparent: true,
+            preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+            is_bgr: true,
+        };
+
+        let config = desired.renderer_config();
+        assert_eq!(config.size, desired.size);
+        assert_eq!(config.transparent, desired.transparent);
+        assert_eq!(
+            config.preferred_present_mode,
+            desired.preferred_present_mode
+        );
+        assert!(desired.is_bgr);
+    }
+
+    #[test]
+    fn recovery_coordinator_recreates_only_missing_or_lost_shared_contexts() {
+        assert!(recovery_requires_new_context(None));
+        assert!(recovery_requires_new_context(Some(true)));
+        assert!(!recovery_requires_new_context(Some(false)));
+    }
+
+    #[test]
+    fn recovery_gap_does_not_reset_consecutive_frame_failures() {
+        let mut failures = FrameFailureStreak::default();
+
+        for expected in 1..=6 {
+            assert_eq!(failures.record_error(), expected);
+            if expected > 5 {
+                failures.begin_recovery();
+            }
+        }
+
+        let mut recovered_failures = FrameFailureStreak::default();
+        failures.transfer_to(&mut recovered_failures);
+        assert_eq!(failures.count, 0);
+        recovered_failures.record_no_error();
+        assert_eq!(recovered_failures.count, 6);
+
+        for expected in 7..=21 {
+            assert_eq!(recovered_failures.record_error(), expected);
+            recovered_failures.begin_recovery();
+            recovered_failures.record_no_error();
+        }
+
+        assert_eq!(recovered_failures.count, 21);
+        recovered_failures.record_no_error();
+        assert_eq!(recovered_failures.count, 0);
+    }
+
+    #[test]
+    fn surface_usage_requests_copy_source_only_when_supported() {
+        let (usage, supports_copy_src) =
+            surface_usage(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
+        assert!(supports_copy_src);
+        assert!(usage.contains(wgpu::TextureUsages::COPY_SRC));
+
+        let (usage, supports_copy_src) = surface_usage(wgpu::TextureUsages::RENDER_ATTACHMENT);
+        assert!(!supports_copy_src);
+        assert!(!usage.contains(wgpu::TextureUsages::COPY_SRC));
+        assert!(usage.contains(wgpu::TextureUsages::RENDER_ATTACHMENT));
+    }
+
+    #[test]
+    fn retained_layer_with_backdrop_blur_is_excluded_from_wgpu_cache() {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(100.0), ScaledPixels(100.0)),
+        );
+        let (scene, layer) = scene_with_retained_primitive(BackdropBlur {
+            order: 0,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::all(ScaledPixels(8.0)),
+            blur_radius: ScaledPixels(16.0),
+            source_origin_x: 0.0,
+            source_origin_y: 0.0,
+            source_width: 1.0,
+            source_height: 1.0,
+            pad2: 0,
+        });
+
+        let retained_scene = scene.clone_paint_range(layer.paint_range);
+        assert!(WgpuRenderer::retained_scene_contains_backdrop_blurs(
+            &retained_scene
+        ));
+    }
+
+    #[test]
+    fn retained_layer_without_backdrop_blur_remains_cacheable_by_wgpu() {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(100.0), ScaledPixels(100.0)),
+        );
+        let (scene, layer) = scene_with_retained_primitive(Quad {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Default::default()
+        });
+
+        let retained_scene = scene.clone_paint_range(layer.paint_range);
+        assert!(!WgpuRenderer::retained_scene_contains_backdrop_blurs(
+            &retained_scene
+        ));
+    }
 }
 
 struct RenderingParameters {
@@ -2705,7 +3119,6 @@ struct RenderingParameters {
     gamma_ratios: [f32; 4],
     grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
-    is_bgr: bool,
 }
 
 impl RenderingParameters {
@@ -2742,7 +3155,6 @@ impl RenderingParameters {
             gamma_ratios,
             grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
-            is_bgr: false,
         }
     }
 }

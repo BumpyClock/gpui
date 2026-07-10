@@ -32,13 +32,13 @@
 //! your own custom layout algorithm or rendering a code editor.
 
 use crate::{
-    App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId, FocusHandle,
-    InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
+    A11ySubtreeBuilder, App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId,
+    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, Size, Style, Window,
     util::FluentBuilder, window::with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
-    any::{Any, type_name},
+    any::Any,
     fmt::{self, Debug, Display},
     mem, panic,
     sync::Arc,
@@ -114,6 +114,14 @@ pub trait Element: 'static + IntoElement {
     /// Write accessibility properties to the given node.
     fn write_a11y_info(&self, _node: &mut accesskit::Node) {}
 
+    /// Add synthetic accessibility child nodes after this element has been prepainted.
+    fn a11y_synthetic_children(
+        &mut self,
+        _prepaint: &mut Self::PrepaintState,
+        _builder: &mut A11ySubtreeBuilder,
+    ) {
+    }
+
     /// Convert this element into a dynamically-typed [`AnyElement`].
     fn into_any(self) -> AnyElement {
         AnyElement::new(self)
@@ -183,116 +191,6 @@ pub trait ParentElement {
         Self: Sized,
     {
         self.extend(children.into_iter().map(|child| child.into_any_element()));
-        self
-    }
-}
-
-/// An element for rendering components. An implementation detail of the [`IntoElement`] derive macro
-/// for [`RenderOnce`]
-#[doc(hidden)]
-pub struct Component<C: RenderOnce> {
-    component: Option<C>,
-    #[cfg(debug_assertions)]
-    source: &'static core::panic::Location<'static>,
-}
-
-impl<C: RenderOnce> Component<C> {
-    /// Create a new component from the given RenderOnce type.
-    #[track_caller]
-    pub fn new(component: C) -> Self {
-        Component {
-            component: Some(component),
-            #[cfg(debug_assertions)]
-            source: core::panic::Location::caller(),
-        }
-    }
-}
-
-fn prepaint_component(
-    (element, name): &mut (AnyElement, &'static str),
-    window: &mut Window,
-    cx: &mut App,
-) {
-    window.with_id(ElementId::Name(SharedString::new_static(name)), |window| {
-        element.prepaint(window, cx);
-    })
-}
-
-fn paint_component(
-    (element, name): &mut (AnyElement, &'static str),
-    window: &mut Window,
-    cx: &mut App,
-) {
-    window.with_id(ElementId::Name(SharedString::new_static(name)), |window| {
-        element.paint(window, cx);
-    })
-}
-impl<C: RenderOnce> Element for Component<C> {
-    type RequestLayoutState = (AnyElement, &'static str);
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        #[cfg(debug_assertions)]
-        return Some(self.source);
-
-        #[cfg(not(debug_assertions))]
-        return None;
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        window.with_id(ElementId::Name(type_name::<C>().into()), |window| {
-            let mut element = self
-                .component
-                .take()
-                .unwrap()
-                .render(window, cx)
-                .into_any_element();
-
-            let layout_id = element.request_layout(window, cx);
-            (layout_id, (element, type_name::<C>()))
-        })
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        state: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        prepaint_component(state, window, cx);
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        state: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        paint_component(state, window, cx);
-    }
-}
-
-impl<C: RenderOnce> IntoElement for Component<C> {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
         self
     }
 }
@@ -442,7 +340,7 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let bounds = window.layout_bounds(layout_id);
-                let mut pushed_a11y_node = false;
+                let mut pushed_a11y_node = None;
                 if window.a11y.is_active() {
                     if let Some(global_id) = global_id.as_ref() {
                         if let Some(role) = self.element.a11y_role() {
@@ -456,8 +354,8 @@ impl<E: Element> Drawable<E> {
                                 y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
                             });
                             self.element.write_a11y_info(&mut node);
-                            pushed_a11y_node = window.a11y.nodes.push(node_id, node);
-                            if pushed_a11y_node {
+                            if window.a11y.nodes.push(node_id, node) {
+                                pushed_a11y_node = Some(node_id);
                                 window.a11y.node_bounds.insert(node_id, bounds);
                             }
                         }
@@ -465,7 +363,7 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let node_id = window.next_frame.dispatch_tree.push_node();
-                let prepaint = self.element.prepaint(
+                let mut prepaint = self.element.prepaint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
                     bounds,
@@ -475,7 +373,12 @@ impl<E: Element> Drawable<E> {
                 );
                 window.next_frame.dispatch_tree.pop_node();
 
-                if pushed_a11y_node {
+                if let Some(node_id) = pushed_a11y_node {
+                    if window.a11y.nodes.has_current_node(node_id) {
+                        let mut builder = A11ySubtreeBuilder::new(node_id, &mut window.a11y.nodes);
+                        self.element
+                            .a11y_synthetic_children(&mut prepaint, &mut builder);
+                    }
                     window.a11y.nodes.pop();
                 }
 

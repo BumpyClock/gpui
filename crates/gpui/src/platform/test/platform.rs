@@ -1,9 +1,10 @@
 use crate::{
     AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
-    DummyKeyboardMapper, ForegroundExecutor, Keymap, NoopTextSystem, Platform, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, SourceMetadata,
-    Task, TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams, size,
+    DummyKeyboardMapper, ForegroundExecutor, Keymap, NoopTextSystem, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
+    SourceMetadata, Task, TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams,
+    size,
 };
 use anyhow::Result;
 use collections::VecDeque;
@@ -24,6 +25,7 @@ pub(crate) struct TestPlatform {
     pub(crate) active_window: RefCell<Option<TestWindow>>,
     active_display: Rc<dyn PlatformDisplay>,
     active_cursor: Mutex<CursorStyle>,
+    cursor_hidden_until_mouse_moves: Mutex<bool>,
     current_clipboard_item: Mutex<Option<ClipboardItem>>,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     current_primary_item: Mutex<Option<ClipboardItem>>,
@@ -34,6 +36,7 @@ pub(crate) struct TestPlatform {
     pub opened_url: RefCell<Option<String>>,
     pub text_system: Arc<dyn PlatformTextSystem>,
     pub expect_restart: RefCell<Option<oneshot::Sender<Option<PathBuf>>>>,
+    system_wake_callback: RefCell<Option<Box<dyn FnMut()>>>,
     headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
     weak: Weak<Self>,
 }
@@ -85,6 +88,10 @@ struct TestPrompt {
 pub(crate) struct TestPrompts {
     multiple_choice: VecDeque<TestPrompt>,
     new_path: VecDeque<(PathBuf, oneshot::Sender<Result<Option<PathBuf>>>)>,
+    paths: VecDeque<(
+        PathPromptOptions,
+        oneshot::Sender<Result<Option<Vec<PathBuf>>>>,
+    )>,
 }
 
 impl TestPlatform {
@@ -120,9 +127,11 @@ impl TestPlatform {
             prompts: Default::default(),
             screen_capture_sources: Default::default(),
             active_cursor: Default::default(),
+            cursor_hidden_until_mouse_moves: Default::default(),
             active_display: Rc::new(TestDisplay::new()),
             active_window: Default::default(),
             expect_restart: Default::default(),
+            system_wake_callback: Default::default(),
             current_clipboard_item: Mutex::new(None),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             current_primary_item: Mutex::new(None),
@@ -146,6 +155,33 @@ impl TestPlatform {
             .pop_front()
             .expect("no pending new path prompt");
         tx.send(Ok(select_path(&path))).ok();
+    }
+
+    pub(crate) fn simulate_path_prompt_response(
+        &self,
+        select_paths: impl FnOnce(&PathPromptOptions) -> Option<Vec<PathBuf>>,
+    ) {
+        let (options, tx) = self
+            .prompts
+            .borrow_mut()
+            .paths
+            .pop_front()
+            .expect("no pending paths prompt");
+        let selection = select_paths(&options);
+        if let Some(paths) = &selection
+            && !options.multiple
+            && paths.len() > 1
+        {
+            panic!(
+                "selected {} paths for a prompt that does not allow multiple selection",
+                paths.len()
+            );
+        }
+        tx.send(Ok(selection)).ok();
+    }
+
+    pub(crate) fn did_prompt_for_paths(&self) -> bool {
+        !self.prompts.borrow().paths.is_empty()
     }
 
     #[track_caller]
@@ -227,6 +263,19 @@ impl TestPlatform {
     pub(crate) fn did_prompt_for_new_path(&self) -> bool {
         !self.prompts.borrow().new_path.is_empty()
     }
+
+    pub(crate) fn simulate_mouse_move(&self) {
+        *self.cursor_hidden_until_mouse_moves.lock() = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_system_wake(&self) {
+        let Some(mut callback) = self.system_wake_callback.borrow_mut().take() else {
+            return;
+        };
+        callback();
+        *self.system_wake_callback.borrow_mut() = Some(callback);
+    }
 }
 
 impl Platform for TestPlatform {
@@ -258,8 +307,8 @@ impl Platform for TestPlatform {
         ThermalState::Nominal
     }
 
-    fn run(&self, _on_finish_launching: Box<dyn FnOnce()>) {
-        unimplemented!()
+    fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+        on_finish_launching()
     }
 
     fn quit(&self) {}
@@ -349,9 +398,11 @@ impl Platform for TestPlatform {
 
     fn prompt_for_paths(
         &self,
-        _options: crate::PathPromptOptions,
+        options: crate::PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<std::path::PathBuf>>>> {
-        unimplemented!()
+        let (tx, rx) = oneshot::channel();
+        self.prompts.borrow_mut().paths.push_back((options, tx));
+        rx
     }
 
     fn prompt_for_new_path(
@@ -381,6 +432,10 @@ impl Platform for TestPlatform {
         unimplemented!()
     }
 
+    fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
+        *self.system_wake_callback.borrow_mut() = Some(callback);
+    }
+
     fn set_menus(&self, _menus: Vec<crate::Menu>, _keymap: &Keymap) {}
     fn set_dock_menu(&self, _menu: Vec<crate::MenuItem>, _keymap: &Keymap) {}
 
@@ -404,10 +459,12 @@ impl Platform for TestPlatform {
         *self.active_cursor.lock() = style;
     }
 
-    fn hide_cursor_until_mouse_moves(&self) {}
+    fn hide_cursor_until_mouse_moves(&self) {
+        *self.cursor_hidden_until_mouse_moves.lock() = true;
+    }
 
     fn is_cursor_visible(&self) -> bool {
-        true
+        !*self.cursor_hidden_until_mouse_moves.lock()
     }
 
     fn should_auto_hide_scrollbars(&self) -> bool {
