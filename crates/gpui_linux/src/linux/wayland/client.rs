@@ -78,10 +78,10 @@ use super::{
 };
 
 use crate::linux::{
-    DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout, ResultExt as _,
-    SCROLL_LINES, capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state,
-    is_within_click_distance, keystroke_from_xkb, keystroke_underlying_dead_key,
-    modifiers_from_xkb, open_uri_internal, read_fd, reveal_path_internal,
+    DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout, SCROLL_LINES,
+    capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
+    keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, open_uri_internal,
+    read_fd, reveal_path_internal,
     wayland::{
         clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
         cursor::Cursor,
@@ -99,7 +99,7 @@ use gpui::{
     ScrollDelta, ScrollWheelEvent, SharedString, Size, TouchPhase, WindowParams, point, profiler,
     px, size,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuContext};
+use gpui_wgpu::{CompositorGpuHint, GpuContext};
 
 /// Used to convert evdev scancode to xkb scancode
 const MIN_KEYCODE: u32 = 8;
@@ -210,7 +210,8 @@ pub struct Output {
 pub(crate) struct WaylandClientState {
     serial_tracker: SerialTracker,
     globals: Globals,
-    pub gpu_context: WgpuContext,
+    pub gpu_context: GpuContext,
+    pub compositor_gpu: Option<CompositorGpuHint>,
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -593,7 +594,7 @@ impl WaylandClient {
 
         let compositor_gpu = detect_compositor_gpu();
         // This could be unified with the notification handling in zed/main:fail_to_open_window.
-        let gpu_context = WgpuContext::new(compositor_gpu).notify_err("Unable to init GPU context");
+        let gpu_context = Rc::new(RefCell::new(None));
 
         let seat = seat.unwrap();
         let globals = Globals::new(
@@ -649,6 +650,7 @@ impl WaylandClient {
             serial_tracker: SerialTracker::new(),
             globals,
             gpu_context,
+            compositor_gpu,
             wl_seat: seat,
             wl_pointer: None,
             wl_keyboard: None,
@@ -809,7 +811,8 @@ impl LinuxClient for WaylandClient {
         let (window, surface_id) = WaylandWindow::new(
             handle,
             state.globals.clone(),
-            &state.gpu_context,
+            Rc::clone(&state.gpu_context),
+            state.compositor_gpu,
             WaylandClientStatePtr(Rc::downgrade(&self.0)),
             params,
             state.common.appearance,

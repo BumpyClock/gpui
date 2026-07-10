@@ -12,7 +12,7 @@ use gpui::{
     ScaledPixels, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowDecorations, WindowKind, WindowParams, px,
 };
-use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{CompositorGpuHint, GpuContext, WgpuRenderer, WgpuSurfaceConfig};
 
 use collections::FxHashSet;
 use gpui_util::{ResultExt, maybe};
@@ -448,7 +448,8 @@ impl X11WindowState {
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
         executor: ForegroundExecutor,
-        gpu_context: &WgpuContext,
+        gpu_context: GpuContext,
+        compositor_gpu: Option<CompositorGpuHint>,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
@@ -775,7 +776,7 @@ impl X11WindowState {
                     transparent: false,
                     preferred_present_mode: None,
                 };
-                WgpuRenderer::new(gpu_context, &raw_window, config)?
+                WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
             };
             renderer.set_subpixel_layout(is_bgr);
 
@@ -901,7 +902,8 @@ impl X11Window {
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
         executor: ForegroundExecutor,
-        gpu_context: &WgpuContext,
+        gpu_context: GpuContext,
+        compositor_gpu: Option<CompositorGpuHint>,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
@@ -920,6 +922,7 @@ impl X11Window {
                 client,
                 executor,
                 gpu_context,
+                compositor_gpu,
                 params,
                 xcb,
                 client_side_decorations_supported,
@@ -1614,14 +1617,8 @@ impl PlatformWindow for X11Window {
         self.0
             .state
             .borrow()
-            .client
-            .0
-            .upgrade()
-            .map(|ref_cell| {
-                let state = ref_cell.borrow();
-                state.gpu_context.supports_dual_source_blending()
-            })
-            .unwrap_or_default()
+            .renderer
+            .supports_dual_source_blending()
     }
 
     fn minimize(&self) {
@@ -1712,7 +1709,18 @@ impl PlatformWindow for X11Window {
 
     fn draw(&self, scene: &Scene) {
         let mut inner = self.0.state.borrow_mut();
+        if inner.renderer.device_lost() {
+            if let Err(error) = inner.renderer.recover() {
+                log::warn!("failed to recover lost wgpu device; will retry: {error:#}");
+            }
+            let _ = inner.renderer.needs_redraw();
+            inner.force_render_after_recovery = true;
+            return;
+        }
         inner.renderer.draw(scene);
+        if inner.renderer.needs_redraw() {
+            inner.force_render_after_recovery = true;
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

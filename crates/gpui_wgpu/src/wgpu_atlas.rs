@@ -93,6 +93,14 @@ impl WgpuAtlas {
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
     }
+
+    /// Clears device-backed textures while retaining this atlas's stable identity.
+    pub fn clear(&self) {
+        let mut lock = self.0.lock();
+        lock.storage = WgpuAtlasStorage::default();
+        lock.tiles_by_key.clear();
+        lock.pending_uploads.clear();
+    }
 }
 
 impl PlatformAtlas for WgpuAtlas {
