@@ -413,6 +413,8 @@ impl ProfilingCollector {
 #[cfg(feature = "profiler")]
 const MAX_TASK_TIMINGS: usize = (16 * 1024 * 1024) / core::mem::size_of::<TaskTiming>();
 
+const MIN_PROFILED_TASK_DURATION: Duration = Duration::from_micros(100);
+
 #[doc(hidden)]
 pub(crate) type TaskTimings = VecDeque<TaskTiming>;
 
@@ -463,8 +465,8 @@ impl Default for TaskStatistics {
         Self {
             // Do not track polls that are not problematic
             // this keeps more calls on the fast path
-            poll_time_to_beat: Duration::from_micros(100),
-            runtime_to_beat: Duration::from_micros(100),
+            poll_time_to_beat: MIN_PROFILED_TASK_DURATION,
+            runtime_to_beat: MIN_PROFILED_TASK_DURATION,
             longest_poll_times: [TaskTiming::placeholder(); 5],
             longest_runtimes: [TaskTiming::placeholder(); 5],
         }
@@ -484,12 +486,19 @@ impl TaskStatistics {
                 .expect("guarded by the comparison with nth_longest_yield_time");
             self.longest_poll_times[to_replace] = task;
 
-            self.poll_time_to_beat = self
+            self.poll_time_to_beat = if self
                 .longest_poll_times
                 .iter()
-                .map(TaskTiming::poll_duration)
-                .min()
-                .expect("never empty");
+                .all(|timing| !timing.poll_duration().is_zero())
+            {
+                self.longest_poll_times
+                    .iter()
+                    .map(TaskTiming::poll_duration)
+                    .min()
+                    .expect("never empty")
+            } else {
+                MIN_PROFILED_TASK_DURATION
+            };
         }
     }
 
@@ -505,12 +514,19 @@ impl TaskStatistics {
                 .expect("guarded by the comparison with nth_longest_yield_time");
             self.longest_runtimes[to_replace] = task;
 
-            self.runtime_to_beat = self
+            self.runtime_to_beat = if self
                 .longest_runtimes
                 .iter()
-                .map(|task| task.since_spawn())
-                .min()
-                .expect("never empty");
+                .all(|timing| !timing.since_spawn().is_zero())
+            {
+                self.longest_runtimes
+                    .iter()
+                    .map(|task| task.since_spawn())
+                    .min()
+                    .expect("never empty")
+            } else {
+                MIN_PROFILED_TASK_DURATION
+            };
         }
     }
 }
@@ -646,9 +662,6 @@ impl ThreadTimings {
             self.total_pushed += 1;
         }
     }
-
-    #[cfg(not(feature = "profiler"))]
-    fn add_task_timing(&mut self, _: TaskTiming) {}
 }
 
 impl Drop for ThreadTimings {
@@ -667,6 +680,7 @@ impl Drop for ThreadTimings {
 }
 
 #[doc(hidden)]
+#[cfg(feature = "profiler")]
 pub fn update_running_task(spawned: SpawnTime, location: &'static std::panic::Location<'_>) {
     THREAD_TIMINGS.with(|timings| {
         timings.lock().update_running_task(spawned, location);
@@ -674,6 +688,12 @@ pub fn update_running_task(spawned: SpawnTime, location: &'static std::panic::Lo
 }
 
 #[doc(hidden)]
+#[cfg(not(feature = "profiler"))]
+#[inline(always)]
+pub fn update_running_task(_: SpawnTime, _: &'static std::panic::Location<'_>) {}
+
+#[doc(hidden)]
+#[cfg(feature = "profiler")]
 pub fn save_task_timing() {
     let yielded_at = YieldTime(Instant::now());
     THREAD_TIMINGS.with(|timings| {
@@ -682,9 +702,20 @@ pub fn save_task_timing() {
 }
 
 #[doc(hidden)]
+#[cfg(not(feature = "profiler"))]
+#[inline(always)]
+pub fn save_task_timing() {}
+
+#[doc(hidden)]
+#[cfg(feature = "profiler")]
 pub fn add_task_timing(timing: TaskTiming) {
     THREAD_TIMINGS.with(|timings| timings.lock().add_task_timing(timing));
 }
+
+#[doc(hidden)]
+#[cfg(not(feature = "profiler"))]
+#[inline(always)]
+pub fn add_task_timing(_: TaskTiming) {}
 
 #[doc(hidden)]
 pub fn get_current_thread_task_timings_including(
@@ -925,5 +956,23 @@ mod tests {
         }
 
         assert_eq!(statistics.poll_time_to_beat, Duration::from_millis(1));
+    }
+
+    #[test]
+    #[cfg(feature = "profiler")]
+    fn task_statistics_keep_minimum_threshold_until_all_slots_are_filled() {
+        let mut statistics = TaskStatistics::default();
+        let end = Instant::now();
+        let timing = TaskTiming {
+            location: core::panic::Location::caller(),
+            spawned: SpawnTime(end - Duration::from_millis(5)),
+            start: end - Duration::from_millis(1),
+            end: YieldTime(end),
+        };
+        statistics.add_yield_timing(timing);
+        statistics.add_runtime(timing);
+
+        assert_eq!(statistics.poll_time_to_beat, Duration::from_micros(100));
+        assert_eq!(statistics.runtime_to_beat, Duration::from_micros(100));
     }
 }

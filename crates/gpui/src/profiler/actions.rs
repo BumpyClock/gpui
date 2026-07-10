@@ -4,6 +4,8 @@ use itertools::Itertools;
 
 use crate::action::Action;
 
+const MIN_PROFILED_ACTION_DURATION: Duration = Duration::from_micros(100);
+
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct ActionStatistics {
@@ -56,7 +58,7 @@ impl ActionStatistics {
         Self {
             // This keeps more calls on the fast path by only tracking
             // problematic polls
-            runtime_to_beat: Duration::from_micros(100),
+            runtime_to_beat: MIN_PROFILED_ACTION_DURATION,
             longest_runtimes: heapless::Vec::new(),
             running: None,
         }
@@ -119,12 +121,15 @@ impl ActionStatistics {
                     .expect("just checked it is not full");
             };
 
-            self.runtime_to_beat = self
-                .longest_runtimes
-                .iter()
-                .map(|action| action.runtime())
-                .min()
-                .expect("never empty");
+            self.runtime_to_beat = if self.longest_runtimes.is_full() {
+                self.longest_runtimes
+                    .iter()
+                    .map(|action| action.runtime())
+                    .min()
+                    .expect("never empty")
+            } else {
+                MIN_PROFILED_ACTION_DURATION
+            };
         }
     }
     #[cfg(not(feature = "profiler"))]
@@ -192,6 +197,7 @@ pub(crate) fn update_running_action(action: &(dyn Action + 'static), cx: &mut cr
 
 #[doc(hidden)]
 #[cfg(not(feature = "profiler"))]
+#[inline(always)]
 pub(crate) fn update_running_action(_: &(dyn Action + 'static), _: &mut crate::App) {}
 
 #[doc(hidden)]
@@ -202,6 +208,7 @@ pub(crate) fn save_action_timing() {
 
 #[doc(hidden)]
 #[cfg(not(feature = "profiler"))]
+#[inline(always)]
 pub(crate) fn save_action_timing() {}
 
 #[doc(hidden)]
@@ -267,6 +274,25 @@ mod tests {
         assert!(!names.contains(&"one"));
         assert!(names.contains(&"five"));
         assert!(names.contains(&"replacement"));
+    }
+
+    #[test]
+    #[cfg(feature = "profiler")]
+    fn action_statistics_fill_all_slots_before_raising_threshold() {
+        let mut statistics = ActionStatistics::new();
+        for (name, duration) in [
+            ("five", 5),
+            ("four", 4),
+            ("three", 3),
+            ("two", 2),
+            ("one", 1),
+        ] {
+            statistics
+                .update_running_action(name, Instant::now() - Duration::from_millis(duration));
+            statistics.save_action_timing();
+        }
+
+        assert_eq!(statistics.longest_runtimes(false).count(), 5);
     }
 
     #[test]
