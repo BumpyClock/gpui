@@ -62,17 +62,10 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
 /// Returns a new [`HeadlessRenderer`] for the current platform, if available.
 #[cfg(feature = "test-support")]
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
-    #[cfg(target_os = "macos")]
-    {
-        Some(Box::new(
-            gpui_macos::metal_renderer::MetalHeadlessRenderer::new(),
-        ))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        None
-    }
+    // This standalone fork benchmarks scene construction without a native renderer. The fork's
+    // Metal renderer also carries retained-layer and backdrop-blur state that the upstream
+    // headless renderer does not model, so report that no compatible renderer is available.
+    None
 }
 
 #[cfg(all(test, target_os = "macos"))]
