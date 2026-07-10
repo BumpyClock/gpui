@@ -1745,7 +1745,7 @@ impl PromptButton {
 impl From<&str> for PromptButton {
     fn from(value: &str) -> Self {
         match value.to_lowercase().as_str() {
-            "ok" => PromptButton::Ok("Ok".into()),
+            "ok" => PromptButton::Ok("OK".into()),
             "cancel" => PromptButton::Cancel("Cancel".into()),
             _ => PromptButton::Other(SharedString::from(value.to_owned())),
         }
@@ -2229,6 +2229,12 @@ impl From<String> for ClipboardString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_ok_prompt_button_uses_standard_capitalization() {
+        assert_eq!(PromptButton::from("ok").label().as_ref(), "OK");
+        assert_eq!(PromptButton::from("OK").label().as_ref(), "OK");
+    }
 
     #[test]
     fn overlay_surface_options_preserve_overlay_window_contract() {
