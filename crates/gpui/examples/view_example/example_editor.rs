@@ -23,6 +23,9 @@ pub struct Editor {
     pub focus_handle: FocusHandle,
     pub cursor: usize,
     pub cursor_visible: bool,
+    selected_range: Range<usize>,
+    marked_range: Option<Range<usize>>,
+    expected_value: Option<String>,
     _blink_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -47,17 +50,20 @@ impl Editor {
         });
 
         // The value is shared: anything can write it while we hold a cursor into
-        // it. Observe it so external writes (a) clamp the cursor back onto a char
+        // it. Observe it so external writes (a) clamp the cursor back onto a grapheme
         // boundary before the next IME round-trip can slice out of bounds, and
         // (b) notify us, so an `editor.cached(..)` subtree re-renders — the cache
         // is keyed on *our* notify, not the value's.
         let value_sub = cx.observe(&value, |this, value, cx| {
             let content = value.read(cx);
-            let mut cursor = this.cursor.min(content.len());
-            while cursor > 0 && !content.is_char_boundary(cursor) {
-                cursor -= 1;
+            if this.expected_value.as_deref() == Some(content.as_str()) {
+                this.expected_value = None;
+            } else {
+                let cursor = floor_grapheme_boundary(content, this.cursor);
+                this.cursor = cursor;
+                this.selected_range = cursor..cursor;
+                this.marked_range = None;
             }
-            this.cursor = cursor;
             cx.notify();
         });
 
@@ -66,6 +72,9 @@ impl Editor {
             focus_handle,
             cursor: 0,
             cursor_visible: false,
+            selected_range: 0..0,
+            marked_range: None,
+            expected_value: None,
             _blink_task: Task::ready(()),
             _subscriptions: vec![focus_sub, blur_sub, value_sub],
         }
@@ -114,6 +123,8 @@ impl Editor {
         if self.cursor > 0 {
             self.cursor = previous_boundary(&content, self.cursor);
         }
+        self.selected_range = self.cursor..self.cursor;
+        self.marked_range = None;
         self.reset_blink(cx);
         cx.notify();
     }
@@ -123,18 +134,24 @@ impl Editor {
         if self.cursor < content.len() {
             self.cursor = next_boundary(&content, self.cursor);
         }
+        self.selected_range = self.cursor..self.cursor;
+        self.marked_range = None;
         self.reset_blink(cx);
         cx.notify();
     }
 
     pub fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
         self.cursor = 0;
+        self.selected_range = 0..0;
+        self.marked_range = None;
         self.reset_blink(cx);
         cx.notify();
     }
 
     pub fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
         self.cursor = self.text(cx).len();
+        self.selected_range = self.cursor..self.cursor;
+        self.marked_range = None;
         self.reset_blink(cx);
         cx.notify();
     }
@@ -150,6 +167,8 @@ impl Editor {
             });
             self.cursor = prev;
         }
+        self.selected_range = self.cursor..self.cursor;
+        self.marked_range = None;
         self.reset_blink(cx);
         cx.notify();
     }
@@ -164,6 +183,8 @@ impl Editor {
                 cx.notify();
             });
         }
+        self.selected_range = self.cursor..self.cursor;
+        self.marked_range = None;
         self.reset_blink(cx);
         cx.notify();
     }
@@ -175,9 +196,22 @@ impl Editor {
             cx.notify();
         });
         self.cursor += 1;
+        self.selected_range = self.cursor..self.cursor;
+        self.marked_range = None;
         self.reset_blink(cx);
         cx.notify();
     }
+}
+
+fn floor_grapheme_boundary(content: &str, offset: usize) -> usize {
+    let offset = offset.min(content.len());
+    content
+        .grapheme_indices(true)
+        .map(|(ix, _)| ix)
+        .chain(std::iter::once(content.len()))
+        .take_while(|ix| *ix <= offset)
+        .last()
+        .unwrap_or(0)
 }
 
 fn previous_boundary(content: &str, offset: usize) -> usize {
@@ -256,9 +290,8 @@ impl EntityInputHandler for Editor {
         cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         let content = self.text(cx);
-        let utf16_cursor = offset_to_utf16(&content, self.cursor);
         Some(UTF16Selection {
-            range: utf16_cursor..utf16_cursor,
+            range: range_to_utf16(&content, &self.selected_range),
             reversed: false,
         })
     }
@@ -266,12 +299,17 @@ impl EntityInputHandler for Editor {
     fn marked_text_range(
         &self,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        None
+        let content = self.text(cx);
+        self.marked_range
+            .as_ref()
+            .map(|range| range_to_utf16(&content, range))
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked_range = None;
+    }
 
     fn replace_text_in_range(
         &mut self,
@@ -284,10 +322,14 @@ impl EntityInputHandler for Editor {
         let range = range_utf16
             .as_ref()
             .map(|r| range_from_utf16(&content, r))
-            .unwrap_or(self.cursor..self.cursor);
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selected_range.clone());
 
         let new_content = content[..range.start].to_owned() + new_text + &content[range.end..];
         self.cursor = range.start + new_text.len();
+        self.selected_range = self.cursor..self.cursor;
+        self.marked_range = None;
+        self.expected_value = Some(new_content.clone());
         self.value.update(cx, |s, cx| {
             *s = new_content;
             cx.notify();
@@ -300,11 +342,32 @@ impl EntityInputHandler for Editor {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _new_selected_range_utf16: Option<Range<usize>>,
-        window: &mut Window,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.replace_text_in_range(range_utf16, new_text, window, cx);
+        let content = self.text(cx);
+        let range = range_utf16
+            .as_ref()
+            .map(|range| range_from_utf16(&content, range))
+            .or_else(|| self.marked_range.clone())
+            .unwrap_or_else(|| self.selected_range.clone());
+        let new_content = content[..range.start].to_owned() + new_text + &content[range.end..];
+        let inserted_range = range.start..range.start + new_text.len();
+        self.marked_range = (!new_text.is_empty()).then_some(inserted_range.clone());
+        self.selected_range = new_selected_range_utf16
+            .as_ref()
+            .map(|selection| range_from_utf16(new_text, selection))
+            .map(|selection| range.start + selection.start..range.start + selection.end)
+            .unwrap_or(inserted_range.end..inserted_range.end);
+        self.cursor = self.selected_range.end;
+        self.expected_value = Some(new_content.clone());
+        self.value.update(cx, |value, cx| {
+            *value = new_content;
+            cx.notify();
+        });
+        self.reset_blink(cx);
+        cx.notify();
     }
 
     fn bounds_for_range(

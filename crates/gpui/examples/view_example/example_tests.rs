@@ -6,7 +6,9 @@
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Context, Entity, KeyBinding, TestAppContext, Window, prelude::*};
+    use gpui::{
+        Context, Entity, EntityInputHandler, KeyBinding, TestAppContext, Window, prelude::*,
+    };
 
     use crate::example_editor::Editor;
     use crate::example_input::Input;
@@ -99,23 +101,65 @@ mod tests {
     fn external_writes_clamp_the_cursor(cx: &mut TestAppContext) {
         let (editor, a_value, _b_value, cx) = setup(cx);
 
-        cx.simulate_input("hello");
-        cx.read_entity(&editor, |editor, _| assert_eq!(editor.cursor, 5));
+        cx.simulate_input("a");
+        cx.read_entity(&editor, |editor, _| assert_eq!(editor.cursor, 1));
 
-        // Write the shared value from outside the editor. The old cursor (5)
-        // now points into the middle of a multi-byte character; the editor's
-        // observation must clamp it back onto a boundary.
+        // Byte 1 is a UTF-8 character boundary, but it lies inside the first
+        // grapheme ("e" plus a combining accent).
         cx.update(|_, cx| {
             a_value.update(cx, |value, cx| {
-                *value = "日本".to_string();
+                *value = "e\u{301}x".to_string();
                 cx.notify();
             })
         });
 
-        cx.read_entity(&a_value, |value, _| assert_eq!(value, "日本"));
+        cx.read_entity(&a_value, |value, _| assert_eq!(value, "e\u{301}x"));
         cx.read_entity(&editor, |editor, _| {
-            assert_eq!(editor.cursor, 3, "cursor must clamp to a char boundary");
+            assert_eq!(editor.cursor, 0, "cursor must clamp to a grapheme boundary");
         });
+    }
+
+    #[gpui::test]
+    fn ime_composition_replaces_the_active_mark_and_tracks_selection(cx: &mut TestAppContext) {
+        let (editor, value, _b_value, cx) = setup(cx);
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.replace_and_mark_text_in_range(None, "日本", Some(1..1), window, cx);
+            });
+        });
+
+        cx.read_entity(&value, |value, _| assert_eq!(value, "日本"));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                assert_eq!(editor.marked_text_range(window, cx), Some(0..2));
+                assert_eq!(
+                    editor.selected_text_range(false, window, cx).unwrap().range,
+                    1..1
+                );
+                assert_eq!(editor.cursor, "日".len());
+            });
+        });
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.replace_and_mark_text_in_range(None, "語", Some(1..1), window, cx);
+            });
+        });
+
+        cx.read_entity(&value, |value, _| assert_eq!(value, "語"));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                assert_eq!(editor.marked_text_range(window, cx), Some(0..1));
+                editor.replace_text_in_range(None, "go", window, cx);
+                assert_eq!(editor.marked_text_range(window, cx), None);
+                assert_eq!(
+                    editor.selected_text_range(false, window, cx).unwrap().range,
+                    2..2
+                );
+            });
+        });
+        cx.read_entity(&value, |value, _| assert_eq!(value, "go"));
     }
 
     #[gpui::test]
