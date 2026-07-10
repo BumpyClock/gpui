@@ -1,3 +1,5 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
 //! Accessibility (AccessKit) demo app.
 //!
 //! Run with: `cargo run -p gpui --example a11y`.
@@ -184,7 +186,7 @@ impl Render for A11yDemo {
     }
 }
 
-fn main() {
+fn run_example() {
     application().run(|cx: &mut App| {
         cx.bind_keys([
             KeyBinding::new("tab", Tab, None),
@@ -205,4 +207,20 @@ fn main() {
         .unwrap();
         cx.activate(true);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Warn)
+        .filter_module("gpui", log::LevelFilter::Info)
+        .init();
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

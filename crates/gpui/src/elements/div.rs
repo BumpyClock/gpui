@@ -1136,6 +1136,23 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Report this node as the active descendant when one of its ancestors is focused.
+    fn aria_active_descendant(mut self) -> Self {
+        self.interactivity()
+            .a11y_state_mut()
+            .report_active_descendant_focus = true;
+        self
+    }
+
+    /// Contribute synthetic accessibility nodes after this element is prepainted.
+    fn a11y_synthetic_children(
+        mut self,
+        f: impl FnOnce(&mut crate::A11ySubtreeBuilder) + 'static,
+    ) -> Self {
+        self.interactivity().a11y_state_mut().synthetic_children = Some(Box::new(f));
+        self
+    }
+
     /// Set the selected state for this element.
     fn aria_selected(mut self, selected: bool) -> Self {
         self.interactivity().a11y_state_mut().aria_selected = Some(selected);
@@ -1157,6 +1174,26 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// Set the numeric value for this element.
     fn aria_numeric_value(mut self, value: f64) -> Self {
         self.interactivity().a11y_state_mut().aria_numeric_value = Some(value);
+        self
+    }
+
+    /// Set the numeric step used by assistive-technology increment/decrement actions.
+    fn aria_numeric_value_step(mut self, step: f64) -> Self {
+        self.interactivity()
+            .a11y_state_mut()
+            .aria_numeric_value_step = Some(step);
+        self
+    }
+
+    /// Set this element's string value.
+    fn aria_value(mut self, value: impl Into<SharedString>) -> Self {
+        self.interactivity().a11y_state_mut().aria_value = Some(value.into());
+        self
+    }
+
+    /// Set this element's placeholder string.
+    fn aria_placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {
+        self.interactivity().a11y_state_mut().aria_placeholder = Some(placeholder.into());
         self
     }
 
@@ -1550,6 +1587,21 @@ impl Element for Div {
         self.interactivity.write_a11y_info(node);
     }
 
+    fn a11y_synthetic_children(
+        &mut self,
+        _prepaint: &mut Self::PrepaintState,
+        builder: &mut crate::A11ySubtreeBuilder,
+    ) {
+        if let Some(f) = self
+            .interactivity
+            .a11y_state
+            .as_mut()
+            .and_then(|state| state.synthetic_children.take())
+        {
+            f(builder);
+        }
+    }
+
     #[stacksafe]
     fn request_layout(
         &mut self,
@@ -1797,6 +1849,8 @@ pub struct Interactivity {
 #[derive(Default)]
 pub(crate) struct A11yState {
     action_listeners: Vec<(accesskit::Action, crate::window::a11y::A11yActionListener)>,
+    synthetic_children: Option<Box<dyn FnOnce(&mut crate::A11ySubtreeBuilder)>>,
+    report_active_descendant_focus: bool,
     override_role: Option<accesskit::Role>,
     aria_label: Option<SharedString>,
     aria_selected: Option<bool>,
@@ -1805,6 +1859,9 @@ pub(crate) struct A11yState {
     aria_numeric_value: Option<f64>,
     aria_min_numeric_value: Option<f64>,
     aria_max_numeric_value: Option<f64>,
+    aria_numeric_value_step: Option<f64>,
+    aria_value: Option<SharedString>,
+    aria_placeholder: Option<SharedString>,
     aria_orientation: Option<accesskit::Orientation>,
     aria_level: Option<usize>,
     aria_position_in_set: Option<usize>,
@@ -1997,10 +2054,17 @@ impl Interactivity {
                             window.a11y.node_bounds.insert(node_id, translated_bounds);
                         }
                         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
-                            window.a11y.focus_ids.insert(node_id, focus_handle.id);
+                            window.a11y.set_focusable(node_id, focus_handle.id);
                             if focus_handle.is_focused(window) {
-                                window.a11y.nodes.set_focus(node_id);
+                                window.a11y.set_focus(node_id);
                             }
+                        }
+                        if self
+                            .a11y_state
+                            .as_deref()
+                            .is_some_and(|state| state.report_active_descendant_focus)
+                        {
+                            window.a11y.set_active_descendant(node_id);
                         }
                     }
                 }
@@ -2593,6 +2657,11 @@ impl Interactivity {
                     .get_or_insert_with(Default::default)
                     .clone();
 
+                let pending_keyboard_down = element_state
+                    .pending_keyboard_down
+                    .get_or_insert_with(Default::default)
+                    .clone();
+
                 let clicked_state = element_state
                     .clicked_state
                     .get_or_insert_with(Default::default)
@@ -2646,6 +2715,20 @@ impl Interactivity {
                 });
 
                 if is_focused {
+                    window.on_key_event({
+                        let pending_keyboard_down = pending_keyboard_down.clone();
+                        move |event: &KeyDownEvent, phase, window, _cx| {
+                            if phase.bubble() && !window.default_prevented() {
+                                let stroke = &event.keystroke;
+                                let is_activation_key = (stroke.key.eq("enter")
+                                    || stroke.key.eq("space"))
+                                    && !stroke.modifiers.modified();
+                                *pending_keyboard_down.borrow_mut() =
+                                    is_activation_key.then_some(window.focus_generation);
+                            }
+                        }
+                    });
+
                     // Press enter, space to trigger click, when the element is focused.
                     window.on_key_event({
                         let click_listeners = click_listeners.clone();
@@ -2664,6 +2747,12 @@ impl Interactivity {
                                 if let Some(button) = keyboard_button
                                     && !stroke.modifiers.modified()
                                 {
+                                    let pending =
+                                        std::mem::take(&mut *pending_keyboard_down.borrow_mut());
+                                    if pending != Some(window.focus_generation) {
+                                        return;
+                                    }
+
                                     let click_event = ClickEvent::Keyboard(KeyboardClickEvent {
                                         button,
                                         bounds: hitbox.bounds,
@@ -2672,6 +2761,8 @@ impl Interactivity {
                                     for listener in &click_listeners {
                                         listener(&click_event, window, cx);
                                     }
+                                } else {
+                                    *pending_keyboard_down.borrow_mut() = None;
                                 }
                             }
                         }
@@ -3109,6 +3200,15 @@ impl A11yState {
         if let Some(value) = self.aria_max_numeric_value {
             node.set_max_numeric_value(value);
         }
+        if let Some(step) = self.aria_numeric_value_step {
+            node.set_numeric_value_step(step);
+        }
+        if let Some(value) = &self.aria_value {
+            node.set_value(value.to_string());
+        }
+        if let Some(placeholder) = &self.aria_placeholder {
+            node.set_placeholder(placeholder.to_string());
+        }
         if let Some(orientation) = self.aria_orientation {
             node.set_orientation(orientation);
         }
@@ -3148,6 +3248,7 @@ pub struct InteractiveElementState {
     pub(crate) hover_state: Option<Rc<RefCell<ElementHoverState>>>,
     pub(crate) hover_listener_state: Option<Rc<RefCell<bool>>>,
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
+    pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
 }
@@ -3540,6 +3641,14 @@ where
         self.element.write_a11y_info(node);
     }
 
+    fn a11y_synthetic_children(
+        &mut self,
+        prepaint: &mut Self::PrepaintState,
+        builder: &mut crate::A11ySubtreeBuilder,
+    ) {
+        self.element.a11y_synthetic_children(prepaint, builder);
+    }
+
     fn request_layout(
         &mut self,
         id: Option<&GlobalElementId>,
@@ -3857,8 +3966,8 @@ impl ScrollHandle {
 mod tests {
     use super::*;
     use crate::{
-        AnyView, AppContext, Context, DrawPhase, Drawable, Render, StyleRefinement, TestAppContext,
-        deferred, text,
+        AnyView, AnyWindowHandle, AppContext, Context, DrawPhase, Drawable, Keystroke, Render,
+        StyleRefinement, TestAppContext, deferred, interactive::InputEvent, text,
     };
     use std::cell::Cell;
     use std::rc::Rc;
@@ -4292,6 +4401,42 @@ mod tests {
     }
 
     #[gpui::test]
+    fn explicit_a11y_click_listener_takes_precedence_over_on_click(cx: &mut TestAppContext) {
+        let ordinary_clicks = Rc::new(Cell::new(0));
+        let explicit_clicks = Rc::new(Cell::new(0));
+        let cx = cx.add_empty_window();
+        let update = draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
+            let ordinary_clicks = ordinary_clicks.clone();
+            let explicit_clicks = explicit_clicks.clone();
+            move |_, _| {
+                div()
+                    .id("explicit-click")
+                    .role(accesskit::Role::Button)
+                    .on_click(move |_, _, _| ordinary_clicks.set(ordinary_clicks.get() + 1))
+                    .on_a11y_action(accesskit::Action::Click, move |_, _, _| {
+                        explicit_clicks.set(explicit_clicks.get() + 1)
+                    })
+            }
+        });
+        let (node_id, _) = node_with_role(&update, accesskit::Role::Button).unwrap();
+
+        cx.update(|window, cx| {
+            window.handle_a11y_action(
+                accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: node_id,
+                    data: None,
+                },
+                cx,
+            );
+        });
+
+        assert_eq!(explicit_clicks.get(), 1);
+        assert_eq!(ordinary_clicks.get(), 0);
+    }
+
+    #[gpui::test]
     fn a11y_window_transact_rolls_back_prepaint_state(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
         let accepted_global_id = global_id("accepted-node");
@@ -4351,6 +4496,276 @@ mod tests {
         assert!(!node_bounds.contains_key(&rejected_id));
         assert!(focus_ids.contains_key(&accepted_id));
         assert!(!focus_ids.contains_key(&rejected_id));
+    }
+
+    #[test]
+    fn write_a11y_info_maps_string_and_numeric_properties() {
+        let state = A11yState {
+            aria_label: Some("Buffer Font Size".into()),
+            aria_value: Some("15".into()),
+            aria_placeholder: Some("Search".into()),
+            aria_numeric_value: Some(15.0),
+            aria_min_numeric_value: Some(6.0),
+            aria_max_numeric_value: Some(72.0),
+            aria_numeric_value_step: Some(1.0),
+            ..Default::default()
+        };
+        let mut node = accesskit::Node::new(accesskit::Role::SpinButton);
+
+        state.write_a11y_info(&mut node);
+
+        assert_eq!(node.label(), Some("Buffer Font Size"));
+        assert_eq!(node.value(), Some("15"));
+        assert_eq!(node.placeholder(), Some("Search"));
+        assert_eq!(node.numeric_value(), Some(15.0));
+        assert_eq!(node.min_numeric_value(), Some(6.0));
+        assert_eq!(node.max_numeric_value(), Some(72.0));
+        assert_eq!(node.numeric_value_step(), Some(1.0));
+    }
+
+    #[gpui::test]
+    fn synthetic_children_are_emitted_and_can_mutate_parent(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let update = draw_accessible(
+            cx,
+            point(px(0.), px(0.)),
+            size(px(100.), px(100.)),
+            |_, _| {
+                div()
+                    .id("editor")
+                    .role(accesskit::Role::TextInput)
+                    .a11y_synthetic_children(|builder| {
+                        let child_id = builder.synthetic_node_id("run");
+                        let mut child = accesskit::Node::new(accesskit::Role::TextRun);
+                        child.set_value("hello");
+                        assert!(builder.push_child(child_id, child));
+                        builder.parent_node().set_label("Editor");
+                    })
+            },
+        );
+        let (_, parent) = node_with_role(&update, accesskit::Role::TextInput).unwrap();
+        assert_eq!(parent.label(), Some("Editor"));
+        assert_eq!(parent.children().len(), 1);
+        assert_eq!(
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == parent.children()[0])
+                .unwrap()
+                .1
+                .value(),
+            Some("hello")
+        );
+    }
+
+    #[gpui::test]
+    fn synthetic_callback_is_not_run_for_suppressed_parent(cx: &mut TestAppContext) {
+        let called = Rc::new(Cell::new(false));
+        let cx = cx.add_empty_window();
+        let update = draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
+            let called = called.clone();
+            move |_, _| {
+                div()
+                    .id("hidden-editor")
+                    .role(accesskit::Role::TextInput)
+                    .invisible()
+                    .a11y_synthetic_children(move |_| called.set(true))
+            }
+        });
+
+        assert!(!called.get());
+        assert!(node_with_role(&update, accesskit::Role::TextInput).is_none());
+    }
+
+    #[gpui::test]
+    fn aria_active_descendant_reports_focused_child(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let focus = cx.update(|_, cx| cx.focus_handle());
+        cx.update(|window, cx| window.focus(&focus, cx));
+        let update = draw_accessible(cx, point(px(0.), px(0.)), size(px(100.), px(100.)), {
+            let focus = focus.clone();
+            move |_, _| {
+                div()
+                    .id("list")
+                    .role(accesskit::Role::ListBox)
+                    .track_focus(&focus)
+                    .child(
+                        div()
+                            .id("active-item")
+                            .role(accesskit::Role::ListBoxOption)
+                            .aria_active_descendant(),
+                    )
+            }
+        });
+
+        let (active_id, _) = node_with_role(&update, accesskit::Role::ListBoxOption).unwrap();
+        assert_eq!(update.focus, active_id);
+    }
+
+    #[gpui::test]
+    fn window_reports_public_a11y_activity(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            assert!(!window.is_a11y_active());
+            window.a11y.set_active_for_test(true);
+            assert!(window.is_a11y_active());
+            window.a11y.set_active_for_test(false);
+        });
+    }
+
+    struct KeyboardActivationTest {
+        focus_a: FocusHandle,
+        focus_b: FocusHandle,
+        clicks: Rc<RefCell<Vec<&'static str>>>,
+    }
+
+    impl Render for KeyboardActivationTest {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let clicks_a = self.clicks.clone();
+            let clicks_b = self.clicks.clone();
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .id("a")
+                        .w(px(50.))
+                        .h(px(50.))
+                        .track_focus(&self.focus_a)
+                        .on_click(move |_, _, _| clicks_a.borrow_mut().push("a")),
+                )
+                .child(
+                    div()
+                        .id("b")
+                        .w(px(50.))
+                        .h(px(50.))
+                        .track_focus(&self.focus_b)
+                        .on_click(move |_, _, _| clicks_b.borrow_mut().push("b")),
+                )
+        }
+    }
+
+    fn setup_keyboard_activation_test() -> (
+        TestAppContext,
+        AnyWindowHandle,
+        Rc<RefCell<Vec<&'static str>>>,
+        FocusHandle,
+        FocusHandle,
+    ) {
+        let mut cx = TestAppContext::single();
+        let (focus_a, focus_b) = cx.update(|cx| (cx.focus_handle(), cx.focus_handle()));
+        let clicks = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let focus_a = focus_a.clone();
+            let focus_b = focus_b.clone();
+            let clicks = clicks.clone();
+            move |_, _| KeyboardActivationTest {
+                focus_a,
+                focus_b,
+                clicks,
+            }
+        });
+        (cx, window.into(), clicks, focus_a, focus_b)
+    }
+
+    fn focus_and_draw(cx: &mut TestAppContext, window: AnyWindowHandle, handle: &FocusHandle) {
+        cx.update_window(window, |_, window, cx| window.focus(handle, cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+    }
+
+    fn key_down(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
+        let keystroke = Keystroke::parse(key).unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                KeyDownEvent {
+                    keystroke,
+                    is_held: false,
+                    prefer_character_input: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .unwrap();
+    }
+
+    fn key_up(cx: &mut TestAppContext, window: AnyWindowHandle, key: &str) {
+        let keystroke = Keystroke::parse(key).unwrap();
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(KeyUpEvent { keystroke }.to_platform_input(), cx);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn keyboard_activation_fires_click_on_same_element() {
+        let (mut cx, window, clicks, focus_a, _) = setup_keyboard_activation_test();
+        focus_and_draw(&mut cx, window, &focus_a);
+        key_down(&mut cx, window, "enter");
+        key_up(&mut cx, window, "enter");
+        assert_eq!(*clicks.borrow(), vec!["a"]);
+    }
+
+    #[test]
+    fn keyboard_activation_does_not_leak_across_focus_change() {
+        let (mut cx, window, clicks, focus_a, focus_b) = setup_keyboard_activation_test();
+        focus_and_draw(&mut cx, window, &focus_a);
+        key_down(&mut cx, window, "enter");
+        focus_and_draw(&mut cx, window, &focus_b);
+        key_up(&mut cx, window, "enter");
+        assert!(clicks.borrow().is_empty());
+    }
+
+    #[test]
+    fn keyboard_activation_does_not_leak_when_focus_returns() {
+        let (mut cx, window, clicks, focus_a, focus_b) = setup_keyboard_activation_test();
+        focus_and_draw(&mut cx, window, &focus_a);
+        key_down(&mut cx, window, "enter");
+        focus_and_draw(&mut cx, window, &focus_b);
+        focus_and_draw(&mut cx, window, &focus_a);
+        key_up(&mut cx, window, "enter");
+        assert!(clicks.borrow().is_empty());
+    }
+
+    #[test]
+    fn keyboard_activation_cleared_by_intervening_key_release() {
+        let (mut cx, window, clicks, focus_a, _) = setup_keyboard_activation_test();
+        focus_and_draw(&mut cx, window, &focus_a);
+        key_down(&mut cx, window, "escape");
+        key_down(&mut cx, window, "space");
+        key_up(&mut cx, window, "escape");
+        key_up(&mut cx, window, "space");
+        assert!(clicks.borrow().is_empty());
+    }
+
+    #[test]
+    fn keyboard_activation_pairs_space_down_with_enter_up() {
+        let (mut cx, window, clicks, focus_a, _) = setup_keyboard_activation_test();
+        focus_and_draw(&mut cx, window, &focus_a);
+        key_down(&mut cx, window, "space");
+        key_up(&mut cx, window, "enter");
+        assert_eq!(*clicks.borrow(), vec!["a"]);
+    }
+
+    #[test]
+    fn keyboard_activation_cleared_by_intervening_keydown() {
+        let (mut cx, window, clicks, focus_a, _) = setup_keyboard_activation_test();
+        focus_and_draw(&mut cx, window, &focus_a);
+        key_down(&mut cx, window, "enter");
+        key_down(&mut cx, window, "a");
+        key_up(&mut cx, window, "enter");
+        assert!(clicks.borrow().is_empty());
+    }
+
+    #[test]
+    fn keyboard_activation_ignores_modified_keys() {
+        let (mut cx, window, clicks, focus_a, _) = setup_keyboard_activation_test();
+        focus_and_draw(&mut cx, window, &focus_a);
+        key_down(&mut cx, window, "cmd-enter");
+        key_up(&mut cx, window, "cmd-enter");
+        assert!(clicks.borrow().is_empty());
     }
 
     #[cfg(not(debug_assertions))]

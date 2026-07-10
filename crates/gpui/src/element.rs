@@ -32,9 +32,9 @@
 //! your own custom layout algorithm or rendering a code editor.
 
 use crate::{
-    App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId, FocusHandle,
-    InspectorElementId, LayoutId, Pixels, Point, Size, Style, Window, util::FluentBuilder,
-    window::with_element_arena,
+    A11ySubtreeBuilder, App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId,
+    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, Size, Style, Window,
+    util::FluentBuilder, window::with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -113,6 +113,14 @@ pub trait Element: 'static + IntoElement {
 
     /// Write accessibility properties to the given node.
     fn write_a11y_info(&self, _node: &mut accesskit::Node) {}
+
+    /// Add synthetic accessibility child nodes after this element has been prepainted.
+    fn a11y_synthetic_children(
+        &mut self,
+        _prepaint: &mut Self::PrepaintState,
+        _builder: &mut A11ySubtreeBuilder,
+    ) {
+    }
 
     /// Convert this element into a dynamically-typed [`AnyElement`].
     fn into_any(self) -> AnyElement {
@@ -332,7 +340,7 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let bounds = window.layout_bounds(layout_id);
-                let mut pushed_a11y_node = false;
+                let mut pushed_a11y_node = None;
                 if window.a11y.is_active() {
                     if let Some(global_id) = global_id.as_ref() {
                         if let Some(role) = self.element.a11y_role() {
@@ -346,8 +354,8 @@ impl<E: Element> Drawable<E> {
                                 y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
                             });
                             self.element.write_a11y_info(&mut node);
-                            pushed_a11y_node = window.a11y.nodes.push(node_id, node);
-                            if pushed_a11y_node {
+                            if window.a11y.nodes.push(node_id, node) {
+                                pushed_a11y_node = Some(node_id);
                                 window.a11y.node_bounds.insert(node_id, bounds);
                             }
                         }
@@ -355,7 +363,7 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let node_id = window.next_frame.dispatch_tree.push_node();
-                let prepaint = self.element.prepaint(
+                let mut prepaint = self.element.prepaint(
                     global_id.as_ref(),
                     inspector_id.as_ref(),
                     bounds,
@@ -365,7 +373,12 @@ impl<E: Element> Drawable<E> {
                 );
                 window.next_frame.dispatch_tree.pop_node();
 
-                if pushed_a11y_node {
+                if let Some(node_id) = pushed_a11y_node {
+                    if window.a11y.nodes.has_current_node(node_id) {
+                        let mut builder = A11ySubtreeBuilder::new(node_id, &mut window.a11y.nodes);
+                        self.element
+                            .a11y_synthetic_children(&mut prepaint, &mut builder);
+                    }
                     window.a11y.nodes.pop();
                 }
 
