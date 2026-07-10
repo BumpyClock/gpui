@@ -2139,6 +2139,7 @@ impl Window {
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
         self.display_id = self.platform_window.display().map(|display| display.id());
+        self.mouse_position = self.platform_window.mouse_position();
 
         self.refresh();
 
@@ -6113,6 +6114,32 @@ impl<T: Into<SharedString>> From<(ElementId, T)> for ElementId {
 impl From<&'static core::panic::Location<'static>> for ElementId {
     fn from(location: &'static core::panic::Location<'static>) -> Self {
         ElementId::CodeLocation(*location)
+    }
+}
+
+#[cfg(test)]
+mod bounds_change_tests {
+    use crate::{Empty, Modifiers, Point, TestAppContext, VisualTestContext, point, px, size};
+
+    #[gpui::test]
+    fn bounds_changed_refreshes_mouse_position_from_platform(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| Empty);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let stale_position = point(px(48.), px(32.));
+
+        cx.simulate_mouse_move(stale_position, None, Modifiers::default());
+        assert_eq!(
+            cx.update(|window, _| window.mouse_position()),
+            stale_position
+        );
+
+        cx.simulate_resize(size(px(640.), px(480.)));
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|window, _| window.mouse_position()),
+            Point::default()
+        );
     }
 }
 
