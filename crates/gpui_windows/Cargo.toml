@@ -40,6 +40,7 @@ windows = { workspace = true, features = [
     "UI_Composition",
     "UI_Composition_Desktop",
     "System",
+    "Win32_System_Power",
     "Win32_System_WinRT_Composition",
 ] }
 windows-core.workspace = true

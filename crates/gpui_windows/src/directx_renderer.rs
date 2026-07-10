@@ -54,6 +54,7 @@ pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
     pub grayscale_enhanced_contrast: f32,
     pub subpixel_enhanced_contrast: f32,
+    pub is_bgr: bool,
 }
 
 pub(crate) struct DirectXRenderer {
@@ -292,6 +293,8 @@ impl DirectXRenderer {
                 viewport_size: [resources.viewport.Width, resources.viewport.Height],
                 grayscale_enhanced_contrast: self.font_info.grayscale_enhanced_contrast,
                 subpixel_enhanced_contrast: self.font_info.subpixel_enhanced_contrast,
+                is_bgr: self.font_info.is_bgr as u32,
+                _pad: [0; 3],
             }],
         )?;
         unsafe {
@@ -1645,6 +1648,7 @@ impl DirectXRenderer {
                 gamma_ratios: gpui::get_gamma_correction_ratios(render_params.GetGamma()),
                 grayscale_enhanced_contrast: render_params.GetGrayscaleEnhancedContrast(),
                 subpixel_enhanced_contrast: render_params.GetEnhancedContrast(),
+                is_bgr: render_params.GetPixelGeometry() == DWRITE_PIXEL_GEOMETRY_BGR,
             }
         })
     }
@@ -2212,6 +2216,8 @@ struct GlobalParams {
     viewport_size: [f32; 2],
     grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
+    is_bgr: u32,
+    _pad: [u32; 3],
 }
 
 #[derive(Debug, Default)]
@@ -3344,7 +3350,12 @@ mod amd {
 
 #[cfg(test)]
 mod tests {
-    use super::rounded_backdrop_rebuild_requested;
+    use super::{GlobalParams, rounded_backdrop_rebuild_requested};
+
+    #[test]
+    fn global_params_preserve_hlsl_constant_buffer_alignment() {
+        assert_eq!(std::mem::size_of::<GlobalParams>(), 48);
+    }
 
     #[test]
     fn rounded_backdrop_rebuild_uses_retained_configuration() {
