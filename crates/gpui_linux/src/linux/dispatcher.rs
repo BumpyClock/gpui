@@ -127,9 +127,9 @@ impl PlatformDispatcher for LinuxDispatcher {
     }
 
     fn dispatch_after(&self, duration: Duration, runnable: RunnableVariant) {
-        self.timer_sender
-            .send(TimerAfter { duration, runnable })
-            .ok();
+        if let Err(err) = self.timer_sender.send(TimerAfter { duration, runnable }) {
+            std::mem::forget(err);
+        }
     }
 
     fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>) {

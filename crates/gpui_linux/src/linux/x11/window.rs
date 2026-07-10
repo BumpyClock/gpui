@@ -5,6 +5,7 @@ use crate::linux::X11ClientStatePtr;
 use crate::linux::accesskit_shims::{
     TrivialActionHandler, TrivialActivationHandler, TrivialDeactivationHandler,
 };
+use gpui::popup::PopupNotSupportedError;
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     OverlayInputMode, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
@@ -462,6 +463,10 @@ impl X11WindowState {
         supports_xinput_gestures: bool,
         is_bgr: bool,
     ) -> anyhow::Result<Self> {
+        if matches!(params.kind, WindowKind::AnchoredPopup(_)) {
+            return Err(PopupNotSupportedError.into());
+        }
+
         let x_screen_index = match params.display_id {
             Some(did) => {
                 let index = usize::try_from(u64::from(did))
@@ -1466,7 +1471,11 @@ impl PlatformWindow for X11Window {
         )
         .log_err()
         .map_or(Point::new(Pixels::ZERO, Pixels::ZERO), |reply| {
-            Point::new((reply.root_x as u32).into(), (reply.root_y as u32).into())
+            let scale_factor = self.0.state.borrow().scale_factor;
+            Point::new(
+                px(reply.win_x as f32 / scale_factor),
+                px(reply.win_y as f32 / scale_factor),
+            )
         })
     }
 
