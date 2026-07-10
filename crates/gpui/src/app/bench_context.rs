@@ -86,7 +86,15 @@ impl BenchReport {
 
     /// Creates a report that treats `frame_budget_nanos` as the per-frame budget
     /// when counting frame budget overruns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `frame_budget_nanos` is zero.
     pub fn with_frame_budget_nanos(frame_budget_nanos: u128) -> Self {
+        assert!(
+            frame_budget_nanos > 0,
+            "frame budget must be greater than zero"
+        );
         Self {
             frame_snapshot: Rc::new(RefCell::new(WindowFrameSnapshot::new())),
             frame_budget_nanos,
@@ -777,5 +785,16 @@ impl VisualContext for BenchWindowContext<'_, '_> {
         self.window.update(&mut self.cx, |_, window, cx| {
             entity.read(cx).focus_handle(cx).focus(window, cx)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "frame budget must be greater than zero")]
+    fn zero_frame_budget_is_rejected_at_construction() {
+        BenchReport::with_frame_budget_nanos(0);
     }
 }
