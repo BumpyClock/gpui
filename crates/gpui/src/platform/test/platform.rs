@@ -1,9 +1,10 @@
 use crate::{
     AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
-    DummyKeyboardMapper, ForegroundExecutor, Keymap, NoopTextSystem, Platform, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, SourceMetadata,
-    Task, TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams, size,
+    DummyKeyboardMapper, ForegroundExecutor, Keymap, NoopTextSystem, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
+    SourceMetadata, Task, TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams,
+    size,
 };
 use anyhow::Result;
 use collections::VecDeque;
@@ -87,6 +88,10 @@ struct TestPrompt {
 pub(crate) struct TestPrompts {
     multiple_choice: VecDeque<TestPrompt>,
     new_path: VecDeque<(PathBuf, oneshot::Sender<Result<Option<PathBuf>>>)>,
+    paths: VecDeque<(
+        PathPromptOptions,
+        oneshot::Sender<Result<Option<Vec<PathBuf>>>>,
+    )>,
 }
 
 impl TestPlatform {
@@ -150,6 +155,33 @@ impl TestPlatform {
             .pop_front()
             .expect("no pending new path prompt");
         tx.send(Ok(select_path(&path))).ok();
+    }
+
+    pub(crate) fn simulate_path_prompt_response(
+        &self,
+        select_paths: impl FnOnce(&PathPromptOptions) -> Option<Vec<PathBuf>>,
+    ) {
+        let (options, tx) = self
+            .prompts
+            .borrow_mut()
+            .paths
+            .pop_front()
+            .expect("no pending paths prompt");
+        let selection = select_paths(&options);
+        if let Some(paths) = &selection
+            && !options.multiple
+            && paths.len() > 1
+        {
+            panic!(
+                "selected {} paths for a prompt that does not allow multiple selection",
+                paths.len()
+            );
+        }
+        tx.send(Ok(selection)).ok();
+    }
+
+    pub(crate) fn did_prompt_for_paths(&self) -> bool {
+        !self.prompts.borrow().paths.is_empty()
     }
 
     #[track_caller]
@@ -366,9 +398,11 @@ impl Platform for TestPlatform {
 
     fn prompt_for_paths(
         &self,
-        _options: crate::PathPromptOptions,
+        options: crate::PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<std::path::PathBuf>>>> {
-        unimplemented!()
+        let (tx, rx) = oneshot::channel();
+        self.prompts.borrow_mut().paths.push_back((options, tx));
+        rx
     }
 
     fn prompt_for_new_path(
