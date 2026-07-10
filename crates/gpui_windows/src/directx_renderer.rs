@@ -715,6 +715,10 @@ impl DirectXRenderer {
     }
 
     pub(crate) fn update_transparency(&mut self, transparent: bool) {
+        if self.disable_direct_composition {
+            return;
+        }
+
         // The rounded backdrop mode already composes the swap chain with per-pixel
         // alpha through its own Windows.UI.Composition target; never create a
         // competing DirectComposition target for the same HWND.

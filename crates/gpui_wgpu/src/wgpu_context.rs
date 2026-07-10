@@ -325,7 +325,7 @@ impl WgpuContext {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("gpui_device"),
                 required_features,
-                required_limits: wgpu::Limits::default()
+                required_limits: wgpu::Limits::downlevel_defaults()
                     .using_resolution(adapter.limits())
                     .using_alignment(adapter.limits()),
                 memory_hints: wgpu::MemoryHints::MemoryUsage,

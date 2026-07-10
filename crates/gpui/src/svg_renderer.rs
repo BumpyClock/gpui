@@ -117,6 +117,13 @@ fn capped_pixmap_scale(width: f32, height: f32, mut scale: f32) -> f32 {
     scale
 }
 
+fn pixmap_dimensions(width: f32, height: f32, scale: f32) -> (u32, u32) {
+    (
+        (width * scale).max(1.) as u32,
+        (height * scale).max(1.) as u32,
+    )
+}
+
 impl SvgRenderer {
     /// Creates a new SVG renderer with the provided asset source.
     pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
@@ -258,11 +265,9 @@ impl SvgRenderer {
         }
 
         // Render the SVG to a pixmap with the specified width and height.
-        let mut pixmap = resvg::tiny_skia::Pixmap::new(
-            (svg_size.width() * scale) as u32,
-            (svg_size.height() * scale) as u32,
-        )
-        .ok_or(usvg::Error::InvalidSize)?;
+        let (width, height) = pixmap_dimensions(svg_size.width(), svg_size.height(), scale);
+        let mut pixmap =
+            resvg::tiny_skia::Pixmap::new(width, height).ok_or(usvg::Error::InvalidSize)?;
 
         let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
 
@@ -332,6 +337,15 @@ mod tests {
         assert_eq!(capped_pixmap_scale(16_384., 4_096., 1.), 0.5);
         assert_eq!(capped_pixmap_scale(4_096., 16_384., 1.), 0.5);
         assert_eq!(capped_pixmap_scale(16_384., 32_768., 1.), 0.25);
+    }
+
+    #[test]
+    fn pixmap_dimensions_preserve_extreme_aspect_ratios() {
+        let scale = capped_pixmap_scale(1_000_000., 1., 1.);
+        assert_eq!(pixmap_dimensions(1_000_000., 1., scale), (8192, 1));
+
+        let scale = capped_pixmap_scale(1., 1_000_000., 1.);
+        assert_eq!(pixmap_dimensions(1., 1_000_000., scale), (1, 8192));
     }
 
     #[test]
