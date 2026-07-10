@@ -55,6 +55,12 @@ pub unsafe fn take_startup_activation_token_from_environment() -> Option<String>
 }
 
 /// Returns the default platform implementation for the current OS.
+///
+/// This compatibility constructor reads `XDG_ACTIVATION_TOKEN` without removing it because it
+/// cannot prove that process environment mutation is safe at the call site. Applications that can
+/// capture the token during single-threaded startup should call
+/// [`take_startup_activation_token_from_environment`] and pass its result to
+/// [`current_platform_with_startup_activation_token`].
 pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
     current_platform_with_startup_activation_token(
         headless,
