@@ -76,6 +76,10 @@ impl FrameFailureStreak {
             self.count = 0;
         }
     }
+
+    fn transfer_to(&mut self, replacement: &mut Self) {
+        *replacement = std::mem::take(self);
+    }
 }
 
 #[repr(C)]
@@ -2936,6 +2940,8 @@ impl WgpuRenderer {
             Some(handles),
         )?;
         recovered.desired.is_bgr = is_bgr;
+        self.frame_failure_streak
+            .transfer_to(&mut recovered.frame_failure_streak);
         recovered.needs_redraw = true;
         *self = recovered;
         Ok(())
@@ -3025,17 +3031,28 @@ mod tests {
     fn recovery_gap_does_not_reset_consecutive_frame_failures() {
         let mut failures = FrameFailureStreak::default();
 
-        for expected in 1..=21 {
+        for expected in 1..=6 {
             assert_eq!(failures.record_error(), expected);
             if expected > 5 {
                 failures.begin_recovery();
-                failures.record_no_error();
             }
         }
 
-        assert_eq!(failures.count, 21);
-        failures.record_no_error();
+        let mut recovered_failures = FrameFailureStreak::default();
+        failures.transfer_to(&mut recovered_failures);
         assert_eq!(failures.count, 0);
+        recovered_failures.record_no_error();
+        assert_eq!(recovered_failures.count, 6);
+
+        for expected in 7..=21 {
+            assert_eq!(recovered_failures.record_error(), expected);
+            recovered_failures.begin_recovery();
+            recovered_failures.record_no_error();
+        }
+
+        assert_eq!(recovered_failures.count, 21);
+        recovered_failures.record_no_error();
+        assert_eq!(recovered_failures.count, 0);
     }
 
     #[test]
