@@ -54,7 +54,7 @@ jobs:
       - run: cargo check --locked --workspace --all-targets
       - run: cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
       - run: cargo test --locked -p scheduler
-      - run: cargo test --locked -p gpui --features test-support
+      - run: cargo test --locked -p gpui --features bench,profiler --lib
       - name: Test release-only accessibility duplicate handling
         run: cargo test --locked --release -p gpui --features test-support duplicate_id
       - run: cargo test --locked -p gpui_wgpu --lib
@@ -152,6 +152,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
+          toolchain: nightly
           components: rust-src
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
