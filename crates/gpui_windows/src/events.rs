@@ -1720,39 +1720,32 @@ fn notify_frame_changed(handle: HWND) {
 mod tests {
     use super::*;
 
+    const CAPTION: isize = HTCAPTION as isize;
+    const CLOSE: isize = HTCLOSE as isize;
+    const MAX_BUTTON: isize = HTMAXBUTTON as isize;
+    const MIN_BUTTON: isize = HTMINBUTTON as isize;
+    const NOWHERE: isize = HTNOWHERE as isize;
+
     #[test]
     fn window_control_hit_targets_respect_window_capabilities() {
-        assert_eq!(
-            window_control_hit_target(WindowControlArea::Drag, false, true, true),
-            None
-        );
-        assert_eq!(
-            window_control_hit_target(WindowControlArea::Close, false, false, false),
-            Some(HTCLOSE as _)
-        );
-        assert_eq!(
-            window_control_hit_target(WindowControlArea::Max, true, false, true),
-            Some(HTCAPTION as _)
-        );
-        assert_eq!(
-            window_control_hit_target(WindowControlArea::Max, false, false, true),
-            Some(HTNOWHERE as _)
-        );
-        assert_eq!(
-            window_control_hit_target(WindowControlArea::Min, true, true, false),
-            Some(HTCAPTION as _)
-        );
-        assert_eq!(
-            window_control_hit_target(WindowControlArea::Min, false, true, false),
-            Some(HTNOWHERE as _)
-        );
-        assert_eq!(
-            window_control_hit_target(WindowControlArea::Max, false, true, false),
-            Some(HTMAXBUTTON as _)
-        );
-        assert_eq!(
-            window_control_hit_target(WindowControlArea::Min, false, false, true),
-            Some(HTMINBUTTON as _)
-        );
+        use WindowControlArea::{Close, Drag, Max, Min};
+
+        let cases: &[(WindowControlArea, bool, bool, bool, Option<isize>)] = &[
+            (Drag, false, true, true, None),
+            (Close, false, false, false, Some(CLOSE)),
+            (Max, true, false, true, Some(CAPTION)),
+            (Max, false, false, true, Some(NOWHERE)),
+            (Min, true, true, false, Some(CAPTION)),
+            (Min, false, true, false, Some(NOWHERE)),
+            (Max, false, true, false, Some(MAX_BUTTON)),
+            (Min, false, false, true, Some(MIN_BUTTON)),
+        ];
+
+        for &(area, movable, resizable, minimizable, expected) in cases {
+            assert!(
+                window_control_hit_target(area, movable, resizable, minimizable) == expected,
+                "window control hit target did not match its capabilities"
+            );
+        }
     }
 }
