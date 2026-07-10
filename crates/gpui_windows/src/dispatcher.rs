@@ -1,7 +1,7 @@
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     thread::{ThreadId, current},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -23,8 +23,7 @@ use windows::{
 
 use crate::{HWND, SafeHwnd, WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD};
 use gpui::{
-    GLOBAL_THREAD_TIMINGS, PlatformDispatcher, Priority, PriorityQueueSender, RunnableVariant,
-    THREAD_TIMINGS, TaskTiming, ThreadTaskTimings, TimerResolutionGuard,
+    PlatformDispatcher, Priority, PriorityQueueSender, RunnableVariant, TimerResolutionGuard,
 };
 
 pub(crate) struct WindowsDispatcher {
@@ -80,53 +79,15 @@ impl WindowsDispatcher {
 
     #[inline(always)]
     pub(crate) fn execute_runnable(runnable: RunnableVariant) {
-        let start = Instant::now();
-
         let location = runnable.metadata().location;
-        let mut timing = TaskTiming {
-            location,
-            start,
-            end: None,
-        };
-        gpui::profiler::add_task_timing(timing);
-
+        let spawned = runnable.metadata().spawned;
+        gpui::profiler::update_running_task(spawned, location);
         runnable.run();
-
-        let end = Instant::now();
-        timing.end = Some(end);
-
-        gpui::profiler::add_task_timing(timing);
+        gpui::profiler::save_task_timing();
     }
 }
 
 impl PlatformDispatcher for WindowsDispatcher {
-    fn get_all_timings(&self) -> Vec<ThreadTaskTimings> {
-        let global_thread_timings = GLOBAL_THREAD_TIMINGS.lock();
-        ThreadTaskTimings::convert(&global_thread_timings)
-    }
-
-    fn get_current_thread_timings(&self) -> gpui::ThreadTaskTimings {
-        THREAD_TIMINGS.with(|timings| {
-            let timings = timings.lock();
-            let thread_name = timings.thread_name.clone();
-            let total_pushed = timings.total_pushed;
-            let timings = &timings.timings;
-
-            let mut vec = Vec::with_capacity(timings.len());
-
-            let (s1, s2) = timings.as_slices();
-            vec.extend_from_slice(s1);
-            vec.extend_from_slice(s2);
-
-            gpui::ThreadTaskTimings {
-                thread_name,
-                thread_id: std::thread::current().id(),
-                timings: vec,
-                total_pushed,
-            }
-        })
-    }
-
     fn is_main_thread(&self) -> bool {
         current().id() == self.main_thread_id
     }

@@ -639,12 +639,24 @@ pub type RunnableVariant = Runnable<RunnableMeta>;
 #[doc(hidden)]
 pub type TimerResolutionGuard = util::Deferred<Box<dyn FnOnce() + Send>>;
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TasksIncluded {
+    OnlyCompleted,
+    CompletedAndRunning,
+}
+
 /// This type is public so that our test macro can generate and use it, but it should not
 /// be considered part of our public API.
 #[doc(hidden)]
 pub trait PlatformDispatcher: Send + Sync {
-    fn get_all_timings(&self) -> Vec<ThreadTaskTimings>;
-    fn get_current_thread_timings(&self) -> ThreadTaskTimings;
+    fn get_all_timings(&self) -> Vec<ThreadTaskTimings> {
+        crate::profiler::get_all_timings(TasksIncluded::OnlyCompleted)
+    }
+
+    fn get_current_thread_timings(&self) -> ThreadTaskTimings {
+        crate::profiler::get_current_thread_timings(TasksIncluded::OnlyCompleted)
+    }
     fn is_main_thread(&self) -> bool;
     fn dispatch(&self, runnable: RunnableVariant, priority: Priority);
     fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority);

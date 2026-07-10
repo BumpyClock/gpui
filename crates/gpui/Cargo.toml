@@ -31,6 +31,7 @@ wayland = ["bitflags"]
 x11 = ["scap?/x11"]
 screen-capture = ["scap"]
 windows-manifest = ["dep:embed-resource"]
+profiler = []
 
 [lib]
 path = "src/gpui.rs"
@@ -53,6 +54,7 @@ futures-concurrency.workspace = true
 gpui_macros.workspace = true
 gpui_shared_string.workspace = true
 gpui_util.workspace = true
+heapless.workspace = true
 http_client.workspace = true
 image.workspace = true
 inventory.workspace = true
