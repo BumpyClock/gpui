@@ -231,6 +231,14 @@ path = "examples/grid_layout.rs"
 name = "mouse_pressure"
 path = "examples/mouse_pressure.rs"
 
+[[example]]
+name = "a11y"
+path = "examples/a11y.rs"
+
+[[example]]
+name = "view_example"
+path = "examples/view_example/view_example_main.rs"
+
 [[bench]]
 name = "scene_construction"
 harness = false
