@@ -1157,17 +1157,49 @@ impl PlatformInputHandler {
         self.handler.replace_text_in_range(None, input, window, cx);
     }
 
-    pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
-        let selection = self.handler.selected_text_range(true, window, cx)?;
-        self.handler.bounds_for_range(
-            if selection.reversed {
-                selection.range.start..selection.range.start
+    pub fn compute_ime_candidate_bounds(
+        marked_range: Option<Range<usize>>,
+        selection: &UTF16Selection,
+        mut bounds_for_range: impl FnMut(Range<usize>) -> Option<Bounds<Pixels>>,
+    ) -> Option<Bounds<Pixels>> {
+        if let Some(marked_range) = marked_range {
+            let mut line_start = marked_range.start;
+            let caret = selection.range.end;
+            if let Some(caret_bounds) = bounds_for_range(caret..caret) {
+                for index in (marked_range.start..caret).rev() {
+                    if let Some(bounds) = bounds_for_range(index..index)
+                        && (bounds.origin.y - caret_bounds.origin.y).abs() > px(0.1)
+                    {
+                        line_start = index + 1;
+                        break;
+                    }
+                }
+            }
+            bounds_for_range(line_start..line_start)
+        } else {
+            let offset = if selection.reversed {
+                selection.range.start
             } else {
-                selection.range.end..selection.range.end
-            },
-            window,
-            cx,
-        )
+                selection.range.end
+            };
+            bounds_for_range(offset..offset)
+        }
+    }
+
+    pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
+        let marked_range = self.handler.marked_text_range(window, cx);
+        let selection = self.handler.selected_text_range(true, window, cx)?;
+        Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
+            self.handler.bounds_for_range(range, window, cx)
+        })
+    }
+
+    pub fn ime_candidate_bounds(&mut self) -> Option<Bounds<Pixels>> {
+        let marked_range = self.marked_text_range();
+        let selection = self.selected_text_range(true)?;
+        Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
+            self.bounds_for_range(range)
+        })
     }
 
     #[allow(unused)]
@@ -1481,6 +1513,8 @@ pub struct WindowParams {
 
     #[cfg_attr(feature = "wayland", allow(dead_code))]
     pub display_id: Option<DisplayId>,
+
+    pub app_id: Option<String>,
 
     pub window_min_size: Option<Size<Pixels>>,
     #[cfg(target_os = "macos")]
@@ -2334,5 +2368,44 @@ mod tests {
 
         assert!(matches!(kind, WindowKind::AnchoredPopup(_)));
         assert_ne!(kind, WindowKind::PopUp);
+    }
+
+    #[test]
+    fn ime_candidate_bounds_use_the_caret_end_without_composition() {
+        let selection = UTF16Selection {
+            range: 3..7,
+            reversed: false,
+        };
+
+        let bounds =
+            PlatformInputHandler::compute_ime_candidate_bounds(None, &selection, |range| {
+                Some(Bounds::new(
+                    point(px(range.start as f32), px(0.)),
+                    size(px(1.), px(1.)),
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(bounds.origin.x, px(7.));
+    }
+
+    #[test]
+    fn ime_candidate_bounds_use_the_current_composition_line() {
+        let selection = UTF16Selection {
+            range: 2..8,
+            reversed: false,
+        };
+
+        let bounds =
+            PlatformInputHandler::compute_ime_candidate_bounds(Some(2..8), &selection, |range| {
+                let y = if range.start < 5 { px(0.) } else { px(20.) };
+                Some(Bounds::new(
+                    point(px(range.start as f32), y),
+                    size(px(1.), px(1.)),
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(bounds.origin, point(px(5.), px(20.)));
     }
 }

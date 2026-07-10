@@ -1245,6 +1245,7 @@ impl Window {
                 focus,
                 show,
                 display_id,
+                app_id: app_id.clone(),
                 window_min_size,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
