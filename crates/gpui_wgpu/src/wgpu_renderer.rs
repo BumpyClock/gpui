@@ -1384,10 +1384,11 @@ impl WgpuRenderer {
         }
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    /// Draws a frame and returns whether a surface buffer was presented.
+    pub fn draw(&mut self, scene: &Scene) -> bool {
         if self.resources.is_none() {
             self.needs_redraw = true;
-            return;
+            return false;
         }
         let last_error = self.last_error.lock().unwrap().take();
         if let Some(error) = last_error {
@@ -1406,7 +1407,7 @@ impl WgpuRenderer {
                 self.atlas.clear();
                 self.needs_redraw = true;
                 self.failed_frame_count = 0;
-                return;
+                return false;
             }
         } else {
             self.failed_frame_count = 0;
@@ -1430,19 +1431,19 @@ impl WgpuRenderer {
                 // Textures must be destroyed before the surface can be reconfigured.
                 drop(frame);
                 self.surface.configure(&self.device, &self.surface_config);
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.surface_config);
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 *self.last_error.lock().unwrap() =
                     Some("Surface texture validation error".to_string());
-                return;
+                return false;
             }
         };
 
@@ -1551,11 +1552,12 @@ impl WgpuRenderer {
                     self.instance_buffer_capacity
                 );
                 frame.present();
-                return;
+                return true;
             }
 
             frame.present();
         }
+        true
     }
 
     fn prepare_retained_layers(&mut self, scene: &Scene) -> Vec<PreparedRetainedLayer> {
