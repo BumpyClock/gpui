@@ -22,6 +22,17 @@ pub type PathVertex_ScaledPixels = PathVertex<ScaledPixels>;
 #[expect(missing_docs)]
 pub type DrawOrder = u32;
 
+/// A boolean stored as an initialized `u32` for padding-free GPU buffer layouts.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct PaddedBool32(u32);
+
+impl From<bool> for PaddedBool32 {
+    fn from(value: bool) -> Self {
+        Self(value as u32)
+    }
+}
+
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
@@ -654,7 +665,7 @@ pub struct Underline {
     pub content_mask: ContentMask<ScaledPixels>,
     pub color: Hsla,
     pub thickness: ScaledPixels,
-    pub wavy: u32,
+    pub wavy: PaddedBool32,
 }
 
 impl From<Underline> for Primitive {
@@ -907,7 +918,7 @@ impl From<SubpixelSprite> for Primitive {
 pub struct PolychromeSprite {
     pub order: DrawOrder,
     pub pad: u32,
-    pub grayscale: bool,
+    pub grayscale: PaddedBool32,
     pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
@@ -1154,6 +1165,39 @@ mod tests {
         assert_eq!(offset_of!(BackdropBlur, source_origin_x), 60);
         assert_eq!(offset_of!(BackdropBlur, source_height), 72);
         assert_eq!(offset_of!(BackdropBlur, pad2), 76);
+    }
+
+    #[test]
+    fn padded_bool32_has_initialized_u32_representation() {
+        assert_eq!(size_of::<PaddedBool32>(), size_of::<u32>());
+        assert_eq!(align_of::<PaddedBool32>(), align_of::<u32>());
+        assert_eq!(PaddedBool32::from(false).0, 0);
+        assert_eq!(PaddedBool32::from(true).0, 1);
+    }
+
+    #[test]
+    fn underline_gpu_layout_matches_shader_storage_contract() {
+        assert_eq!(align_of::<Underline>(), 4);
+        assert_eq!(size_of::<Underline>(), 64);
+        assert_eq!(offset_of!(Underline, order), 0);
+        assert_eq!(offset_of!(Underline, bounds), 8);
+        assert_eq!(offset_of!(Underline, content_mask), 24);
+        assert_eq!(offset_of!(Underline, color), 40);
+        assert_eq!(offset_of!(Underline, thickness), 56);
+        assert_eq!(offset_of!(Underline, wavy), 60);
+    }
+
+    #[test]
+    fn polychrome_sprite_gpu_layout_matches_shader_storage_contract() {
+        assert_eq!(align_of::<PolychromeSprite>(), 4);
+        assert_eq!(size_of::<PolychromeSprite>(), 96);
+        assert_eq!(offset_of!(PolychromeSprite, order), 0);
+        assert_eq!(offset_of!(PolychromeSprite, grayscale), 8);
+        assert_eq!(offset_of!(PolychromeSprite, opacity), 12);
+        assert_eq!(offset_of!(PolychromeSprite, bounds), 16);
+        assert_eq!(offset_of!(PolychromeSprite, content_mask), 32);
+        assert_eq!(offset_of!(PolychromeSprite, corner_radii), 48);
+        assert_eq!(offset_of!(PolychromeSprite, tile), 64);
     }
 
     #[test]

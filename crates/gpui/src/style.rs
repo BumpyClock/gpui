@@ -9,7 +9,7 @@ use crate::{
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
     FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
     PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, quad, rems, size,
+    point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -360,6 +360,39 @@ pub struct BoxShadow {
     /// Whether this is an inset shadow (drawn inside the element's bounds).
     #[serde(default)]
     pub inset: bool,
+}
+
+impl BoxShadow {
+    /// Creates a new [`BoxShadow`] with the given offset and color, matching the order
+    /// of the CSS `box-shadow` property. Use the builder methods to set blur radius,
+    /// spread radius, and inset.
+    pub fn new(offset_x: Pixels, offset_y: Pixels, color: Hsla) -> Self {
+        Self {
+            color,
+            offset: point(offset_x, offset_y),
+            blur_radius: px(0.),
+            spread_radius: px(0.),
+            inset: false,
+        }
+    }
+
+    /// Sets the shadow blur radius.
+    pub fn blur_radius(mut self, blur_radius: Pixels) -> Self {
+        self.blur_radius = blur_radius;
+        self
+    }
+
+    /// Sets the shadow spread radius.
+    pub fn spread_radius(mut self, spread_radius: Pixels) -> Self {
+        self.spread_radius = spread_radius;
+        self
+    }
+
+    /// Marks the shadow as inset (drawn inside the element's bounds).
+    pub fn inset(mut self) -> Self {
+        self.inset = true;
+        self
+    }
 }
 
 /// How to handle whitespace in text
@@ -1304,6 +1337,26 @@ mod tests {
     use crate::{blue, green, px, red, yellow};
 
     use super::*;
+
+    #[test]
+    fn box_shadow_builder_sets_css_ordered_fields_and_defaults() {
+        let color = red();
+        let shadow = BoxShadow::new(px(1.), px(2.), color)
+            .blur_radius(px(3.))
+            .spread_radius(px(4.))
+            .inset();
+
+        assert_eq!(shadow.offset, point(px(1.), px(2.)));
+        assert_eq!(shadow.color, color);
+        assert_eq!(shadow.blur_radius, px(3.));
+        assert_eq!(shadow.spread_radius, px(4.));
+        assert!(shadow.inset);
+
+        let defaults = BoxShadow::new(px(5.), px(6.), color);
+        assert_eq!(defaults.blur_radius, px(0.));
+        assert_eq!(defaults.spread_radius, px(0.));
+        assert!(!defaults.inset);
+    }
 
     use util_macros::perf;
 

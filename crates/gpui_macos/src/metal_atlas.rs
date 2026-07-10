@@ -59,9 +59,10 @@ impl PlatformAtlas for MetalAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
-        let Some(id) = lock.tiles_by_key.remove(key).map(|v| v.texture_id) else {
+        let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
+        let id = tile.texture_id;
 
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
@@ -78,6 +79,7 @@ impl PlatformAtlas for MetalAtlas {
         };
 
         if let Some(mut texture) = texture_slot.take() {
+            texture.allocator.deallocate(tile.tile_id.into());
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
                 textures.free_list.push(id.index as usize);
@@ -260,3 +262,46 @@ fn point_from_etagere(value: etagere::Point) -> Point<DevicePixels> {
 struct AssertSend<T>(T);
 
 unsafe impl<T> Send for AssertSend<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{ImageId, RenderImageParams, size};
+
+    fn create_atlas() -> Option<MetalAtlas> {
+        Some(MetalAtlas::new(metal::Device::system_default()?))
+    }
+
+    fn insert_tile(atlas: &MetalAtlas, image_id: usize, size: Size<DevicePixels>) -> AtlasTile {
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(image_id),
+            frame_index: 0,
+        });
+        atlas
+            .get_or_insert_with(&key, &mut || {
+                let byte_count = size.width.0 as usize * size.height.0 as usize * 4;
+                Ok(Some((size, Cow::Owned(vec![0; byte_count]))))
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn remove_deallocates_tile_space_for_reuse() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+        let small = size(DevicePixels(64), DevicePixels(64));
+        let big = size(DevicePixels(700), DevicePixels(700));
+        let keeper = insert_tile(&atlas, 1, small);
+        let removed = insert_tile(&atlas, 2, big);
+        assert_eq!(keeper.texture_id, removed.texture_id);
+
+        atlas.remove(&AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(2),
+            frame_index: 0,
+        }));
+        let replacement = insert_tile(&atlas, 3, big);
+        assert_eq!(replacement.texture_id, keeper.texture_id);
+    }
+}

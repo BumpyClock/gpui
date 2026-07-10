@@ -121,15 +121,17 @@ impl PlatformAtlas for WgpuAtlas {
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
 
-        let Some(id) = lock.tiles_by_key.remove(key).map(|tile| tile.texture_id) else {
+        let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
+        let id = tile.texture_id;
 
         let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize) else {
             return;
         };
 
         if let Some(mut texture) = texture_slot.take() {
+            texture.allocator.deallocate(tile.tile_id.into());
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
                 lock.pending_uploads
@@ -365,7 +367,39 @@ impl WgpuAtlasTexture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::size;
+    use gpui::{ImageId, RenderImageParams, block_on, size};
+
+    fn test_device_and_queue() -> anyhow::Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
+        block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                flags: wgpu::InstanceFlags::default(),
+                backend_options: wgpu::BackendOptions::default(),
+                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                display: None,
+            });
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await?;
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("wgpu_atlas_test_device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_defaults()
+                        .using_resolution(adapter.limits())
+                        .using_alignment(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::Off,
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                })
+                .await?;
+            Ok((Arc::new(device), Arc::new(queue)))
+        })
+    }
 
     #[test]
     fn atlas_texture_size_never_exceeds_max_texture_size() {
@@ -381,5 +415,37 @@ mod tests {
 
         assert_eq!(size.width, DevicePixels(1024));
         assert_eq!(size.height, DevicePixels(1024));
+    }
+
+    #[test]
+    fn remove_deallocates_tile_space_for_reuse() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::new(device, queue);
+        let insert = |image_id, size: Size<DevicePixels>| {
+            let key = AtlasKey::Image(RenderImageParams {
+                image_id: ImageId(image_id),
+                frame_index: 0,
+            });
+            let byte_count = size.width.0 as usize * size.height.0 as usize * 4;
+            atlas
+                .get_or_insert_with(&key, &mut || {
+                    Ok(Some((size, Cow::Owned(vec![0; byte_count]))))
+                })
+                .unwrap()
+                .unwrap()
+        };
+        let small = size(DevicePixels(64), DevicePixels(64));
+        let big = size(DevicePixels(700), DevicePixels(700));
+        let keeper = insert(1, small);
+        let removed = insert(2, big);
+        assert_eq!(keeper.texture_id, removed.texture_id);
+
+        atlas.remove(&AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(2),
+            frame_index: 0,
+        }));
+        let replacement = insert(3, big);
+        assert_eq!(replacement.texture_id, keeper.texture_id);
+        Ok(())
     }
 }
