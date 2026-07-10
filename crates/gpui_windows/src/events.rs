@@ -1718,7 +1718,11 @@ fn notify_frame_changed(handle: HWND) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::window_control_hit_target;
+    use gpui::WindowControlArea;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HTCAPTION, HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTNOWHERE,
+    };
 
     const CAPTION: isize = HTCAPTION as isize;
     const CLOSE: isize = HTCLOSE as isize;

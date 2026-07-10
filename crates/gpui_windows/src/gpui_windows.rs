@@ -1,5 +1,4 @@
 #![cfg(target_os = "windows")]
-#![cfg_attr(test, recursion_limit = "256")]
 
 mod clipboard;
 mod destination_list;
