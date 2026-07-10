@@ -56,7 +56,7 @@ jobs:
       - run: cargo test --locked -p scheduler
       - run: cargo test --locked -p gpui --features test-support
       - name: Test release-only accessibility duplicate handling
-        run: cargo test --locked --release -p gpui --features test-support a11y_duplicate_id
+        run: cargo test --locked --release -p gpui --features test-support duplicate_id
       - run: cargo test --locked -p gpui_wgpu --lib
       - run: cargo check --locked -p gpui --examples
       - run: cargo check --locked -p gpui --features bench --benches
