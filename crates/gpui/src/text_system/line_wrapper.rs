@@ -302,7 +302,13 @@ impl LineWrapper {
         }
 
         if truncate_from == TruncateFrom::Middle {
-            return self.truncate_line(text, wrap_width, truncation_affix, runs, truncate_from);
+            return self.truncate_wrapped_line_middle(
+                text,
+                wrap_width,
+                max_lines,
+                truncation_affix,
+                runs,
+            );
         }
 
         if max_lines <= 1 {
@@ -441,6 +447,61 @@ impl LineWrapper {
         }
 
         (text, Cow::Borrowed(runs))
+    }
+
+    fn truncate_wrapped_line_middle<'a>(
+        &mut self,
+        text: SharedString,
+        wrap_width: Pixels,
+        max_lines: usize,
+        truncation_affix: &str,
+        runs: &'a [TextRun],
+    ) -> (SharedString, Cow<'a, [TextRun]>) {
+        if self.wrapped_line_count(&text, wrap_width) <= max_lines {
+            return (text, Cow::Borrowed(runs));
+        }
+
+        let mut boundaries = Vec::with_capacity(text.chars().count() + 1);
+        boundaries.push(0);
+        boundaries.extend(text.char_indices().map(|(ix, c)| ix + c.len_utf8()));
+        let character_count = boundaries.len() - 1;
+
+        let candidate = |retained_characters: usize| {
+            let front_characters = retained_characters.saturating_mul(2).div_ceil(3);
+            let back_characters = retained_characters - front_characters;
+            let front_end_ix = boundaries[front_characters];
+            let back_start_ix = boundaries[character_count - back_characters];
+            let result = SharedString::from(format!(
+                "{}{truncation_affix}{}",
+                &text[..front_end_ix],
+                &text[back_start_ix..]
+            ));
+            (result, front_end_ix, back_start_ix)
+        };
+
+        // The line-count check keeps hard newlines and word wrapping authoritative;
+        // multiplying the one-line width by `max_lines` does not model either.
+        let mut low = 0;
+        let mut high = character_count.saturating_sub(1);
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            let (result, _, _) = candidate(mid);
+            if self.wrapped_line_count(&result, wrap_width) <= max_lines {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        let (result, front_end_ix, back_start_ix) = candidate(low);
+        let mut runs = runs.to_vec();
+        update_runs_after_middle_truncation(
+            truncation_affix,
+            &mut runs,
+            front_end_ix,
+            back_start_ix,
+        );
+        (result, Cow::Owned(runs))
     }
 
     fn truncate_single_wrapped_line<'a>(
@@ -857,6 +918,7 @@ fn update_runs_after_middle_truncation(
         byte_pos = run_end;
     }
 
+    result_runs.retain(|run| run.len > 0);
     *runs = result_runs;
 }
 
@@ -1614,6 +1676,46 @@ mod tests {
         assert_eq!(
             result_runs.iter().map(|run| run.len).sum::<usize>(),
             result.len()
+        );
+    }
+
+    #[test]
+    fn test_wrapped_middle_truncation_respects_max_lines() {
+        let mut wrapper = build_wrapper();
+        let text = "beginning alpha beta gamma\nmiddle delta epsilon zeta\nending eta theta omega";
+        let wrap_width = px(72.);
+        let max_lines = 2;
+        let runs = generate_test_runs(&[10, 15, text.len() - 25]);
+
+        let (result, result_runs) = wrapper.truncate_wrapped_line(
+            text.into(),
+            wrap_width,
+            max_lines,
+            "…",
+            &runs,
+            TruncateFrom::Middle,
+        );
+
+        assert_eq!(result.chars().next(), text.chars().next());
+        assert_eq!(result.chars().last(), text.chars().last());
+        assert!(result.contains('…'));
+        assert!(wrapped_line_count(&mut wrapper, &result, wrap_width) <= max_lines);
+        assert_eq!(
+            result_runs.iter().map(|run| run.len).sum::<usize>(),
+            result.len()
+        );
+        assert!(result_runs.iter().all(|run| run.len > 0));
+    }
+
+    #[test]
+    fn test_middle_truncation_drops_empty_boundary_runs() {
+        let mut runs = generate_test_runs(&[4, 4, 4]);
+
+        update_runs_after_middle_truncation("", &mut runs, 4, 8);
+
+        assert_eq!(
+            runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![4, 4]
         );
     }
 
