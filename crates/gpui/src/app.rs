@@ -147,8 +147,7 @@ impl ApplicationHandle {
     ///
     /// This must not be called re-entrantly from code that is already inside an update.
     pub fn update<R>(&self, f: impl FnOnce(&mut App) -> R) -> R {
-        let cx = &mut *self.app.borrow_mut();
-        f(cx)
+        self.app.borrow_mut().update(f)
     }
 
     /// Return an async-friendly weak handle to the application.
@@ -2843,6 +2842,20 @@ mod test {
         let async_app = handle.to_async();
         async_app.update(|cx| cx.global_mut::<EmbeddedState>().0 += 1);
         assert_eq!(handle.update(|cx| cx.global::<EmbeddedState>().0), 3);
+    }
+
+    #[test]
+    fn embedded_application_update_flushes_effects_before_returning() {
+        let (application, _) = test_application();
+        let handle = application.run_embedded(|_| {});
+        let deferred = Rc::new(Cell::new(false));
+
+        handle.update({
+            let deferred = deferred.clone();
+            move |cx| cx.defer(move |_| deferred.set(true))
+        });
+
+        assert!(deferred.get());
     }
 
     #[test]
