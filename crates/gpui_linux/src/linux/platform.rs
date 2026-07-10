@@ -86,6 +86,21 @@ pub(crate) trait LinuxClient {
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>>;
     fn run(&self);
 
+    fn handle_system_wake(&self) {
+        let Some(mut callback) = self.with_common(|common| common.callbacks.system_wake.take())
+        else {
+            return;
+        };
+
+        callback();
+
+        self.with_common(|common| {
+            if common.callbacks.system_wake.is_none() {
+                common.callbacks.system_wake = Some(callback);
+            }
+        });
+    }
+
     #[cfg(any(feature = "wayland", feature = "x11"))]
     fn window_identifier(
         &self,
@@ -176,13 +191,6 @@ impl LinuxCommon {
         })
         .detach();
         self.wake_listener_started = true;
-    }
-
-    pub(crate) fn handle_system_wake(&mut self) {
-        if let Some(mut callback) = self.callbacks.system_wake.take() {
-            callback();
-            self.callbacks.system_wake = Some(callback);
-        }
     }
 }
 
@@ -809,9 +817,21 @@ pub(super) fn get_xkb_compose_state(cx: &xkb::Context) -> Option<xkb::compose::S
 pub(super) const PIPE_READ_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[cfg(feature = "wayland")]
+const MAX_PIPE_READ_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(feature = "wayland")]
 pub(super) fn read_fd_with_timeout(
+    fd: filedescriptor::FileDescriptor,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    read_fd_with_timeout_and_limit(fd, timeout, MAX_PIPE_READ_BYTES)
+}
+
+#[cfg(feature = "wayland")]
+fn read_fd_with_timeout_and_limit(
     mut fd: filedescriptor::FileDescriptor,
     timeout: Duration,
+    max_bytes: usize,
 ) -> Result<Vec<u8>> {
     fd.set_non_blocking(true)?;
     let mut buffer = Vec::new();
@@ -836,7 +856,12 @@ pub(super) fn read_fd_with_timeout(
         }
         match fd.read(&mut chunk) {
             Ok(0) => return Ok(buffer),
-            Ok(len) => buffer.extend_from_slice(&chunk[..len]),
+            Ok(len) => {
+                if buffer.len().saturating_add(len) > max_bytes {
+                    anyhow::bail!("pipe payload exceeds {max_bytes} byte limit");
+                }
+                buffer.extend_from_slice(&chunk[..len]);
+            }
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::Interrupted => {}
@@ -1200,6 +1225,7 @@ pub(super) fn compositor_gpu_hint_from_dev_t(dev: u64) -> Option<gpui_wgpu::Comp
 mod tests {
     #[cfg(any(feature = "wayland", feature = "x11"))]
     use super::*;
+    use crate::linux::HeadlessClient;
     #[cfg(any(feature = "wayland", feature = "x11"))]
     use gpui::{Point, px};
 
@@ -1220,6 +1246,21 @@ mod tests {
             zero,
             Point::new(px(5.0), px(5.1))
         ),);
+    }
+
+    #[test]
+    fn system_wake_callback_can_reenter_client_state() {
+        let client = HeadlessClient::new();
+        let callback_client = client.clone();
+        client.with_common(|common| {
+            common.callbacks.system_wake = Some(Box::new(move || {
+                callback_client.with_common(|common| common.auto_hide_scrollbars = true);
+            }));
+        });
+
+        client.handle_system_wake();
+
+        assert!(client.with_common(|common| common.auto_hide_scrollbars));
     }
 
     #[cfg(feature = "wayland")]
@@ -1245,5 +1286,18 @@ mod tests {
 
         let error = read_fd_with_timeout(pipe.read, Duration::from_millis(20)).unwrap_err();
         assert!(error.to_string().contains("timed out"));
+    }
+
+    #[cfg(feature = "wayland")]
+    #[test]
+    fn read_fd_with_timeout_rejects_oversized_payload() {
+        use std::io::Write as _;
+
+        let mut pipe = filedescriptor::Pipe::new().unwrap();
+        pipe.write.write_all(b"too-large").unwrap();
+        drop(pipe.write);
+
+        let error = read_fd_with_timeout_and_limit(pipe.read, PIPE_READ_TIMEOUT, 4).unwrap_err();
+        assert!(error.to_string().contains("exceeds 4 byte limit"));
     }
 }

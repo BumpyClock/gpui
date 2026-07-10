@@ -27,10 +27,54 @@ pub(crate) use x11::*;
 
 use std::rc::Rc;
 
+const XDG_ACTIVATION_TOKEN_ENV_VAR: &str = "XDG_ACTIVATION_TOKEN";
+
+fn startup_activation_token_from_environment() -> Option<String> {
+    std::env::var(XDG_ACTIVATION_TOKEN_ENV_VAR)
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
+/// Removes and returns the Wayland startup activation token from the process environment.
+///
+/// Pass the result to [`current_platform_with_startup_activation_token`] so the first Wayland
+/// window can consume it without mutating the environment during platform construction.
+///
+/// # Safety
+///
+/// The caller must ensure that no other thread can read or write the process environment and that
+/// no other thread can spawn a child process for the duration of this call. This normally means
+/// calling it during single-threaded process startup, before initializing worker threads or an
+/// embedded host runtime.
+pub unsafe fn take_startup_activation_token_from_environment() -> Option<String> {
+    let token = startup_activation_token_from_environment();
+    // SAFETY: The function's contract requires the caller to exclude concurrent environment access
+    // and child-process creation for the duration of this call.
+    unsafe { std::env::remove_var(XDG_ACTIVATION_TOKEN_ENV_VAR) };
+    token
+}
+
 /// Returns the default platform implementation for the current OS.
 pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
+    current_platform_with_startup_activation_token(
+        headless,
+        startup_activation_token_from_environment(),
+    )
+}
+
+/// Returns the default platform implementation with an explicitly captured Wayland startup token.
+///
+/// Passing the token explicitly lets embedders remove it at a startup boundary where process
+/// environment mutation is known to be safe. On non-Wayland backends the token is ignored.
+pub fn current_platform_with_startup_activation_token(
+    headless: bool,
+    startup_activation_token: Option<String>,
+) -> Rc<dyn gpui::Platform> {
     #[cfg(feature = "x11")]
     use anyhow::Context as _;
+
+    #[cfg(not(feature = "wayland"))]
+    let _ = startup_activation_token;
 
     if headless {
         return Rc::new(LinuxPlatform {
@@ -41,7 +85,7 @@ pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
     match gpui::guess_compositor() {
         #[cfg(feature = "wayland")]
         "Wayland" => Rc::new(LinuxPlatform {
-            inner: WaylandClient::new(),
+            inner: WaylandClient::new(startup_activation_token),
         }),
 
         #[cfg(feature = "x11")]

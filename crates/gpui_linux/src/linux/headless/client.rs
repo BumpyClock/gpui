@@ -40,7 +40,7 @@ impl HeadlessClient {
         handle
             .insert_source(wake_receiver, |event, _, client: &mut HeadlessClient| {
                 if let calloop::channel::Event::Msg(()) = event {
-                    client.with_common(LinuxCommon::handle_system_wake);
+                    client.handle_system_wake();
                 }
             })
             .ok();

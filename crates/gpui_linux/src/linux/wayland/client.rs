@@ -107,18 +107,6 @@ use gpui_wgpu::{CompositorGpuHint, GpuContext};
 const MIN_KEYCODE: u32 = 8;
 
 const UNKNOWN_KEYBOARD_LAYOUT_NAME: SharedString = SharedString::new_static("unknown");
-const XDG_ACTIVATION_TOKEN_ENV_VAR: &str = "XDG_ACTIVATION_TOKEN";
-
-fn take_startup_activation_token_from_environment() -> Option<String> {
-    let token = std::env::var(XDG_ACTIVATION_TOKEN_ENV_VAR)
-        .ok()
-        .filter(|token| !token.is_empty());
-    // SAFETY: Wayland initialization runs before GPUI starts concurrent environment access or
-    // launches child processes. The protocol requires removing the token before children inherit it.
-    unsafe { std::env::remove_var(XDG_ACTIVATION_TOKEN_ENV_VAR) };
-    token
-}
-
 #[derive(Clone)]
 pub struct Globals {
     pub qh: QueueHandle<WaylandClientStatePtr>,
@@ -566,8 +554,7 @@ fn wl_output_version(version: u32) -> u32 {
 }
 
 impl WaylandClient {
-    pub(crate) fn new() -> Self {
-        let startup_activation_token = take_startup_activation_token_from_environment();
+    pub(crate) fn new(startup_activation_token: Option<String>) -> Self {
         let conn = Connection::connect_to_env().unwrap();
 
         let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn).unwrap();
@@ -631,7 +618,7 @@ impl WaylandClient {
                 wake_receiver,
                 |event, _, client: &mut WaylandClientStatePtr| {
                     if let calloop::channel::Event::Msg(()) = event {
-                        client.get_client().borrow_mut().common.handle_system_wake();
+                        WaylandClient(client.get_client()).handle_system_wake();
                     }
                 },
             )

@@ -337,7 +337,7 @@ impl X11Client {
         handle
             .insert_source(wake_receiver, |event, _, client: &mut X11Client| {
                 if let calloop::channel::Event::Msg(()) = event {
-                    client.0.borrow_mut().common.handle_system_wake();
+                    client.handle_system_wake();
                 }
             })
             .map_err(|err| {
