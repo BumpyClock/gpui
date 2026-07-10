@@ -109,6 +109,14 @@ struct WindowInvalidatorInner {
     pub dirty: bool,
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
+    pub frame_dirty: FrameDirtyAccumulator,
+}
+
+/// Per-frame invalidation bookkeeping used by the runtime-gated frame tracer.
+#[derive(Default)]
+struct FrameDirtyAccumulator {
+    dirty_at: Option<Instant>,
+    invalidations: u64,
 }
 
 #[derive(Clone)]
@@ -123,6 +131,7 @@ impl WindowInvalidator {
                 dirty: true,
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
+                frame_dirty: FrameDirtyAccumulator::default(),
             })),
         }
     }
@@ -131,6 +140,7 @@ impl WindowInvalidator {
         let mut inner = self.inner.borrow_mut();
         inner.dirty_views.insert(entity);
         if inner.draw_phase == DrawPhase::None {
+            Self::record_frame_dirty(&mut inner);
             inner.dirty = true;
             cx.push_effect(Effect::Notify { emitter: entity });
             true
@@ -144,11 +154,26 @@ impl WindowInvalidator {
     }
 
     pub fn set_dirty(&self, dirty: bool) {
-        self.inner.borrow_mut().dirty = dirty
+        let mut inner = self.inner.borrow_mut();
+        inner.dirty = dirty;
+        if dirty {
+            Self::record_frame_dirty(&mut inner);
+        }
     }
 
     pub fn set_phase(&self, phase: DrawPhase) {
         self.inner.borrow_mut().draw_phase = phase
+    }
+
+    fn record_frame_dirty(inner: &mut WindowInvalidatorInner) {
+        if profiler::frame_trace_enabled() {
+            inner.frame_dirty.dirty_at.get_or_insert_with(Instant::now);
+            inner.frame_dirty.invalidations += 1;
+        }
+    }
+
+    fn take_frame_dirty(&self) -> FrameDirtyAccumulator {
+        mem::take(&mut self.inner.borrow_mut().frame_dirty)
     }
 
     pub fn take_views(&self) -> FxHashSet<EntityId> {
@@ -2424,6 +2449,11 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        // Drain unconditionally so enable/disable transitions cannot leak a
+        // stale first-invalidation timestamp into a later frame.
+        let frame_dirty = self.invalidator.take_frame_dirty();
+        let draw_started_at = profiler::frame_trace_enabled().then(Instant::now);
+
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
@@ -2517,6 +2547,16 @@ impl Window {
         self.invalidator.set_phase(DrawPhase::None);
         self.needs_present.set(true);
 
+        if let Some(draw_start) = draw_started_at {
+            profiler::record_frame_timing(profiler::FrameTiming {
+                window_id: self.handle.window_id(),
+                dirty_at: frame_dirty.dirty_at,
+                invalidations: frame_dirty.invalidations,
+                draw_start,
+                draw_end: Instant::now(),
+            });
+        }
+
         ArenaClearNeeded::new(&cx.element_arena)
     }
 
@@ -2547,6 +2587,14 @@ impl Window {
         self.platform_window.draw(&self.rendered_frame.scene);
         self.needs_present.set(false);
         profiling::finish_frame!();
+    }
+
+    /// Presents the most recently drawn frame if it has not been presented.
+    #[cfg(feature = "bench")]
+    pub fn present_if_needed(&self) {
+        if self.needs_present.get() {
+            self.present();
+        }
     }
 
     fn draw_roots(&mut self, cx: &mut App) {

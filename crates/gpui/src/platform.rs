@@ -6,6 +6,9 @@ mod keystroke;
 #[expect(missing_docs)]
 pub mod layer_shell;
 
+#[cfg(any(test, feature = "bench"))]
+mod bench_dispatcher;
+
 #[cfg(any(test, feature = "test-support"))]
 mod test;
 
@@ -74,6 +77,9 @@ pub(crate) use test::*;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
+
+#[cfg(any(test, feature = "bench"))]
+pub use bench_dispatcher::BenchDispatcher;
 
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test::VisualTestPlatform;
@@ -674,6 +680,11 @@ pub trait PlatformDispatcher: Send + Sync {
 
     #[cfg(any(test, feature = "test-support"))]
     fn as_test(&self) -> Option<&TestDispatcher> {
+        None
+    }
+
+    #[cfg(any(test, feature = "bench"))]
+    fn as_bench(&self) -> Option<&BenchDispatcher> {
         None
     }
 }

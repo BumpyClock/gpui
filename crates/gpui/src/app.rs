@@ -23,6 +23,8 @@ use slotmap::SlotMap;
 
 use crate::util::{ResultExt, debug_panic};
 pub use async_context::*;
+#[cfg(feature = "bench")]
+pub use bench_context::{BenchAppContext, BenchReport, BenchWindowContext, bench_platform};
 use collections::{FxHashMap, FxHashSet, HashMap, VecDeque};
 pub use context::*;
 pub use entity_map::*;
@@ -50,6 +52,8 @@ use crate::{
 };
 
 mod async_context;
+#[cfg(feature = "bench")]
+mod bench_context;
 mod context;
 mod entity_map;
 #[cfg(any(test, feature = "test-support"))]
@@ -1508,7 +1512,7 @@ impl App {
                     }
                 }
             } else {
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(any(test, feature = "test-support", feature = "bench"))]
                 for window in self
                     .windows
                     .values()
