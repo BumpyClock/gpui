@@ -190,14 +190,17 @@ impl Editor {
     }
 
     pub fn insert_newline(&mut self, cx: &mut Context<Self>) {
-        let cursor = self.cursor;
-        self.value.update(cx, |s, cx| {
-            s.insert(cursor, '\n');
-            cx.notify();
-        });
-        self.cursor += 1;
+        let mut content = self.text(cx);
+        let cursor = floor_grapheme_boundary(&content, self.cursor);
+        content.insert(cursor, '\n');
+        self.cursor = cursor + 1;
         self.selected_range = self.cursor..self.cursor;
         self.marked_range = None;
+        self.expected_value = Some(content.clone());
+        self.value.update(cx, |value, cx| {
+            *value = content;
+            cx.notify();
+        });
         self.reset_blink(cx);
         cx.notify();
     }

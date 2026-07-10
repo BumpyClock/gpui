@@ -172,4 +172,20 @@ mod tests {
         cx.simulate_keystrokes("left left");
         cx.read_entity(&editor, |editor, _| assert_eq!(editor.cursor, 1));
     }
+
+    #[gpui::test]
+    fn newline_normalizes_a_cursor_inside_a_grapheme(cx: &mut TestAppContext) {
+        let (editor, value, _b_value, cx) = setup(cx);
+        cx.simulate_input("é");
+
+        cx.update(|_, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.cursor = 1;
+                editor.insert_newline(cx);
+            });
+        });
+
+        cx.read_entity(&value, |value, _| assert_eq!(value, "\né"));
+        cx.read_entity(&editor, |editor, _| assert_eq!(editor.cursor, 1));
+    }
 }

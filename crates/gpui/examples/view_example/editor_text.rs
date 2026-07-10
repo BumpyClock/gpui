@@ -172,6 +172,7 @@ impl Element for EditorText {
 }
 
 fn cursor_line_and_offset(content: &str, cursor: usize) -> (usize, usize) {
+    let cursor = cursor.min(content.len());
     let mut line_index = 0;
     let mut line_start = 0;
     for (i, ch) in content.char_indices() {
@@ -184,4 +185,14 @@ fn cursor_line_and_offset(content: &str, cursor: usize) -> (usize, usize) {
         }
     }
     (line_index, cursor - line_start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_offset_past_content_clamps_to_the_last_line_end() {
+        assert_eq!(cursor_line_and_offset("a\nβ", usize::MAX), (1, "β".len()));
+    }
 }
