@@ -52,6 +52,32 @@ fn surface_usage(surface_usages: wgpu::TextureUsages) -> (wgpu::TextureUsages, b
     (usage, supports_copy_src)
 }
 
+#[derive(Default)]
+struct FrameFailureStreak {
+    count: u32,
+    recovery_frame_pending: bool,
+}
+
+impl FrameFailureStreak {
+    fn record_error(&mut self) -> u32 {
+        self.count += 1;
+        self.count
+    }
+
+    fn begin_recovery(&mut self) {
+        self.recovery_frame_pending = true;
+    }
+
+    fn record_no_error(&mut self) {
+        // Recovery returns before submitting a replacement frame. The next draw
+        // therefore has no prior error to report, but it is not evidence that
+        // the GPU recovered successfully.
+        if !std::mem::take(&mut self.recovery_frame_pending) {
+            self.count = 0;
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GlobalParams {
@@ -294,7 +320,7 @@ pub struct WgpuRenderer {
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
     max_texture_size: u32,
     last_error: Arc<Mutex<Option<String>>>,
-    failed_frame_count: u32,
+    frame_failure_streak: FrameFailureStreak,
     device_lost: Arc<std::sync::atomic::AtomicBool>,
     needs_redraw: bool,
 }
@@ -680,7 +706,7 @@ impl WgpuRenderer {
             opaque_alpha_mode,
             max_texture_size,
             last_error,
-            failed_frame_count: 0,
+            frame_failure_streak: FrameFailureStreak::default(),
             device_lost: context.device_lost_flag(),
             needs_redraw: false,
         })
@@ -1392,25 +1418,25 @@ impl WgpuRenderer {
         }
         let last_error = self.last_error.lock().unwrap().take();
         if let Some(error) = last_error {
-            self.failed_frame_count += 1;
+            let failed_frame_count = self.frame_failure_streak.record_error();
             log::error!(
                 "GPU error during frame (failure {} of 20): {error}",
-                self.failed_frame_count
+                failed_frame_count
             );
-            if self.failed_frame_count > 20 {
+            if failed_frame_count > 20 {
                 panic!("Too many consecutive GPU errors. Last error: {error}");
-            } else if self.failed_frame_count > 5 {
+            } else if failed_frame_count > 5 {
                 self.resources
                     .as_mut()
                     .expect("GPU resources checked above")
                     .invalidate_cached_gpu_state();
                 self.atlas.clear();
                 self.needs_redraw = true;
-                self.failed_frame_count = 0;
+                self.frame_failure_streak.begin_recovery();
                 return false;
             }
         } else {
-            self.failed_frame_count = 0;
+            self.frame_failure_streak.record_no_error();
         }
 
         self.atlas.before_frame();
@@ -2993,6 +3019,23 @@ mod tests {
         assert!(recovery_requires_new_context(None));
         assert!(recovery_requires_new_context(Some(true)));
         assert!(!recovery_requires_new_context(Some(false)));
+    }
+
+    #[test]
+    fn recovery_gap_does_not_reset_consecutive_frame_failures() {
+        let mut failures = FrameFailureStreak::default();
+
+        for expected in 1..=21 {
+            assert_eq!(failures.record_error(), expected);
+            if expected > 5 {
+                failures.begin_recovery();
+                failures.record_no_error();
+            }
+        }
+
+        assert_eq!(failures.count, 21);
+        failures.record_no_error();
+        assert_eq!(failures.count, 0);
     }
 
     #[test]
