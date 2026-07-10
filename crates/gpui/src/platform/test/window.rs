@@ -88,6 +88,7 @@ impl TestWindow {
         })))
     }
 
+    #[cfg(test)]
     pub(crate) fn input_region(&self) -> Option<Vec<Bounds<Pixels>>> {
         self.0.lock().input_region.clone()
     }
