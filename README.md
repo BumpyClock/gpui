@@ -25,7 +25,11 @@ cargo build --example hello_world
 
 ## Upstream Sync
 
-Last targeted sync with [zed-industries/zed](https://github.com/zed-industries/zed) at commit [`24f62484e9`](https://github.com/zed-industries/zed/commit/24f62484e936aa355c72f2009313bbe2898a9fd5) (2026-04-29).
+GPUI changes have been selectively audited and synchronized through
+[zed-industries/zed commit `2c4e44704c`](https://github.com/zed-industries/zed/commit/2c4e44704c37ee87e59ac84e3e17388178b28545)
+(2026-07-09). This is a semantic fork sync, not a contiguous merge or a claim that the trees are
+byte-identical. See [UPSTREAM.md](UPSTREAM.md) for imported areas, fork invariants, exclusions,
+verification evidence, and the next-sync procedure.
 
 ## License
 
