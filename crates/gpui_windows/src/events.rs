@@ -1746,9 +1746,10 @@ mod tests {
         ];
 
         for &(area, movable, resizable, minimizable, expected) in cases {
-            assert!(
-                window_control_hit_target(area, movable, resizable, minimizable) == expected,
-                "window control hit target did not match its capabilities"
+            assert_eq!(
+                window_control_hit_target(area, movable, resizable, minimizable),
+                expected,
+                "unexpected hit target for area={area:?} movable={movable} resizable={resizable} minimizable={minimizable}"
             );
         }
     }
