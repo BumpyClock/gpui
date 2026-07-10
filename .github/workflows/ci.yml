@@ -27,28 +27,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            clang \
-            pkg-config \
-            libfontconfig-dev \
-            libfreetype-dev \
-            mesa-vulkan-drivers \
-            libvulkan-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libwayland-dev \
-            libx11-xcb-dev \
-            libxcb1-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libxcb-randr0-dev \
-            libxcb-xinput-dev \
-            libxcb-cursor-dev \
-            libxcb-sync-dev \
-            libxcb-render0-dev \
-            libxcb-present-dev
+        uses: ./.github/actions/install-linux-dependencies
       - run: cargo fmt --all -- --check
       - run: cargo metadata --locked --format-version 1 > /dev/null
       - run: cargo check --locked --workspace --all-targets
@@ -104,6 +83,8 @@ jobs:
         backend: [wayland, x11]
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      BACKEND: ${{ matrix.backend }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -115,30 +96,9 @@ jobs:
         with:
           key: linux-${{ matrix.backend }}
       - name: Install Linux dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            clang \
-            pkg-config \
-            libfontconfig-dev \
-            libfreetype-dev \
-            mesa-vulkan-drivers \
-            libvulkan-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libwayland-dev \
-            libx11-xcb-dev \
-            libxcb1-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libxcb-randr0-dev \
-            libxcb-xinput-dev \
-            libxcb-cursor-dev \
-            libxcb-sync-dev \
-            libxcb-render0-dev \
-            libxcb-present-dev
-      - run: cargo check --locked -p gpui_platform --no-default-features --features ${{ matrix.backend }} --all-targets
-      - run: cargo test --locked -p gpui_linux --no-default-features --features ${{ matrix.backend }},test-support --lib
+        uses: ./.github/actions/install-linux-dependencies
+      - run: cargo check --locked -p gpui_platform --no-default-features --features "$BACKEND" --all-targets
+      - run: cargo test --locked -p gpui_linux --no-default-features --features "$BACKEND,test-support" --lib
 
   wasm:
     name: WebAssembly
