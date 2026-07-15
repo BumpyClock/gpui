@@ -1142,7 +1142,7 @@ mod tests {
             order,
             pad: 0,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             corner_radii: Corners::all(ScaledPixels(2.0)),
             blur_radius: ScaledPixels(12.0),
             source_origin_x: 0.0,
@@ -1154,17 +1154,28 @@ mod tests {
     }
 
     #[test]
+    fn content_mask_gpu_layout_matches_shader_storage_contract() {
+        assert_eq!(align_of::<ContentMask<ScaledPixels>>(), 4);
+        assert_eq!(size_of::<ContentMask<ScaledPixels>>(), 48);
+        assert_eq!(offset_of!(ContentMask<ScaledPixels>, bounds), 0);
+        assert_eq!(offset_of!(ContentMask<ScaledPixels>, rounded_bounds), 16);
+        assert_eq!(offset_of!(ContentMask<ScaledPixels>, corner_radii), 32);
+    }
+
+    #[test]
     fn backdrop_blur_gpu_layout_matches_shader_storage_contract() {
         assert_eq!(align_of::<BackdropBlur>(), 4);
-        assert_eq!(size_of::<BackdropBlur>(), 80);
+        assert_eq!(size_of::<BackdropBlur>(), 112);
         assert_eq!(offset_of!(BackdropBlur, order), 0);
         assert_eq!(offset_of!(BackdropBlur, bounds), 8);
         assert_eq!(offset_of!(BackdropBlur, content_mask), 24);
-        assert_eq!(offset_of!(BackdropBlur, corner_radii), 40);
-        assert_eq!(offset_of!(BackdropBlur, blur_radius), 56);
-        assert_eq!(offset_of!(BackdropBlur, source_origin_x), 60);
-        assert_eq!(offset_of!(BackdropBlur, source_height), 72);
-        assert_eq!(offset_of!(BackdropBlur, pad2), 76);
+        assert_eq!(offset_of!(BackdropBlur, corner_radii), 72);
+        assert_eq!(offset_of!(BackdropBlur, blur_radius), 88);
+        assert_eq!(offset_of!(BackdropBlur, source_origin_x), 92);
+        assert_eq!(offset_of!(BackdropBlur, source_origin_y), 96);
+        assert_eq!(offset_of!(BackdropBlur, source_width), 100);
+        assert_eq!(offset_of!(BackdropBlur, source_height), 104);
+        assert_eq!(offset_of!(BackdropBlur, pad2), 108);
     }
 
     #[test]
@@ -1178,26 +1189,26 @@ mod tests {
     #[test]
     fn underline_gpu_layout_matches_shader_storage_contract() {
         assert_eq!(align_of::<Underline>(), 4);
-        assert_eq!(size_of::<Underline>(), 64);
+        assert_eq!(size_of::<Underline>(), 96);
         assert_eq!(offset_of!(Underline, order), 0);
         assert_eq!(offset_of!(Underline, bounds), 8);
         assert_eq!(offset_of!(Underline, content_mask), 24);
-        assert_eq!(offset_of!(Underline, color), 40);
-        assert_eq!(offset_of!(Underline, thickness), 56);
-        assert_eq!(offset_of!(Underline, wavy), 60);
+        assert_eq!(offset_of!(Underline, color), 72);
+        assert_eq!(offset_of!(Underline, thickness), 88);
+        assert_eq!(offset_of!(Underline, wavy), 92);
     }
 
     #[test]
     fn polychrome_sprite_gpu_layout_matches_shader_storage_contract() {
         assert_eq!(align_of::<PolychromeSprite>(), 4);
-        assert_eq!(size_of::<PolychromeSprite>(), 96);
+        assert_eq!(size_of::<PolychromeSprite>(), 128);
         assert_eq!(offset_of!(PolychromeSprite, order), 0);
         assert_eq!(offset_of!(PolychromeSprite, grayscale), 8);
         assert_eq!(offset_of!(PolychromeSprite, opacity), 12);
         assert_eq!(offset_of!(PolychromeSprite, bounds), 16);
         assert_eq!(offset_of!(PolychromeSprite, content_mask), 32);
-        assert_eq!(offset_of!(PolychromeSprite, corner_radii), 48);
-        assert_eq!(offset_of!(PolychromeSprite, tile), 64);
+        assert_eq!(offset_of!(PolychromeSprite, corner_radii), 80);
+        assert_eq!(offset_of!(PolychromeSprite, tile), 96);
     }
 
     #[test]
@@ -1209,13 +1220,13 @@ mod tests {
             Quad {
                 order: 4,
                 bounds,
-                content_mask: ContentMask { bounds },
+                content_mask: ContentMask::new(bounds),
                 ..Default::default()
             },
             Quad {
                 order: 1,
                 bounds,
-                content_mask: ContentMask { bounds },
+                content_mask: ContentMask::new(bounds),
                 ..Default::default()
             },
         ];
@@ -1258,7 +1269,7 @@ mod tests {
     #[test]
     fn replay_retained_layer_ranges_and_marks_content_clean() {
         let bounds = test_bounds();
-        let content_mask = ContentMask { bounds };
+        let content_mask = ContentMask::new(bounds);
         let mut prev_scene = Scene::default();
 
         prev_scene.insert_primitive(Quad {
@@ -1290,7 +1301,7 @@ mod tests {
     #[test]
     fn replay_offsets_retained_layer_ranges_after_existing_ops() {
         let bounds = test_bounds();
-        let content_mask = ContentMask { bounds };
+        let content_mask = ContentMask::new(bounds);
         let mut prev_scene = Scene::default();
 
         prev_scene.insert_primitive(Quad {
@@ -1333,7 +1344,7 @@ mod tests {
             blur_radius: ScaledPixels(0.0),
             bounds,
             corner_radii: Corners::all(ScaledPixels(0.0)),
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             color: Hsla::default(),
             element_bounds,
             element_corner_radii: Corners::all(ScaledPixels(0.0)),

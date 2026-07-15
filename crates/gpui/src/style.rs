@@ -649,40 +649,72 @@ impl Style {
                 y: Overflow::Visible,
             } => None,
             _ => {
+                let element_size = bounds.size;
                 let mut min = bounds.origin;
                 let mut max = bounds.bottom_right();
-
-                if self
+                let border_widths = self.border_widths.to_pixels(rem_size);
+                let has_visible_border = self
                     .border_color
-                    .is_some_and(|color| !color.is_transparent())
-                {
-                    min.x += self.border_widths.left.to_pixels(rem_size);
-                    max.x -= self.border_widths.right.to_pixels(rem_size);
-                    min.y += self.border_widths.top.to_pixels(rem_size);
-                    max.y -= self.border_widths.bottom.to_pixels(rem_size);
+                    .is_some_and(|color| !color.is_transparent());
+
+                if has_visible_border {
+                    min.x += border_widths.left;
+                    max.x -= border_widths.right;
+                    min.y += border_widths.top;
+                    max.y -= border_widths.bottom;
                 }
 
-                let bounds = match (
+                let (bounds, clips_both_axes) = match (
                     self.overflow.x == Overflow::Visible,
                     self.overflow.y == Overflow::Visible,
                 ) {
                     // x and y both visible
                     (true, true) => return None,
                     // x visible, y hidden
-                    (true, false) => Bounds::from_corners(
-                        point(min.x, bounds.origin.y),
-                        point(max.x, bounds.bottom_right().y),
+                    (true, false) => (
+                        Bounds::from_corners(
+                            point(bounds.origin.x, min.y),
+                            point(bounds.bottom_right().x, max.y),
+                        ),
+                        false,
                     ),
                     // x hidden, y visible
-                    (false, true) => Bounds::from_corners(
-                        point(bounds.origin.x, min.y),
-                        point(bounds.bottom_right().x, max.y),
+                    (false, true) => (
+                        Bounds::from_corners(
+                            point(min.x, bounds.origin.y),
+                            point(max.x, bounds.bottom_right().y),
+                        ),
+                        false,
                     ),
                     // both hidden
-                    (false, false) => Bounds::from_corners(min, max),
+                    (false, false) => (Bounds::from_corners(min, max), true),
                 };
 
-                Some(ContentMask { bounds })
+                let mut corner_radii = self
+                    .corner_radii
+                    .to_pixels(rem_size)
+                    .clamp_radii_for_quad_size(element_size);
+                if has_visible_border {
+                    corner_radii.top_left = (corner_radii.top_left
+                        - border_widths.top.max(border_widths.left))
+                    .max(Pixels::ZERO);
+                    corner_radii.top_right = (corner_radii.top_right
+                        - border_widths.top.max(border_widths.right))
+                    .max(Pixels::ZERO);
+                    corner_radii.bottom_right = (corner_radii.bottom_right
+                        - border_widths.bottom.max(border_widths.right))
+                    .max(Pixels::ZERO);
+                    corner_radii.bottom_left = (corner_radii.bottom_left
+                        - border_widths.bottom.max(border_widths.left))
+                    .max(Pixels::ZERO);
+                    corner_radii = corner_radii.clamp_radii_for_quad_size(bounds.size);
+                }
+
+                if clips_both_axes && corner_radii != Corners::default() {
+                    Some(ContentMask::rounded(bounds, corner_radii))
+                } else {
+                    Some(ContentMask::new(bounds))
+                }
             }
         }
     }
@@ -1338,9 +1370,73 @@ impl From<Position> for taffy::style::Position {
 
 #[cfg(test)]
 mod tests {
-    use crate::{blue, green, px, red, yellow};
+    use crate::{Bounds, blue, green, px, red, size, yellow};
 
     use super::*;
+
+    #[test]
+    fn overflow_mask_preserves_rounded_clip_geometry() {
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(80.)));
+        let style = Style {
+            overflow: point(Overflow::Hidden, Overflow::Hidden),
+            corner_radii: Corners::all(px(12.).into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            style.overflow_mask(bounds, px(16.)),
+            Some(ContentMask::rounded(bounds, Corners::all(px(12.))))
+        );
+    }
+
+    #[test]
+    fn overflow_mask_stays_rectangular_when_only_one_axis_is_clipped() {
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(80.)));
+        let style = Style {
+            overflow: point(Overflow::Hidden, Overflow::Visible),
+            corner_radii: Corners::all(px(12.).into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            style.overflow_mask(bounds, px(16.)),
+            Some(ContentMask::new(bounds))
+        );
+    }
+
+    #[test]
+    fn overflow_mask_insets_only_the_clipped_axis_for_visible_borders() {
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(80.)));
+        let base_style = Style {
+            border_widths: Edges::all(px(2.).into()),
+            border_color: Some(red()),
+            ..Default::default()
+        };
+
+        let x_clipped = Style {
+            overflow: point(Overflow::Hidden, Overflow::Visible),
+            ..base_style.clone()
+        };
+        assert_eq!(
+            x_clipped.overflow_mask(bounds, px(16.)),
+            Some(ContentMask::new(Bounds::from_corners(
+                point(px(12.), px(20.)),
+                point(px(108.), px(100.)),
+            )))
+        );
+
+        let y_clipped = Style {
+            overflow: point(Overflow::Visible, Overflow::Hidden),
+            ..base_style
+        };
+        assert_eq!(
+            y_clipped.overflow_mask(bounds, px(16.)),
+            Some(ContentMask::new(Bounds::from_corners(
+                point(px(10.), px(22.)),
+                point(px(110.), px(98.)),
+            )))
+        );
+    }
 
     #[test]
     fn box_shadow_builder_sets_css_ordered_fields_and_defaults() {
