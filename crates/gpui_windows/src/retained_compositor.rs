@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use windows::{
     Win32::Graphics::{
-        DirectComposition::{IDCompositionDevice, IDCompositionVisual, IDCompositionVisual3},
+        DirectComposition::{
+            IDCompositionClip, IDCompositionDevice, IDCompositionVisual, IDCompositionVisual3,
+        },
         Dxgi::IDXGISwapChain1,
     },
     core::Interface,
@@ -18,6 +20,18 @@ pub(crate) struct RetainedLayerState {
     pub(crate) order: u32,
     pub(crate) transform: Matrix3x2,
     pub(crate) opacity: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RetainedLayerClip {
+    pub(crate) left: f32,
+    pub(crate) top: f32,
+    pub(crate) right: f32,
+    pub(crate) bottom: f32,
+    pub(crate) top_left_radius: f32,
+    pub(crate) top_right_radius: f32,
+    pub(crate) bottom_right_radius: f32,
+    pub(crate) bottom_left_radius: f32,
 }
 
 pub(crate) enum RetainedLayerContent<'a> {
@@ -102,6 +116,32 @@ impl RetainedCompositor {
             self.rebuild_visual_order()?;
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn set_root_clip(&self, clip: Option<RetainedLayerClip>) -> Result<()> {
+        let Some(clip) = clip else {
+            return unsafe { self.root_visual.SetClip(None::<&IDCompositionClip>) }
+                .context("clearing retained DirectComposition clip");
+        };
+
+        let rectangle_clip = unsafe { self.comp_device.CreateRectangleClip() }
+            .context("creating retained DirectComposition clip")?;
+        unsafe {
+            rectangle_clip.SetLeft2(clip.left)?;
+            rectangle_clip.SetTop2(clip.top)?;
+            rectangle_clip.SetRight2(clip.right)?;
+            rectangle_clip.SetBottom2(clip.bottom)?;
+            rectangle_clip.SetTopLeftRadiusX2(clip.top_left_radius)?;
+            rectangle_clip.SetTopLeftRadiusY2(clip.top_left_radius)?;
+            rectangle_clip.SetTopRightRadiusX2(clip.top_right_radius)?;
+            rectangle_clip.SetTopRightRadiusY2(clip.top_right_radius)?;
+            rectangle_clip.SetBottomRightRadiusX2(clip.bottom_right_radius)?;
+            rectangle_clip.SetBottomRightRadiusY2(clip.bottom_right_radius)?;
+            rectangle_clip.SetBottomLeftRadiusX2(clip.bottom_left_radius)?;
+            rectangle_clip.SetBottomLeftRadiusY2(clip.bottom_left_radius)?;
+            self.root_visual.SetClip(&rectangle_clip)?;
+        }
         Ok(())
     }
 

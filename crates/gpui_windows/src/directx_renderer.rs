@@ -184,6 +184,24 @@ fn retained_layer_state(layer: &gpui::RetainedLayer, order: usize) -> RetainedLa
     }
 }
 
+fn retained_layer_clip(mask: &ContentMask<ScaledPixels>) -> Option<RetainedLayerClip> {
+    if mask.corner_radii == Corners::default() {
+        return None;
+    }
+
+    let bottom_right = mask.rounded_bounds.bottom_right();
+    Some(RetainedLayerClip {
+        left: mask.rounded_bounds.origin.x.0,
+        top: mask.rounded_bounds.origin.y.0,
+        right: bottom_right.x.0,
+        bottom: bottom_right.y.0,
+        top_left_radius: mask.corner_radii.top_left.0,
+        top_right_radius: mask.corner_radii.top_right.0,
+        bottom_right_radius: mask.corner_radii.bottom_right.0,
+        bottom_left_radius: mask.corner_radii.bottom_left.0,
+    })
+}
+
 fn matrix_from_transformation(transform: TransformationMatrix) -> windows_numerics::Matrix3x2 {
     windows_numerics::Matrix3x2 {
         M11: transform.rotation_scale[0][0],
@@ -377,6 +395,9 @@ impl DirectXRenderer {
         }
 
         direct_composition.enable_retained_layers()?;
+        direct_composition
+            .retained_compositor
+            .set_root_clip(retained_layer_clip(&scene.retained_layers[0].content_mask))?;
         let active_layers = Self::retained_layer_ids(scene);
         for (order, layer) in scene.retained_layers.iter().enumerate() {
             direct_composition.retained_compositor.set_layer(
@@ -1970,6 +1991,7 @@ impl DirectComposition {
     pub fn set_swap_chain(&mut self, swap_chain: &IDXGISwapChain1) -> Result<()> {
         unsafe {
             self.retained_compositor.retain_layers(&[])?;
+            self.retained_compositor.set_root_clip(None)?;
             self.comp_visual.SetContent(swap_chain)?;
             self.comp_target.SetRoot(&self.comp_visual)?;
             self.comp_device.Commit()?;
@@ -1997,6 +2019,7 @@ impl DirectComposition {
         }
 
         self.retained_compositor.retain_layers(&[])?;
+        self.retained_compositor.set_root_clip(None)?;
         unsafe {
             self.comp_visual.SetContent(swap_chain)?;
             self.comp_target.SetRoot(&self.comp_visual)?;
@@ -3356,7 +3379,11 @@ mod amd {
 
 #[cfg(test)]
 mod tests {
-    use super::{GlobalParams, rounded_backdrop_rebuild_requested};
+    use gpui::{Bounds, ContentMask, Corners, ScaledPixels, point, size};
+
+    use super::{
+        GlobalParams, RetainedLayerClip, retained_layer_clip, rounded_backdrop_rebuild_requested,
+    };
 
     #[test]
     fn global_params_preserve_hlsl_constant_buffer_alignment() {
@@ -3368,6 +3395,46 @@ mod tests {
         assert!(!rounded_backdrop_rebuild_requested(None));
         assert!(rounded_backdrop_rebuild_requested(Some(0.0)));
         assert!(rounded_backdrop_rebuild_requested(Some(12.0)));
+    }
+
+    #[test]
+    fn retained_layer_clip_is_disabled_for_rectangular_masks() {
+        let mask = ContentMask::new(Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(100.0), ScaledPixels(80.0)),
+        ));
+
+        assert_eq!(retained_layer_clip(&mask), None);
+    }
+
+    #[test]
+    fn retained_layer_clip_preserves_rounded_mask_geometry() {
+        let mask = ContentMask::rounded(
+            Bounds::new(
+                point(ScaledPixels(2.0), ScaledPixels(3.0)),
+                size(ScaledPixels(100.0), ScaledPixels(80.0)),
+            ),
+            Corners {
+                top_left: ScaledPixels(4.0),
+                top_right: ScaledPixels(5.0),
+                bottom_right: ScaledPixels(6.0),
+                bottom_left: ScaledPixels(7.0),
+            },
+        );
+
+        assert_eq!(
+            retained_layer_clip(&mask),
+            Some(RetainedLayerClip {
+                left: 2.0,
+                top: 3.0,
+                right: 102.0,
+                bottom: 83.0,
+                top_left_radius: 4.0,
+                top_right_radius: 5.0,
+                bottom_right_radius: 6.0,
+                bottom_left_radius: 7.0,
+            })
+        );
     }
 }
 
