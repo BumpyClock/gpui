@@ -108,9 +108,17 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct PodContentMask {
+    bounds: PodBounds,
+    rounded_bounds: PodBounds,
+    corner_radii: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct SurfaceParams {
     bounds: PodBounds,
-    content_mask: PodBounds,
+    content_mask: PodContentMask,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +156,7 @@ struct PathRasterizationVertex {
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
     scratch_bounds: Bounds<ScaledPixels>,
     texture_size: [f32; 2],
 }
@@ -1763,47 +1772,55 @@ impl WgpuRenderer {
     fn localize_scene(scene: &mut Scene, origin: Point<ScaledPixels>) {
         for quad in &mut scene.quads {
             quad.bounds = quad.bounds - origin;
-            quad.content_mask.bounds = quad.content_mask.bounds - origin;
+            Self::localize_content_mask(&mut quad.content_mask, origin);
         }
         for shadow in &mut scene.shadows {
             shadow.bounds = shadow.bounds - origin;
             shadow.element_bounds = shadow.element_bounds - origin;
-            shadow.content_mask.bounds = shadow.content_mask.bounds - origin;
+            Self::localize_content_mask(&mut shadow.content_mask, origin);
         }
         for blur in &mut scene.backdrop_blurs {
             blur.bounds = blur.bounds - origin;
-            blur.content_mask.bounds = blur.content_mask.bounds - origin;
+            Self::localize_content_mask(&mut blur.content_mask, origin);
         }
         for path in &mut scene.paths {
             path.bounds = path.bounds - origin;
-            path.content_mask.bounds = path.content_mask.bounds - origin;
+            Self::localize_content_mask(&mut path.content_mask, origin);
             for vertex in &mut path.vertices {
                 vertex.xy_position -= origin;
-                vertex.content_mask.bounds = vertex.content_mask.bounds - origin;
+                Self::localize_content_mask(&mut vertex.content_mask, origin);
             }
         }
         for underline in &mut scene.underlines {
             underline.bounds = underline.bounds - origin;
-            underline.content_mask.bounds = underline.content_mask.bounds - origin;
+            Self::localize_content_mask(&mut underline.content_mask, origin);
         }
         for sprite in &mut scene.monochrome_sprites {
             sprite.bounds = sprite.bounds - origin;
-            sprite.content_mask.bounds = sprite.content_mask.bounds - origin;
+            Self::localize_content_mask(&mut sprite.content_mask, origin);
             sprite.transformation = Self::localize_transform(sprite.transformation, origin);
         }
         for sprite in &mut scene.subpixel_sprites {
             sprite.bounds = sprite.bounds - origin;
-            sprite.content_mask.bounds = sprite.content_mask.bounds - origin;
+            Self::localize_content_mask(&mut sprite.content_mask, origin);
             sprite.transformation = Self::localize_transform(sprite.transformation, origin);
         }
         for sprite in &mut scene.polychrome_sprites {
             sprite.bounds = sprite.bounds - origin;
-            sprite.content_mask.bounds = sprite.content_mask.bounds - origin;
+            Self::localize_content_mask(&mut sprite.content_mask, origin);
         }
         for surface in &mut scene.surfaces {
             surface.bounds = surface.bounds - origin;
-            surface.content_mask.bounds = surface.content_mask.bounds - origin;
+            Self::localize_content_mask(&mut surface.content_mask, origin);
         }
+    }
+
+    fn localize_content_mask(
+        content_mask: &mut ContentMask<ScaledPixels>,
+        origin: Point<ScaledPixels>,
+    ) {
+        content_mask.bounds = content_mask.bounds - origin;
+        content_mask.rounded_bounds = content_mask.rounded_bounds - origin;
     }
 
     fn localize_transform(
@@ -2694,6 +2711,7 @@ impl WgpuRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds,
+                content_mask: path.content_mask.clone(),
                 scratch_bounds: scratch_bounds.bounds,
                 texture_size: [
                     scratch_bounds.texture_size.width.0 as f32,
@@ -2967,7 +2985,7 @@ mod tests {
             content_revision: 1.into(),
             content_dirty: true,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             transform: TransformationMatrix::unit(),
             opacity: 1.0,
             paint_range: 0..scene.paint_operation_count(),
@@ -3078,7 +3096,7 @@ mod tests {
             order: 0,
             pad: 0,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             corner_radii: Corners::all(ScaledPixels(8.0)),
             blur_radius: ScaledPixels(16.0),
             source_origin_x: 0.0,
@@ -3103,7 +3121,7 @@ mod tests {
         let (scene, layer) = scene_with_retained_primitive(Quad {
             order: 0,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             ..Default::default()
         });
 

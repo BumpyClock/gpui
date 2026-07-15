@@ -221,6 +221,7 @@ pub struct PathRasterizationVertex {
     pub st_position: Point<f32>,
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
     pub scratch_bounds: Bounds<ScaledPixels>,
     pub texture_size: Size<DevicePixels>,
 }
@@ -1378,6 +1379,7 @@ impl MetalRenderer {
         origin: Point<ScaledPixels>,
     ) {
         Self::localize_bounds(&mut content_mask.bounds, origin);
+        Self::localize_bounds(&mut content_mask.rounded_bounds, origin);
     }
 
     fn localize_transformation(
@@ -2185,6 +2187,7 @@ impl MetalRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.bounds.intersect(&path.content_mask.bounds),
+                content_mask: path.content_mask.clone(),
                 scratch_bounds: scratch_bounds.bounds,
                 texture_size: scratch_bounds.texture_size,
             }));
@@ -3151,7 +3154,7 @@ mod tests {
             content_revision: 1.into(),
             content_dirty: true,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             transform: TransformationMatrix::unit(),
             opacity: 1.0,
             paint_range: 0..scene.paint_operation_count(),
@@ -3169,7 +3172,7 @@ mod tests {
             order: 0,
             pad: 0,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             corner_radii: Corners::all(ScaledPixels(8.0)),
             blur_radius: ScaledPixels(16.0),
             source_origin_x: 0.0,
@@ -3191,7 +3194,7 @@ mod tests {
         let scene = scene_with_retained_primitive(Quad {
             order: 0,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask::new(bounds),
             ..Default::default()
         });
 

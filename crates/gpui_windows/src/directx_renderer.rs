@@ -1403,6 +1403,7 @@ impl DirectXRenderer {
                 st_position: v.st_position,
                 color: path.color,
                 bounds: path.clipped_bounds(),
+                content_mask: path.content_mask.clone(),
                 scratch_bounds: scratch_bounds.bounds,
                 texture_size: [
                     scratch_bounds.texture_size.width.0 as f32,
@@ -2410,13 +2411,14 @@ impl<T> PipelineState<T> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 #[repr(C)]
 struct PathRasterizationSprite {
     xy_position: Point<ScaledPixels>,
     st_position: Point<f32>,
     color: Background,
     bounds: Bounds<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
     scratch_bounds: Bounds<ScaledPixels>,
     texture_size: [f32; 2],
 }

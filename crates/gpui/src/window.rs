@@ -637,7 +637,7 @@ pub struct Hitbox {
     pub transform: TransformationMatrix,
     /// Cached inverse transform from window space into local hitbox space.
     pub inverse_transform: Option<TransformationMatrix>,
-    /// The content mask when the hitbox was inserted.
+    /// The content mask in local hitbox space when the hitbox was inserted.
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
@@ -679,20 +679,32 @@ impl Hitbox {
 
     /// Returns true when this hitbox contains the point in window space.
     pub fn contains_window_point(&self, point: Point<Pixels>) -> bool {
+        if !self.bounds.contains(&point) {
+            return false;
+        }
+
+        let local_point = if self.transform.is_unit() {
+            point
+        } else if let Some(local_point) = self.window_to_local(point) {
+            local_point
+        } else {
+            return false;
+        };
+
         if !self
-            .bounds
+            .local_bounds
             .intersect(&self.content_mask.bounds)
-            .contains(&point)
+            .contains(&local_point)
         {
             return false;
         }
 
-        if self.transform.is_unit() {
-            return self.local_bounds.contains(&point);
-        }
-
-        self.window_to_local(point)
-            .is_some_and(|local| self.local_bounds.contains(&local))
+        self.content_mask.corner_radii == Corners::default()
+            || rounded_rect_contains_point(
+                self.content_mask.rounded_bounds,
+                self.content_mask.corner_radii,
+                local_point,
+            )
     }
 }
 
@@ -1683,13 +1695,39 @@ pub struct DispatchEventResult {
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
-/// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
-/// to leave room to support more complex shapes in the future.
+/// rendered.
+///
+/// The rectangular `bounds` are always applied. One rounded clip can be preserved in addition to
+/// those bounds so nested rectangular overflow masks do not discard an ancestor's corner radii.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 pub struct ContentMask<P: Clone + Debug + Default + PartialEq> {
-    /// The bounds
+    /// The rectangular clip bounds.
     pub bounds: Bounds<P>,
+    /// Bounds for the rounded clip geometry.
+    pub rounded_bounds: Bounds<P>,
+    /// Corner radii for `rounded_bounds`. Zero radii disable the rounded clip.
+    pub corner_radii: Corners<P>,
+}
+
+impl<P: Clone + Debug + Default + PartialEq> ContentMask<P> {
+    /// Create a rectangular content mask.
+    pub fn new(bounds: Bounds<P>) -> Self {
+        Self {
+            rounded_bounds: bounds.clone(),
+            bounds,
+            corner_radii: Corners::default(),
+        }
+    }
+
+    /// Create a content mask with rounded clip geometry.
+    pub fn rounded(bounds: Bounds<P>, corner_radii: Corners<P>) -> Self {
+        Self {
+            rounded_bounds: bounds.clone(),
+            bounds,
+            corner_radii,
+        }
+    }
 }
 
 impl ContentMask<Pixels> {
@@ -1697,14 +1735,106 @@ impl ContentMask<Pixels> {
     pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: self.bounds.scale(factor),
+            rounded_bounds: self.rounded_bounds.scale(factor),
+            corner_radii: self.corner_radii.scale(factor),
         }
     }
 
     /// Intersect the content mask with the given content mask.
+    ///
+    /// Rectangular bounds intersect exactly. When both masks are rounded, the inner clip is kept
+    /// if its complete rectangular bounds fit inside the ancestor's rounded geometry. Otherwise,
+    /// the existing ancestor clip (`other`) is retained; content masks currently carry one rounded
+    /// geometry.
     pub fn intersect(&self, other: &Self) -> Self {
         let bounds = self.bounds.intersect(&other.bounds);
-        ContentMask { bounds }
+        let self_is_rounded = self.corner_radii != Corners::default();
+        let other_is_rounded = other.corner_radii != Corners::default();
+        let (rounded_bounds, corner_radii) = if self_is_rounded
+            && (!other_is_rounded
+                || rounded_rect_contains_bounds(
+                    other.rounded_bounds,
+                    other.corner_radii,
+                    self.bounds,
+                )) {
+            (self.rounded_bounds, self.corner_radii)
+        } else if other_is_rounded {
+            (other.rounded_bounds, other.corner_radii)
+        } else {
+            (bounds, Corners::default())
+        };
+
+        ContentMask {
+            bounds,
+            rounded_bounds,
+            corner_radii,
+        }
     }
+}
+
+fn rounded_rect_contains_bounds(
+    rounded_bounds: Bounds<Pixels>,
+    corner_radii: Corners<Pixels>,
+    bounds: Bounds<Pixels>,
+) -> bool {
+    [
+        bounds.origin,
+        bounds.top_right(),
+        bounds.bottom_right(),
+        bounds.bottom_left(),
+    ]
+    .into_iter()
+    .all(|point| rounded_rect_contains_point(rounded_bounds, corner_radii, point))
+}
+
+fn rounded_rect_contains_point(
+    bounds: Bounds<Pixels>,
+    corner_radii: Corners<Pixels>,
+    point: Point<Pixels>,
+) -> bool {
+    let x = (point.x - bounds.origin.x).0;
+    let y = (point.y - bounds.origin.y).0;
+    let width = bounds.size.width.0;
+    let height = bounds.size.height.0;
+
+    if x < 0. || y < 0. || x > width || y > height {
+        return false;
+    }
+
+    let inside_corner = |x: f32, y: f32, center_x: f32, center_y: f32, radius: Pixels| {
+        let radius = radius.0;
+        let dx = x - center_x;
+        let dy = y - center_y;
+        dx * dx + dy * dy <= radius * radius
+    };
+
+    let top_left = corner_radii.top_left;
+    if x < top_left.0 && y < top_left.0 {
+        return inside_corner(x, y, top_left.0, top_left.0, top_left);
+    }
+
+    let top_right = corner_radii.top_right;
+    if x > width - top_right.0 && y < top_right.0 {
+        return inside_corner(x, y, width - top_right.0, top_right.0, top_right);
+    }
+
+    let bottom_right = corner_radii.bottom_right;
+    if x > width - bottom_right.0 && y > height - bottom_right.0 {
+        return inside_corner(
+            x,
+            y,
+            width - bottom_right.0,
+            height - bottom_right.0,
+            bottom_right,
+        );
+    }
+
+    let bottom_left = corner_radii.bottom_left;
+    if x < bottom_left.0 && y > height - bottom_left.0 {
+        return inside_corner(x, y, bottom_left.0, height - bottom_left.0, bottom_left);
+    }
+
+    true
 }
 
 impl Window {
@@ -3256,15 +3386,12 @@ impl Window {
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
-        self.content_mask_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(|| ContentMask {
-                bounds: Bounds {
-                    origin: Point::default(),
-                    size: self.viewport_size,
-                },
+        self.content_mask_stack.last().cloned().unwrap_or_else(|| {
+            ContentMask::new(Bounds {
+                origin: Point::default(),
+                size: self.viewport_size,
             })
+        })
     }
 
     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.
@@ -4235,9 +4362,7 @@ impl Window {
             local_bounds,
             transform,
             inverse_transform: transform.try_inverse(),
-            content_mask: ContentMask {
-                bounds: transformed_bounds(content_mask.bounds, transform),
-            },
+            content_mask,
             behavior,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
@@ -6139,9 +6264,95 @@ impl From<&'static core::panic::Location<'static>> for ElementId {
 
 #[cfg(test)]
 mod bounds_change_tests {
+    use super::{Hitbox, HitboxId};
     use crate::{
-        Bounds, Empty, Modifiers, Point, TestAppContext, VisualTestContext, point, px, size,
+        Bounds, ContentMask, Corners, Empty, HitboxBehavior, Modifiers, Point, TestAppContext,
+        TransformationMatrix, VisualTestContext, point, px, size,
     };
+
+    #[test]
+    fn content_mask_intersection_preserves_rounded_ancestor() {
+        let ancestor_bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(80.)));
+        let child_bounds = Bounds::new(point(px(10.), px(5.)), size(px(60.), px(40.)));
+        let ancestor = ContentMask::rounded(ancestor_bounds, Corners::all(px(12.)));
+        let child = ContentMask::new(child_bounds);
+
+        assert_eq!(
+            child.intersect(&ancestor),
+            ContentMask {
+                bounds: child_bounds,
+                rounded_bounds: ancestor_bounds,
+                corner_radii: Corners::all(px(12.)),
+            }
+        );
+    }
+
+    #[test]
+    fn content_mask_intersection_keeps_contained_rounded_child() {
+        let ancestor_bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(80.)));
+        let child_bounds = Bounds::new(point(px(8.), px(8.)), size(px(60.), px(40.)));
+        let ancestor = ContentMask::rounded(ancestor_bounds, Corners::all(px(12.)));
+        let child = ContentMask::rounded(child_bounds, Corners::all(px(16.)));
+
+        assert_eq!(
+            child.intersect(&ancestor),
+            ContentMask {
+                bounds: child_bounds,
+                rounded_bounds: child_bounds,
+                corner_radii: Corners::all(px(16.)),
+            }
+        );
+    }
+
+    #[test]
+    fn hitbox_rejects_points_clipped_by_rounded_content_mask() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(80.)));
+        let transform = TransformationMatrix::unit();
+        let hitbox = Hitbox {
+            id: HitboxId(0),
+            bounds,
+            local_bounds: bounds,
+            transform,
+            inverse_transform: Some(transform),
+            content_mask: ContentMask::rounded(bounds, Corners::all(px(16.))),
+            behavior: HitboxBehavior::Normal,
+        };
+
+        assert!(!hitbox.contains_window_point(point(px(1.), px(1.))));
+        assert!(hitbox.contains_window_point(point(px(16.), px(16.))));
+    }
+
+    #[test]
+    fn transformed_hitbox_tests_rounded_mask_in_local_space() {
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(100.), px(80.)));
+        let transform = TransformationMatrix::unit().scale(size(2., 2.));
+        let hitbox = Hitbox {
+            id: HitboxId(0),
+            bounds: super::transformed_bounds(bounds, transform),
+            local_bounds: bounds,
+            transform,
+            inverse_transform: transform.try_inverse(),
+            content_mask: ContentMask::rounded(bounds, Corners::all(px(16.))),
+            behavior: HitboxBehavior::Normal,
+        };
+
+        assert!(!hitbox.contains_window_point(point(px(5.), px(5.))));
+        assert!(hitbox.contains_window_point(point(px(32.), px(32.))));
+    }
+
+    #[test]
+    fn content_mask_scale_scales_rounded_geometry() {
+        let bounds = Bounds::new(point(px(2.), px(4.)), size(px(20.), px(10.)));
+        let mask = ContentMask::rounded(bounds, Corners::all(px(3.)));
+        let scaled = mask.scale(2.);
+
+        assert_eq!(scaled.bounds.origin.x.0, 4.);
+        assert_eq!(scaled.bounds.origin.y.0, 8.);
+        assert_eq!(scaled.bounds.size.width.0, 40.);
+        assert_eq!(scaled.bounds.size.height.0, 20.);
+        assert_eq!(scaled.rounded_bounds, scaled.bounds);
+        assert_eq!(scaled.corner_radii, Corners::all(crate::ScaledPixels(6.)));
+    }
 
     #[gpui::test]
     fn bounds_changed_refreshes_mouse_position_from_platform(cx: &mut TestAppContext) {
