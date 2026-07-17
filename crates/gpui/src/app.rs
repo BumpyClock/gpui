@@ -13,8 +13,8 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use derive_more::{Deref, DerefMut};
 use futures::{
-    Future, FutureExt,
-    channel::oneshot,
+    Future, FutureExt, StreamExt,
+    channel::{mpsc, oneshot},
     future::{LocalBoxFuture, Shared},
 };
 use itertools::Itertools;
@@ -654,6 +654,36 @@ impl GpuiMode {
     }
 }
 
+/// A closure posted to the main thread via [`MainThreadPoster`].
+type MainThreadTask = Box<dyn FnOnce(&mut App) + Send + 'static>;
+
+/// A cloneable, `Send + Sync` handle for scheduling closures to run on the main thread.
+///
+/// Obtain one with [`App::main_thread_poster`]. Unlike [`App::spawn`], which must be called on
+/// the main thread and takes a `!Send` future, a `MainThreadPoster` can be moved to and cloned
+/// across background threads. This makes it the way to re-enter the app from OS callbacks that
+/// fire off the main thread — tray-icon menu handlers, global hotkeys, filesystem watchers, and
+/// the like — without spinning a foreground poll loop.
+///
+/// Posting enqueues the closure and wakes the main run loop through the platform dispatcher, so
+/// an idle app stays parked until there is work. Closures run on the main thread with exclusive
+/// [`App`] access, in the order they were posted.
+#[derive(Clone)]
+pub struct MainThreadPoster {
+    tx: mpsc::UnboundedSender<MainThreadTask>,
+}
+
+impl MainThreadPoster {
+    /// Posts `f` to run on the main thread with exclusive access to the [`App`].
+    ///
+    /// Returns `true` if the closure was enqueued. Returns `false` if the app has shut down (the
+    /// main-thread receiver is gone), in which case `f` is dropped without running. Enqueued
+    /// closures run on the main thread in the order they were posted.
+    pub fn post(&self, f: impl FnOnce(&mut App) + Send + 'static) -> bool {
+        self.tx.unbounded_send(Box::new(f)).is_ok()
+    }
+}
+
 /// Contains the state of the full application, and passed as a reference to a variety of callbacks.
 /// Other [Context] derefs to this type.
 /// You need a reference to an `App` to access the state of a [Entity].
@@ -719,6 +749,10 @@ pub struct App {
         FxHashMap<EntityId, FxHashMap<WindowId, WindowInvalidator>>,
     pub(crate) tracked_entities: FxHashMap<WindowId, FxHashSet<EntityId>>,
     pub(crate) current_window_by_entity: FxHashMap<EntityId, WindowId>,
+    /// Lazily-created channel behind [`App::main_thread_poster`]. Sending on it wakes the
+    /// main run loop through the platform dispatcher, so background threads can schedule
+    /// work onto the main thread without polling.
+    main_thread_poster: Option<mpsc::UnboundedSender<MainThreadTask>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_renderer: Option<crate::InspectorRenderer>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -800,6 +834,7 @@ impl App {
                 tracked_entities: FxHashMap::default(),
                 window_invalidators_by_entity: FxHashMap::default(),
                 current_window_by_entity: FxHashMap::default(),
+                main_thread_poster: None,
                 event_listeners: SubscriberSet::new(),
                 release_listeners: SubscriberSet::new(),
                 keystroke_observers: SubscriberSet::new(),
@@ -1771,6 +1806,54 @@ impl App {
 
         self.foreground_executor
             .spawn(async move { f(&mut cx).await }.boxed_local())
+    }
+
+    /// Returns a cloneable, `Send + Sync` [`MainThreadPoster`] for scheduling closures onto the
+    /// main thread from any thread.
+    ///
+    /// The poster is created lazily on first call and cached, so repeated calls hand back clones
+    /// backed by the same channel. Closures posted through it run on the main thread with
+    /// exclusive [`App`] access, in the order they were posted, and wake the run loop via the
+    /// platform dispatcher rather than by polling. Posts made after the app has shut down are
+    /// dropped harmlessly (see [`MainThreadPoster::post`]).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use gpui::App;
+    /// # fn example(cx: &mut App) {
+    /// let poster = cx.main_thread_poster();
+    /// std::thread::spawn(move || {
+    ///     // Later, from a background thread or OS callback:
+    ///     poster.post(|cx: &mut App| {
+    ///         cx.refresh_windows();
+    ///     });
+    /// });
+    /// # }
+    /// ```
+    pub fn main_thread_poster(&mut self) -> MainThreadPoster {
+        if let Some(tx) = &self.main_thread_poster {
+            return MainThreadPoster { tx: tx.clone() };
+        }
+
+        let (tx, mut rx) = mpsc::unbounded::<MainThreadTask>();
+        let weak_app = self.this.clone();
+        // A single persistent foreground task drains the channel. Sending on `tx` wakes this
+        // task's waker, which schedules it onto the main thread via the platform dispatcher, so
+        // there is no polling. The task ends (and further posts fail) once the app is dropped.
+        self.foreground_executor
+            .spawn(async move {
+                while let Some(task) = rx.next().await {
+                    let Some(app) = weak_app.upgrade() else {
+                        break;
+                    };
+                    app.borrow_mut().update(|cx| task(cx));
+                }
+            })
+            .detach();
+
+        self.main_thread_poster = Some(tx.clone());
+        MainThreadPoster { tx }
     }
 
     /// Spawns the future returned by the given function on the main thread with
@@ -2805,12 +2888,12 @@ mod test {
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
-        sync::Arc,
+        sync::{Arc, Mutex},
     };
 
     use crate::{
-        AppContext, Application, BackgroundExecutor, Context, Empty, Entity, ForegroundExecutor,
-        Global, Render, TestAppContext, TestDispatcher, TestPlatform, Window,
+        App, AppContext, Application, BackgroundExecutor, Context, Empty, Entity,
+        ForegroundExecutor, Global, Render, TestAppContext, TestDispatcher, TestPlatform, Window,
     };
 
     #[derive(Default)]
@@ -2945,5 +3028,59 @@ mod test {
         cx.read(|cx| {
             assert_eq!(cx.current_window_by_entity.get(&child_id), None);
         });
+    }
+
+    #[gpui::test]
+    async fn main_thread_poster_runs_posts_in_order(cx: &mut TestAppContext) {
+        let poster = cx.update(|cx| cx.main_thread_poster());
+        let log: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Post from a background task to exercise the `Send`, cross-thread path.
+        cx.executor()
+            .spawn({
+                let poster = poster.clone();
+                let log = log.clone();
+                async move {
+                    for i in 0..5 {
+                        let log = log.clone();
+                        poster.post(move |_: &mut App| log.lock().unwrap().push(i));
+                    }
+                }
+            })
+            .await;
+
+        cx.run_until_parked();
+        assert_eq!(*log.lock().unwrap(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[gpui::test]
+    async fn main_thread_poster_grants_app_access(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(EmbeddedState::default()));
+        let poster = cx.update(|cx| cx.main_thread_poster());
+
+        cx.executor()
+            .spawn(async move {
+                poster.post(|cx: &mut App| cx.global_mut::<EmbeddedState>().0 += 1);
+            })
+            .await;
+
+        cx.run_until_parked();
+        assert_eq!(cx.update(|cx| cx.global::<EmbeddedState>().0), 1);
+    }
+
+    #[gpui::test]
+    async fn main_thread_poster_is_cached_across_calls(cx: &mut TestAppContext) {
+        // Repeated calls hand back working posters backed by the same pump task.
+        let first = cx.update(|cx| cx.main_thread_poster());
+        let second = cx.update(|cx| cx.main_thread_poster());
+        let ran = Arc::new(Mutex::new(0u32));
+
+        for poster in [first, second] {
+            let ran = ran.clone();
+            poster.post(move |_: &mut App| *ran.lock().unwrap() += 1);
+        }
+
+        cx.run_until_parked();
+        assert_eq!(*ran.lock().unwrap(), 2);
     }
 }
