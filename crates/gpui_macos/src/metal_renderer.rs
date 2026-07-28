@@ -2938,6 +2938,38 @@ mod tests {
     }
 
     #[test]
+    fn fading_backdrop_blurs_keep_the_snapshot_fast_path() {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(100.0), ScaledPixels(100.0)),
+        );
+        let blur = |order, opacity| BackdropBlur {
+            order,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask::new(bounds),
+            corner_radii: Corners::all(ScaledPixels(8.0)),
+            blur_radius: ScaledPixels(16.0),
+            source_origin_x: 0.0,
+            source_origin_y: 0.0,
+            source_width: 1.0,
+            source_height: 1.0,
+            opacity,
+        };
+
+        // Two surfaces mid-fade at different opacities still share one plan
+        // group, so the renderer keeps blurring in place instead of taking a
+        // source snapshot.
+        let plan_groups =
+            backdrop_blur_plan_groups(&[blur(0, 0.9), blur(1, 0.8)], BackdropBlurPlan::MAX_PASSES);
+
+        assert_eq!(plan_groups.len(), 1);
+        assert!(!MetalRenderer::backdrop_blur_needs_source_snapshot(
+            &plan_groups
+        ));
+    }
+
+    #[test]
     fn retained_layer_with_backdrop_blur_is_excluded_from_metal_cache() {
         let bounds = Bounds::new(
             Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),

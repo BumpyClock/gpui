@@ -75,12 +75,6 @@ pub const DEFAULT_ADDITIONAL_WINDOW_SIZE: Size<Pixels> = Size {
     height: Pixels(750.),
 };
 
-/// Backdrop blur is skipped below this effective element opacity. Half of one
-/// 8-bit step is the most such a composite can move any channel, so dropping
-/// the primitive here saves the source snapshot and blur pyramid without a
-/// visible step at the end of a fade.
-const MINIMUM_BACKDROP_BLUR_OPACITY: f32 = 0.5 / 255.;
-
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DispatchPhase {
@@ -3734,8 +3728,11 @@ impl Window {
             return;
         }
 
+        // Only a fully transparent element is culled. Any positive opacity
+        // still contributes, because dropping the primitive at a threshold
+        // reintroduces the one-frame step this weighting exists to remove.
         let opacity = self.element_opacity();
-        if !opacity.is_finite() || opacity < MINIMUM_BACKDROP_BLUR_OPACITY {
+        if !opacity.is_finite() || opacity <= 0. {
             return;
         }
 
@@ -6563,11 +6560,16 @@ mod backdrop_blur_tests {
     }
 
     #[gpui::test]
-    fn backdrop_blur_is_skipped_once_invisible(cx: &mut TestAppContext) {
+    fn backdrop_blur_is_culled_only_at_zero_opacity(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
         assert!(paint_backdrop_blur(cx, 0.0).is_empty());
-        assert!(paint_backdrop_blur(cx, 0.001).is_empty());
-        assert_eq!(paint_backdrop_blur(cx, 0.01), vec![0.01]);
+        // Anything above zero still paints; a threshold here would be the
+        // one-frame pop the opacity weighting exists to remove.
+        assert_eq!(
+            paint_backdrop_blur(cx, f32::MIN_POSITIVE),
+            vec![f32::MIN_POSITIVE]
+        );
+        assert_eq!(paint_backdrop_blur(cx, 0.001), vec![0.001]);
     }
 }

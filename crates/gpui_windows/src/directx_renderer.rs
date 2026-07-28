@@ -3221,7 +3221,7 @@ mod amd {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Bounds, ContentMask, Corners, ScaledPixels, point, size};
+    use gpui::{BackdropBlur, Bounds, ContentMask, Corners, ScaledPixels, point, size};
 
     use super::{
         BackdropBlurParams, GlobalParams, RetainedLayerClip, retained_layer_clip,
@@ -3236,6 +3236,16 @@ mod tests {
     #[test]
     fn backdrop_blur_params_preserve_hlsl_buffer_layout() {
         assert_eq!(std::mem::size_of::<BackdropBlurParams>(), 16);
+    }
+
+    /// `struct BackdropBlur` in `shaders.hlsl` is hand-written, unlike the
+    /// Metal one that `gpui_macos/build.rs` generates from `scene.rs`, so
+    /// nothing else catches it drifting from the Rust type. The structured
+    /// buffer's `StructureByteStride` comes from this size, and a shader-side
+    /// struct of a different size skews every instance after the first.
+    #[test]
+    fn backdrop_blur_preserves_hlsl_structured_buffer_stride() {
+        assert_eq!(std::mem::size_of::<BackdropBlur>(), 112);
     }
 
     #[test]

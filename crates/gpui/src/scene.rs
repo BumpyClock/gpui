@@ -1745,30 +1745,39 @@ mod tests {
 
     #[test]
     fn backdrop_blur_opacity_does_not_split_clusters_or_plan_groups() {
+        // Same bounds and radius, so everything but opacity is shared.
         let mut blurs = [
             test_backdrop_blur_with_bounds(1, 0.0, 10.0, 12.0),
-            test_backdrop_blur_with_bounds(2, 15.0, 10.0, 12.0),
-            test_backdrop_blur_with_bounds(3, 30.0, 10.0, 12.0),
+            test_backdrop_blur_with_bounds(2, 5.0, 10.0, 12.0),
         ];
         let viewport_size = size(DevicePixels(200), DevicePixels(100));
         let opaque_clusters = backdrop_blur_clusters(&blurs, viewport_size);
         let opaque_groups = backdrop_blur_plan_groups(&blurs, BackdropBlurPlan::MAX_PASSES);
+        let opaque_scratch = backdrop_scratch_bounds(&blurs, viewport_size).unwrap();
 
-        // Mid-fade each blur carries a different opacity; batching must not
-        // notice, or a fading stack of surfaces would fragment into one
-        // snapshot and blur pyramid per surface.
-        blurs[0].opacity = 0.25;
-        blurs[1].opacity = 0.5;
-        blurs[2].opacity = 0.75;
+        // Mid-fade the two surfaces sit at different opacities. Batching must
+        // not notice: opacity is a composite parameter, and letting it reach
+        // planning would give each surface its own cluster, plan group, blur
+        // texture and source snapshot.
+        blurs[0].opacity = 0.9;
+        blurs[1].opacity = 0.8;
 
         let faded_clusters = backdrop_blur_clusters(&blurs, viewport_size);
+        let faded_groups = backdrop_blur_plan_groups(&blurs, BackdropBlurPlan::MAX_PASSES);
+        let faded_scratch = backdrop_scratch_bounds(&blurs, viewport_size).unwrap();
+
         assert_eq!(faded_clusters.len(), 1);
+        assert_eq!(faded_clusters[0].len(), 2);
         assert_eq!(faded_clusters.len(), opaque_clusters.len());
         assert_eq!(faded_clusters[0].len(), opaque_clusters[0].len());
-        assert_eq!(
-            backdrop_blur_plan_groups(&blurs, BackdropBlurPlan::MAX_PASSES),
-            opaque_groups
-        );
+
+        // One plan group is one generated blur texture.
+        assert_eq!(faded_groups.len(), 1);
+        assert_eq!(faded_groups, opaque_groups);
+
+        // One source snapshot, over the same region.
+        assert_eq!(faded_scratch.bounds, opaque_scratch.bounds);
+        assert_eq!(faded_scratch.texture_size, opaque_scratch.texture_size);
     }
 
     #[test]
