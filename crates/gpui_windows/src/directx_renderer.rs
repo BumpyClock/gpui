@@ -128,12 +128,6 @@ struct BackdropBlurResources {
     upsample_srvs: Vec<Option<ID3D11ShaderResourceView>>,
 }
 
-#[derive(Clone, Copy)]
-struct BackdropScratchBounds {
-    bounds: Bounds<ScaledPixels>,
-    texture_size: Size<DevicePixels>,
-}
-
 struct DirectXRenderPipelines {
     shadow_pipeline: PipelineState<Shadow>,
     backdrop_blur_pipeline: PipelineState<BackdropBlur>,
@@ -579,7 +573,7 @@ impl DirectXRenderer {
                         );
                         for blurs in backdrop_blur_clusters(blurs, viewport_size) {
                             let Some(mut scratch_bounds) =
-                                Self::backdrop_scratch_bounds(&blurs, self.width, self.height)
+                                backdrop_scratch_bounds(&blurs, viewport_size)
                             else {
                                 continue;
                             };
@@ -592,22 +586,17 @@ impl DirectXRenderer {
                                     .ensure_backdrop_resources(
                                         devices,
                                         scratch_bounds.texture_size,
-                                        Self::max_backdrop_texture_size(
-                                            scratch_bounds,
-                                            self.width,
-                                            self.height,
-                                        ),
+                                        max_backdrop_texture_size(scratch_bounds, viewport_size),
                                     )?
                                 {
-                                    scratch_bounds = Self::fit_backdrop_scratch_bounds(
+                                    scratch_bounds = fit_backdrop_scratch_bounds(
                                         scratch_bounds,
                                         texture_size,
                                         viewport_size,
                                     );
                                 }
                             }
-                            let prepared_blurs =
-                                Self::prepare_backdrop_blurs(&blurs, scratch_bounds);
+                            let prepared_blurs = prepare_backdrop_blurs(&blurs, scratch_bounds);
                             self.copy_render_target_to_backdrop(scratch_bounds)?;
                             let max_backdrop_blur_levels = self.max_backdrop_blur_levels();
                             let mut current_plan = None;
@@ -1021,98 +1010,6 @@ impl DirectXRenderer {
             }
         }
         Ok(())
-    }
-
-    fn backdrop_scratch_bounds(
-        blurs: &[BackdropBlur],
-        width: u32,
-        height: u32,
-    ) -> Option<BackdropScratchBounds> {
-        let mut bounds = blurs
-            .first()?
-            .bounds
-            .dilate(backdrop_blur_padding(blurs.first()?.blur_radius.0));
-        for blur in blurs.iter().skip(1) {
-            bounds = bounds.union(
-                &blur
-                    .bounds
-                    .dilate(backdrop_blur_padding(blur.blur_radius.0)),
-            );
-        }
-
-        let viewport_bounds = Bounds {
-            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
-            size: size(ScaledPixels(width as f32), ScaledPixels(height as f32)),
-        };
-        bounds = bounds.intersect(&viewport_bounds);
-        if bounds.is_empty() {
-            return None;
-        }
-
-        let origin = bounds.origin.map(|component| component.floor());
-        let bottom_right = bounds.bottom_right().map(|component| component.ceil());
-        let bounds = Bounds::from_corners(origin, bottom_right);
-        Some(BackdropScratchBounds {
-            texture_size: size(
-                DevicePixels::from(bounds.size.width),
-                DevicePixels::from(bounds.size.height),
-            ),
-            bounds,
-        })
-    }
-
-    fn max_backdrop_texture_size(
-        scratch_bounds: BackdropScratchBounds,
-        width: u32,
-        height: u32,
-    ) -> Size<DevicePixels> {
-        Size {
-            width: DevicePixels((width as i32 - scratch_bounds.bounds.origin.x.0 as i32).max(0)),
-            height: DevicePixels((height as i32 - scratch_bounds.bounds.origin.y.0 as i32).max(0)),
-        }
-    }
-
-    fn fit_backdrop_scratch_bounds(
-        mut scratch_bounds: BackdropScratchBounds,
-        texture_size: Size<DevicePixels>,
-        viewport_size: Size<DevicePixels>,
-    ) -> BackdropScratchBounds {
-        let texture_size = size(
-            texture_size.width.min(viewport_size.width),
-            texture_size.height.min(viewport_size.height),
-        );
-        let max_origin_x = (viewport_size.width.0 - texture_size.width.0).max(0) as f32;
-        let max_origin_y = (viewport_size.height.0 - texture_size.height.0).max(0) as f32;
-        let origin = point(
-            ScaledPixels(scratch_bounds.bounds.origin.x.0.clamp(0.0, max_origin_x)),
-            ScaledPixels(scratch_bounds.bounds.origin.y.0.clamp(0.0, max_origin_y)),
-        );
-        scratch_bounds.bounds = Bounds {
-            origin,
-            size: size(
-                ScaledPixels::from(texture_size.width),
-                ScaledPixels::from(texture_size.height),
-            ),
-        };
-        scratch_bounds.texture_size = texture_size;
-        scratch_bounds
-    }
-
-    fn prepare_backdrop_blurs(
-        blurs: &[BackdropBlur],
-        scratch_bounds: BackdropScratchBounds,
-    ) -> Vec<BackdropBlur> {
-        blurs
-            .iter()
-            .cloned()
-            .map(|mut blur| {
-                blur.source_origin_x = scratch_bounds.bounds.origin.x.0;
-                blur.source_origin_y = scratch_bounds.bounds.origin.y.0;
-                blur.source_width = scratch_bounds.texture_size.width.0 as f32;
-                blur.source_height = scratch_bounds.texture_size.height.0 as f32;
-                blur
-            })
-            .collect()
     }
 
     fn max_backdrop_blur_levels(&self) -> usize {

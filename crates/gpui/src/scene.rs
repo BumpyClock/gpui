@@ -898,12 +898,26 @@ pub fn can_reuse_backdrop_texture(
     current_size.width >= required_size.width && current_size.height >= required_size.height
 }
 
+/// Bounds and texture dimensions for backdrop blur scratch rendering.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct BackdropScratchBounds {
+    /// Viewport-space source bounds.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Scratch texture dimensions.
+    pub texture_size: Size<DevicePixels>,
+}
+
 /// Returns the viewport-clipped source bounds required for one backdrop blur.
 #[doc(hidden)]
 pub fn backdrop_source_bounds(
     blur: &BackdropBlur,
     viewport_size: Size<DevicePixels>,
 ) -> Option<Bounds<ScaledPixels>> {
+    if !blur.blur_radius.0.is_finite() || blur.blur_radius.0 <= 0.0 {
+        return None;
+    }
+
     let viewport_bounds = Bounds {
         origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
         size: Size {
@@ -957,6 +971,111 @@ pub fn backdrop_blur_clusters(
     }
 
     clusters.into_iter().map(|(_, blurs)| blurs).collect()
+}
+
+/// Returns viewport-clipped scratch bounds for a backdrop blur cluster.
+#[doc(hidden)]
+pub fn backdrop_scratch_bounds(
+    blurs: &[BackdropBlur],
+    viewport_size: Size<DevicePixels>,
+) -> Option<BackdropScratchBounds> {
+    let mut bounds = blurs
+        .first()?
+        .bounds
+        .dilate(backdrop_blur_padding(blurs.first()?.blur_radius.0));
+    for blur in blurs.iter().skip(1) {
+        bounds = bounds.union(
+            &blur
+                .bounds
+                .dilate(backdrop_blur_padding(blur.blur_radius.0)),
+        );
+    }
+
+    let viewport_bounds = Bounds {
+        origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+        size: Size {
+            width: ScaledPixels::from(viewport_size.width),
+            height: ScaledPixels::from(viewport_size.height),
+        },
+    };
+    bounds = bounds.intersect(&viewport_bounds);
+    if bounds.is_empty() {
+        return None;
+    }
+
+    let origin = bounds.origin.map(|component| component.floor());
+    let bottom_right = bounds.bottom_right().map(|component| component.ceil());
+    let bounds = Bounds::from_corners(origin, bottom_right);
+    Some(BackdropScratchBounds {
+        texture_size: Size {
+            width: DevicePixels::from(bounds.size.width),
+            height: DevicePixels::from(bounds.size.height),
+        },
+        bounds,
+    })
+}
+
+/// Returns the largest texture that fits from the scratch origin to the viewport edge.
+#[doc(hidden)]
+pub fn max_backdrop_texture_size(
+    scratch_bounds: BackdropScratchBounds,
+    viewport_size: Size<DevicePixels>,
+) -> Size<DevicePixels> {
+    Size {
+        width: DevicePixels(
+            (viewport_size.width.0 - scratch_bounds.bounds.origin.x.0 as i32).max(0),
+        ),
+        height: DevicePixels(
+            (viewport_size.height.0 - scratch_bounds.bounds.origin.y.0 as i32).max(0),
+        ),
+    }
+}
+
+/// Fits an allocated backdrop texture within the viewport.
+#[doc(hidden)]
+pub fn fit_backdrop_scratch_bounds(
+    mut scratch_bounds: BackdropScratchBounds,
+    texture_size: Size<DevicePixels>,
+    viewport_size: Size<DevicePixels>,
+) -> BackdropScratchBounds {
+    let texture_size = Size {
+        width: texture_size.width.min(viewport_size.width),
+        height: texture_size.height.min(viewport_size.height),
+    };
+    let max_origin_x = (viewport_size.width.0 - texture_size.width.0).max(0) as f32;
+    let max_origin_y = (viewport_size.height.0 - texture_size.height.0).max(0) as f32;
+    let origin = Point {
+        x: ScaledPixels(scratch_bounds.bounds.origin.x.0.clamp(0.0, max_origin_x)),
+        y: ScaledPixels(scratch_bounds.bounds.origin.y.0.clamp(0.0, max_origin_y)),
+    };
+    scratch_bounds.bounds = Bounds {
+        origin,
+        size: Size {
+            width: ScaledPixels::from(texture_size.width),
+            height: ScaledPixels::from(texture_size.height),
+        },
+    };
+    scratch_bounds.texture_size = texture_size;
+    scratch_bounds
+}
+
+/// Prepares backdrop blur instances to sample from shared scratch bounds.
+#[doc(hidden)]
+pub fn prepare_backdrop_blurs(
+    blurs: &[BackdropBlur],
+    scratch_bounds: BackdropScratchBounds,
+) -> Vec<BackdropBlur> {
+    blurs
+        .iter()
+        .cloned()
+        .map(|mut blur| {
+            blur.source_origin_x = scratch_bounds.bounds.origin.x.0;
+            blur.source_origin_y = scratch_bounds.bounds.origin.y.0;
+            blur.source_width = scratch_bounds.texture_size.width.0 as f32;
+            blur.source_height = scratch_bounds.texture_size.height.0 as f32;
+            blur
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1571,6 +1690,55 @@ mod tests {
             size(DevicePixels(32), DevicePixels(128)),
             required,
         ));
+    }
+
+    #[test]
+    fn backdrop_blur_clusters_exclude_noop_radii() {
+        let blurs = [
+            test_backdrop_blur_with_bounds(1, 0.0, 10.0, 0.0),
+            test_backdrop_blur_with_bounds(2, 0.0, 10.0, -1.0),
+            test_backdrop_blur_with_bounds(3, 0.0, 10.0, f32::NAN),
+        ];
+        let viewport_size = size(DevicePixels(200), DevicePixels(100));
+
+        assert!(
+            blurs
+                .iter()
+                .all(|blur| backdrop_source_bounds(blur, viewport_size).is_none())
+        );
+        assert!(backdrop_blur_clusters(&blurs, viewport_size).is_empty());
+    }
+
+    #[test]
+    fn backdrop_blur_scratch_helpers_fit_reused_textures() {
+        let blurs = [test_backdrop_blur_with_bounds(1, 80.0, 10.0, 1.0)];
+        let viewport_size = size(DevicePixels(100), DevicePixels(100));
+        let scratch_bounds = backdrop_scratch_bounds(&blurs, viewport_size).unwrap();
+
+        assert_eq!(
+            max_backdrop_texture_size(scratch_bounds, viewport_size),
+            size(DevicePixels(26), DevicePixels(100))
+        );
+
+        let fitted = fit_backdrop_scratch_bounds(
+            scratch_bounds,
+            size(DevicePixels(64), DevicePixels(64)),
+            viewport_size,
+        );
+        assert_eq!(
+            fitted.bounds.origin,
+            point(ScaledPixels(36.0), ScaledPixels(0.0))
+        );
+        assert_eq!(
+            fitted.texture_size,
+            size(DevicePixels(64), DevicePixels(64))
+        );
+
+        let prepared = prepare_backdrop_blurs(&blurs, fitted);
+        assert_eq!(prepared[0].source_origin_x, 36.0);
+        assert_eq!(prepared[0].source_origin_y, 0.0);
+        assert_eq!(prepared[0].source_width, 64.0);
+        assert_eq!(prepared[0].source_height, 64.0);
     }
 
     #[test]

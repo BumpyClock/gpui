@@ -7,11 +7,13 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, BackdropBlur, BackdropBlurPlan, Background, Bounds, ContentMask, DevicePixels,
-    GlobalElementId, MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch,
-    Quad, RetainedLayer, RetainedLayerContentRevision, ScaledPixels, Scene, Shadow, Size, Surface,
-    TransformationMatrix, Underline, backdrop_blur_clusters, backdrop_blur_level_sizes_for,
-    backdrop_blur_padding, backdrop_blur_plan_groups, can_reuse_backdrop_texture, point, size,
+    AtlasTextureId, BackdropBlur, BackdropBlurPlan, BackdropScratchBounds, Background, Bounds,
+    ContentMask, DevicePixels, GlobalElementId, MonochromeSprite, PaintSurface, Path, Point,
+    PolychromeSprite, PrimitiveBatch, Quad, RetainedLayer, RetainedLayerContentRevision,
+    ScaledPixels, Scene, Shadow, Size, Surface, TransformationMatrix, Underline,
+    backdrop_blur_clusters, backdrop_blur_level_sizes_for, backdrop_blur_plan_groups,
+    backdrop_scratch_bounds, can_reuse_backdrop_texture, fit_backdrop_scratch_bounds,
+    max_backdrop_texture_size, point, prepare_backdrop_blurs, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -225,12 +227,6 @@ pub struct PathRasterizationVertex {
 
 #[derive(Clone, Copy)]
 struct PathScratchBounds {
-    bounds: Bounds<ScaledPixels>,
-    texture_size: Size<DevicePixels>,
-}
-
-#[derive(Clone, Copy)]
-struct BackdropScratchBounds {
     bounds: Bounds<ScaledPixels>,
     texture_size: Size<DevicePixels>,
 }
@@ -1410,23 +1406,23 @@ impl MetalRenderer {
                     let mut ok = true;
                     for blurs in backdrop_blur_clusters(blurs, viewport_size) {
                         let Some(mut scratch_bounds) =
-                            Self::backdrop_scratch_bounds(&blurs, viewport_size)
+                            backdrop_scratch_bounds(&blurs, viewport_size)
                         else {
                             continue;
                         };
                         let Some(texture_size) = self.ensure_backdrop_textures(
                             scratch_bounds.texture_size,
-                            Self::max_backdrop_texture_size(scratch_bounds, viewport_size),
+                            max_backdrop_texture_size(scratch_bounds, viewport_size),
                         ) else {
                             continue;
                         };
-                        scratch_bounds = Self::fit_backdrop_scratch_bounds(
+                        scratch_bounds = fit_backdrop_scratch_bounds(
                             scratch_bounds,
                             texture_size,
                             viewport_size,
                         );
                         let level_sizes = self.backdrop_blur_level_sizes.clone();
-                        let prepared_blurs = Self::prepare_backdrop_blurs(&blurs, scratch_bounds);
+                        let prepared_blurs = prepare_backdrop_blurs(&blurs, scratch_bounds);
                         let plan_groups =
                             backdrop_blur_plan_groups(&blurs, level_sizes.len().saturating_sub(1));
 
@@ -1695,103 +1691,6 @@ impl MetalRenderer {
         command_encoder.set_fragment_texture(0, Some(source_texture));
         command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
         command_encoder.end_encoding();
-    }
-
-    fn backdrop_scratch_bounds(
-        blurs: &[BackdropBlur],
-        viewport_size: Size<DevicePixels>,
-    ) -> Option<BackdropScratchBounds> {
-        let mut bounds = blurs
-            .first()?
-            .bounds
-            .dilate(backdrop_blur_padding(blurs.first()?.blur_radius.0));
-        for blur in blurs.iter().skip(1) {
-            bounds = bounds.union(
-                &blur
-                    .bounds
-                    .dilate(backdrop_blur_padding(blur.blur_radius.0)),
-            );
-        }
-
-        let viewport_bounds = Bounds {
-            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
-            size: size(
-                ScaledPixels::from(viewport_size.width),
-                ScaledPixels::from(viewport_size.height),
-            ),
-        };
-        bounds = bounds.intersect(&viewport_bounds);
-        if bounds.is_empty() {
-            return None;
-        }
-
-        let origin = bounds.origin.map(|component| component.floor());
-        let bottom_right = bounds.bottom_right().map(|component| component.ceil());
-        let bounds = Bounds::from_corners(origin, bottom_right);
-        Some(BackdropScratchBounds {
-            texture_size: size(
-                DevicePixels::from(bounds.size.width),
-                DevicePixels::from(bounds.size.height),
-            ),
-            bounds,
-        })
-    }
-
-    fn max_backdrop_texture_size(
-        scratch_bounds: BackdropScratchBounds,
-        viewport_size: Size<DevicePixels>,
-    ) -> Size<DevicePixels> {
-        Size {
-            width: DevicePixels(
-                (viewport_size.width.0 - scratch_bounds.bounds.origin.x.0 as i32).max(0),
-            ),
-            height: DevicePixels(
-                (viewport_size.height.0 - scratch_bounds.bounds.origin.y.0 as i32).max(0),
-            ),
-        }
-    }
-
-    fn fit_backdrop_scratch_bounds(
-        mut scratch_bounds: BackdropScratchBounds,
-        texture_size: Size<DevicePixels>,
-        viewport_size: Size<DevicePixels>,
-    ) -> BackdropScratchBounds {
-        let texture_size = size(
-            texture_size.width.min(viewport_size.width),
-            texture_size.height.min(viewport_size.height),
-        );
-        let max_origin_x = (viewport_size.width.0 - texture_size.width.0).max(0) as f32;
-        let max_origin_y = (viewport_size.height.0 - texture_size.height.0).max(0) as f32;
-        let origin = point(
-            ScaledPixels(scratch_bounds.bounds.origin.x.0.clamp(0.0, max_origin_x)),
-            ScaledPixels(scratch_bounds.bounds.origin.y.0.clamp(0.0, max_origin_y)),
-        );
-        scratch_bounds.bounds = Bounds {
-            origin,
-            size: size(
-                ScaledPixels::from(texture_size.width),
-                ScaledPixels::from(texture_size.height),
-            ),
-        };
-        scratch_bounds.texture_size = texture_size;
-        scratch_bounds
-    }
-
-    fn prepare_backdrop_blurs(
-        blurs: &[BackdropBlur],
-        scratch_bounds: BackdropScratchBounds,
-    ) -> Vec<BackdropBlur> {
-        blurs
-            .iter()
-            .cloned()
-            .map(|mut blur| {
-                blur.source_origin_x = scratch_bounds.bounds.origin.x.0;
-                blur.source_origin_y = scratch_bounds.bounds.origin.y.0;
-                blur.source_width = scratch_bounds.texture_size.width.0 as f32;
-                blur.source_height = scratch_bounds.texture_size.height.0 as f32;
-                blur
-            })
-            .collect()
     }
 
     fn backdrop_blur_needs_source_snapshot(
