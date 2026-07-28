@@ -5,8 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, GlobalElementId,
-    Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, DevicePixels, Edges,
+    GlobalElementId, Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree,
+    point,
 };
 use std::{
     fmt::Debug,
@@ -829,6 +830,135 @@ impl PartialEq for BackdropBlurPlan {
 
 impl Eq for BackdropBlurPlan {}
 
+/// Returns the padded source extent for a backdrop blur radius.
+#[doc(hidden)]
+pub fn backdrop_blur_padding(radius: f32) -> ScaledPixels {
+    ScaledPixels(BackdropBlurPlan::padding(radius))
+}
+
+/// Returns the texture dimensions for each available backdrop blur pyramid level.
+#[doc(hidden)]
+pub fn backdrop_blur_level_sizes_for(size: Size<DevicePixels>) -> Vec<Size<DevicePixels>> {
+    let mut level_sizes = Vec::new();
+    if size.width.0 <= 0 || size.height.0 <= 0 {
+        return level_sizes;
+    }
+
+    level_sizes.push(size);
+    let mut level_size = size;
+    for _ in 0..BackdropBlurPlan::MAX_PASSES {
+        let next_width = level_size.width.0 / 2;
+        let next_height = level_size.height.0 / 2;
+        if next_width < 2 || next_height < 2 {
+            break;
+        }
+        level_size = Size {
+            width: DevicePixels(next_width),
+            height: DevicePixels(next_height),
+        };
+        level_sizes.push(level_size);
+    }
+    level_sizes
+}
+
+/// Builds a backdrop blur plan limited to the available pyramid passes.
+#[doc(hidden)]
+pub fn backdrop_blur_plan_for_radius(radius: f32, available_passes: usize) -> BackdropBlurPlan {
+    BackdropBlurPlan::for_radius(radius, available_passes)
+}
+
+/// Groups adjacent backdrop blurs that share one complete blur plan.
+#[doc(hidden)]
+pub fn backdrop_blur_plan_groups(
+    blurs: &[BackdropBlur],
+    available_passes: usize,
+) -> Vec<(usize, usize, BackdropBlurPlan)> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < blurs.len() {
+        let plan = backdrop_blur_plan_for_radius(blurs[start].blur_radius.0, available_passes);
+        let mut end = start + 1;
+        while end < blurs.len()
+            && backdrop_blur_plan_for_radius(blurs[end].blur_radius.0, available_passes) == plan
+        {
+            end += 1;
+        }
+        groups.push((start, end, plan));
+        start = end;
+    }
+    groups
+}
+
+/// Returns whether an allocated backdrop texture can fit the required region.
+#[doc(hidden)]
+pub fn can_reuse_backdrop_texture(
+    current_size: Size<DevicePixels>,
+    required_size: Size<DevicePixels>,
+) -> bool {
+    current_size.width >= required_size.width && current_size.height >= required_size.height
+}
+
+/// Returns the viewport-clipped source bounds required for one backdrop blur.
+#[doc(hidden)]
+pub fn backdrop_source_bounds(
+    blur: &BackdropBlur,
+    viewport_size: Size<DevicePixels>,
+) -> Option<Bounds<ScaledPixels>> {
+    let viewport_bounds = Bounds {
+        origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+        size: Size {
+            width: ScaledPixels::from(viewport_size.width),
+            height: ScaledPixels::from(viewport_size.height),
+        },
+    };
+    let bounds = blur
+        .bounds
+        .dilate(backdrop_blur_padding(blur.blur_radius.0))
+        .intersect(&viewport_bounds);
+    if bounds.is_empty() {
+        return None;
+    }
+
+    let origin = bounds.origin.map(|component| component.floor());
+    let bottom_right = bounds.bottom_right().map(|component| component.ceil());
+    Some(Bounds::from_corners(origin, bottom_right))
+}
+
+/// Clusters backdrop blurs whose padded source regions overlap.
+///
+/// Intervening clusters join a merged cluster so each source snapshot covers a
+/// contiguous draw-order epoch.
+#[doc(hidden)]
+pub fn backdrop_blur_clusters(
+    blurs: &[BackdropBlur],
+    viewport_size: Size<DevicePixels>,
+) -> Vec<Vec<BackdropBlur>> {
+    let mut clusters: Vec<(Bounds<ScaledPixels>, Vec<BackdropBlur>)> = Vec::new();
+    for blur in blurs {
+        let Some(mut cluster_bounds) = backdrop_source_bounds(blur, viewport_size) else {
+            continue;
+        };
+        let mut cluster_blurs = vec![blur.clone()];
+
+        while let Some(first_overlapping_cluster_ix) = clusters
+            .iter()
+            .position(|(bounds, _)| bounds.intersects(&cluster_bounds))
+        {
+            let mut preceding_blurs = Vec::new();
+            for (bounds, mut blurs) in clusters.drain(first_overlapping_cluster_ix..) {
+                cluster_bounds = cluster_bounds.union(&bounds);
+                preceding_blurs.append(&mut blurs);
+            }
+            preceding_blurs.append(&mut cluster_blurs);
+            cluster_blurs = preceding_blurs;
+        }
+
+        clusters.push((cluster_bounds, cluster_blurs));
+    }
+
+    clusters.into_iter().map(|(_, blurs)| blurs).collect()
+}
+
 #[derive(Debug, Clone)]
 #[repr(C)]
 #[expect(missing_docs)]
@@ -1269,14 +1399,26 @@ mod tests {
     }
 
     fn test_backdrop_blur(order: DrawOrder) -> BackdropBlur {
-        let bounds = test_bounds();
+        test_backdrop_blur_with_bounds(order, 0.0, 10.0, 12.0)
+    }
+
+    fn test_backdrop_blur_with_bounds(
+        order: DrawOrder,
+        x: f32,
+        width: f32,
+        radius: f32,
+    ) -> BackdropBlur {
+        let bounds = Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(0.0)),
+            size(ScaledPixels(width), ScaledPixels(10.0)),
+        );
         BackdropBlur {
             order,
             pad: 0,
             bounds,
             content_mask: ContentMask::new(bounds),
             corner_radii: Corners::all(ScaledPixels(2.0)),
-            blur_radius: ScaledPixels(12.0),
+            blur_radius: ScaledPixels(radius),
             source_origin_x: 0.0,
             source_origin_y: 0.0,
             source_width: 1.0,
@@ -1381,6 +1523,104 @@ mod tests {
         assert_eq!(BackdropBlurPlan::padding(120.0), 122.0);
         assert!(BackdropBlurPlan::padding(1_000.0) < 500.0);
         assert_eq!(BackdropBlurPlan::padding(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn backdrop_blur_pyramid_limits_plans_to_available_levels() {
+        let full_level_sizes =
+            backdrop_blur_level_sizes_for(size(DevicePixels(4096), DevicePixels(4096)));
+        assert_eq!(full_level_sizes.len(), BackdropBlurPlan::MAX_PASSES + 1);
+        assert_eq!(
+            backdrop_blur_plan_for_radius(240.0, full_level_sizes.len() - 1).passes,
+            BackdropBlurPlan::MAX_PASSES
+        );
+
+        let small_level_sizes =
+            backdrop_blur_level_sizes_for(size(DevicePixels(8), DevicePixels(8)));
+        assert_eq!(small_level_sizes.len(), 3);
+        assert_eq!(
+            backdrop_blur_plan_for_radius(240.0, small_level_sizes.len() - 1).passes,
+            2
+        );
+    }
+
+    #[test]
+    fn backdrop_blur_groups_require_equal_sample_distance() {
+        let blurs = [
+            test_backdrop_blur_with_bounds(0, 0.0, 10.0, 8.0),
+            test_backdrop_blur_with_bounds(1, 0.0, 10.0, 8.0),
+            test_backdrop_blur_with_bounds(2, 0.0, 10.0, 9.0),
+        ];
+        let groups = backdrop_blur_plan_groups(&blurs, BackdropBlurPlan::MAX_PASSES);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!((groups[0].0, groups[0].1, groups[0].2.passes), (0, 2, 1));
+        assert_eq!((groups[1].0, groups[1].1, groups[1].2.passes), (2, 3, 1));
+        assert_ne!(groups[0].2.sample_distance, groups[1].2.sample_distance);
+    }
+
+    #[test]
+    fn backdrop_blur_texture_reuse_depends_only_on_required_size() {
+        let required = size(DevicePixels(64), DevicePixels(64));
+
+        assert!(can_reuse_backdrop_texture(
+            size(DevicePixels(512), DevicePixels(512)),
+            required,
+        ));
+        assert!(!can_reuse_backdrop_texture(
+            size(DevicePixels(32), DevicePixels(128)),
+            required,
+        ));
+    }
+
+    #[test]
+    fn backdrop_blur_clusters_preserve_interleaved_source_order() {
+        let blurs = [
+            test_backdrop_blur_with_bounds(7, 0.0, 10.0, 1.0),
+            test_backdrop_blur_with_bounds(3, 50.0, 10.0, 1.0),
+            test_backdrop_blur_with_bounds(9, 15.0, 10.0, 1.0),
+        ];
+
+        let clusters = backdrop_blur_clusters(&blurs, size(DevicePixels(200), DevicePixels(100)));
+
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(
+            clusters
+                .iter()
+                .flatten()
+                .map(|blur| blur.order)
+                .collect::<Vec<_>>(),
+            vec![7, 3, 9]
+        );
+    }
+
+    #[test]
+    fn backdrop_blur_clusters_merge_adjacent_transitive_overlaps() {
+        let blurs = [
+            test_backdrop_blur_with_bounds(7, 0.0, 10.0, 1.0),
+            test_backdrop_blur_with_bounds(3, 30.0, 10.0, 1.0),
+            test_backdrop_blur_with_bounds(9, 11.0, 18.0, 1.0),
+            test_backdrop_blur_with_bounds(11, 150.0, 10.0, 1.0),
+            test_backdrop_blur_with_bounds(13, 300.0, 10.0, 1.0),
+        ];
+
+        let clusters = backdrop_blur_clusters(&blurs, size(DevicePixels(200), DevicePixels(100)));
+
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(
+            clusters[0]
+                .iter()
+                .map(|blur| blur.order)
+                .collect::<Vec<_>>(),
+            vec![7, 3, 9]
+        );
+        assert_eq!(
+            clusters[1]
+                .iter()
+                .map(|blur| blur.order)
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
     }
 
     #[test]
