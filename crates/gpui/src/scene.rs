@@ -979,10 +979,10 @@ pub fn backdrop_scratch_bounds(
     blurs: &[BackdropBlur],
     viewport_size: Size<DevicePixels>,
 ) -> Option<BackdropScratchBounds> {
-    let mut bounds = blurs
-        .first()?
+    let first = blurs.first()?;
+    let mut bounds = first
         .bounds
-        .dilate(backdrop_blur_padding(blurs.first()?.blur_radius.0));
+        .dilate(backdrop_blur_padding(first.blur_radius.0));
     for blur in blurs.iter().skip(1) {
         bounds = bounds.union(
             &blur
