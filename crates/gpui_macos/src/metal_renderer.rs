@@ -7,9 +7,9 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, GlobalElementId,
-    MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
-    RetainedLayer, RetainedLayerContentRevision, ScaledPixels, Scene, Shadow, Size, Surface,
+    AtlasTextureId, BackdropBlur, BackdropBlurPlan, Background, Bounds, ContentMask, DevicePixels,
+    GlobalElementId, MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch,
+    Quad, RetainedLayer, RetainedLayerContentRevision, ScaledPixels, Scene, Shadow, Size, Surface,
     TransformationMatrix, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -46,9 +46,7 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
-const BACKDROP_BLUR_RADIUS_PER_LEVEL: f32 = 6.0;
-const MAX_BACKDROP_BLUR_LEVELS: usize = 4;
-const BACKDROP_BLUR_OFFSET: f32 = 1.0;
+const MAX_BACKDROP_BLUR_LEVELS: usize = BackdropBlurPlan::MAX_PASSES;
 const BACKDROP_TEXTURE_SIZE_QUANTUM: i32 = 64;
 
 use crate::dispatch_semaphore::FrameSemaphore;
@@ -208,7 +206,6 @@ pub(crate) struct MetalRenderer {
     backdrop_blur_level_sizes: Vec<Size<DevicePixels>>,
     backdrop_blur_downsample_textures: Vec<metal::Texture>,
     backdrop_blur_upsample_textures: Vec<metal::Texture>,
-    backdrop_debug_last_scratch: Option<(i32, i32, u64, usize)>,
     retained_layers: HashMap<RetainedLayerCacheKey, CachedRetainedLayer>,
     path_sample_count: u32,
     is_apple_gpu: bool,
@@ -243,7 +240,7 @@ struct BackdropBlurParams {
     input_origin: [f32; 2],
     input_size: Size<DevicePixels>,
     texture_size: Size<DevicePixels>,
-    offset: f32,
+    sample_distance: f32,
     pad: f32,
 }
 
@@ -389,7 +386,7 @@ impl MetalRenderer {
             "backdrop_blur_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
-        let backdrop_blur_downsample_pipeline_state = build_pipeline_state(
+        let backdrop_blur_downsample_pipeline_state = build_no_blend_pipeline_state(
             &device,
             &library,
             "backdrop_blur_downsample",
@@ -397,7 +394,7 @@ impl MetalRenderer {
             "backdrop_blur_downsample_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
-        let backdrop_blur_upsample_pipeline_state = build_pipeline_state(
+        let backdrop_blur_upsample_pipeline_state = build_no_blend_pipeline_state(
             &device,
             &library,
             "backdrop_blur_upsample",
@@ -492,7 +489,6 @@ impl MetalRenderer {
             backdrop_blur_level_sizes: Vec::new(),
             backdrop_blur_downsample_textures: Vec::new(),
             backdrop_blur_upsample_textures: Vec::new(),
-            backdrop_debug_last_scratch: None,
             retained_layers: HashMap::default(),
             path_sample_count: PATH_SAMPLE_COUNT,
             is_apple_gpu,
@@ -578,7 +574,6 @@ impl MetalRenderer {
         self.backdrop_blur_level_sizes.clear();
         self.backdrop_blur_downsample_textures.clear();
         self.backdrop_blur_upsample_textures.clear();
-        self.backdrop_debug_last_scratch = None;
     }
 
     fn ensure_path_intermediate_textures(
@@ -646,7 +641,7 @@ impl MetalRenderer {
     ) -> Option<Size<DevicePixels>> {
         let size = Self::quantize_backdrop_texture_size(size, max_size);
         if let Some(current_size) = self.backdrop_texture_size {
-            if current_size.width >= size.width && current_size.height >= size.height {
+            if Self::can_reuse_backdrop_texture(current_size, size, max_size) {
                 return Some(current_size);
             }
             return self.create_backdrop_textures(Size {
@@ -656,6 +651,17 @@ impl MetalRenderer {
         }
 
         self.create_backdrop_textures(size)
+    }
+
+    fn can_reuse_backdrop_texture(
+        current_size: Size<DevicePixels>,
+        required_size: Size<DevicePixels>,
+        max_size: Size<DevicePixels>,
+    ) -> bool {
+        current_size.width >= required_size.width
+            && current_size.height >= required_size.height
+            && current_size.width <= max_size.width
+            && current_size.height <= max_size.height
     }
 
     fn quantize_backdrop_texture_size(
@@ -687,15 +693,6 @@ impl MetalRenderer {
 
         self.update_backdrop_blur_textures(size);
         self.backdrop_texture_size = Some(size);
-        if Self::backdrop_debug_enabled() {
-            eprintln!(
-                "[gpui backdrop blur] backdrop allocate {}x{} levels={} retained={:.1} MiB",
-                size.width.0,
-                size.height.0,
-                self.backdrop_blur_level_sizes.len(),
-                Self::bytes_to_mib(self.backdrop_texture_bytes()),
-            );
-        }
         Some(size)
     }
 
@@ -772,110 +769,6 @@ impl MetalRenderer {
         level_sizes
     }
 
-    fn backdrop_debug_enabled() -> bool {
-        std::env::var_os("GPUI_BACKDROP_BLUR_DEBUG").is_some()
-    }
-
-    fn bytes_to_mib(bytes: u64) -> f64 {
-        bytes as f64 / 1024.0 / 1024.0
-    }
-
-    fn texture_bytes(size: Size<DevicePixels>) -> u64 {
-        size.width.0.max(0) as u64 * size.height.0.max(0) as u64 * 4
-    }
-
-    fn backdrop_texture_bytes_for_size(size: Size<DevicePixels>) -> u64 {
-        let levels = Self::backdrop_blur_level_sizes_for(size);
-        levels
-            .iter()
-            .skip(1)
-            .copied()
-            .map(Self::texture_bytes)
-            .sum::<u64>()
-            + levels.iter().copied().map(Self::texture_bytes).sum::<u64>()
-    }
-
-    fn backdrop_texture_bytes(&self) -> u64 {
-        self.backdrop_texture_size
-            .map(Self::backdrop_texture_bytes_for_size)
-            .unwrap_or(0)
-    }
-
-    fn backdrop_individual_area(blurs: &[BackdropBlur], viewport_size: Size<DevicePixels>) -> u64 {
-        let viewport_bounds = Bounds {
-            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
-            size: size(
-                ScaledPixels::from(viewport_size.width),
-                ScaledPixels::from(viewport_size.height),
-            ),
-        };
-
-        blurs
-            .iter()
-            .map(|blur| {
-                let bounds = blur
-                    .bounds
-                    .dilate(Self::backdrop_blur_padding(blur.blur_radius.0))
-                    .intersect(&viewport_bounds);
-                if bounds.is_empty() {
-                    return 0;
-                }
-
-                let origin = bounds.origin.map(|component| component.floor());
-                let bottom_right = bounds.bottom_right().map(|component| component.ceil());
-                let bounds = Bounds::from_corners(origin, bottom_right);
-                DevicePixels::from(bounds.size.width).0.max(0) as u64
-                    * DevicePixels::from(bounds.size.height).0.max(0) as u64
-            })
-            .sum()
-    }
-
-    fn log_backdrop_scratch(
-        &mut self,
-        blurs: &[BackdropBlur],
-        scratch_bounds: BackdropScratchBounds,
-        viewport_size: Size<DevicePixels>,
-    ) {
-        if !Self::backdrop_debug_enabled() {
-            return;
-        }
-
-        let individual_area = Self::backdrop_individual_area(blurs, viewport_size);
-        let union_area = scratch_bounds.texture_size.width.0.max(0) as u64
-            * scratch_bounds.texture_size.height.0.max(0) as u64;
-        let signature = (
-            scratch_bounds.texture_size.width.0,
-            scratch_bounds.texture_size.height.0,
-            individual_area,
-            blurs.len(),
-        );
-        if self.backdrop_debug_last_scratch == Some(signature) {
-            return;
-        }
-        self.backdrop_debug_last_scratch = Some(signature);
-
-        let waste_ratio = if individual_area > 0 {
-            union_area as f64 / individual_area as f64
-        } else {
-            0.0
-        };
-        eprintln!(
-            "[gpui backdrop blur] batch blurs={} scratch={}x{} copy={:.1} MiB pyramid={:.1} MiB individual_area={} union_area={} waste={:.1}x viewport={}x{}",
-            blurs.len(),
-            scratch_bounds.texture_size.width.0,
-            scratch_bounds.texture_size.height.0,
-            Self::bytes_to_mib(Self::texture_bytes(scratch_bounds.texture_size)),
-            Self::bytes_to_mib(Self::backdrop_texture_bytes_for_size(
-                scratch_bounds.texture_size
-            )),
-            individual_area,
-            union_area,
-            waste_ratio,
-            viewport_size.width.0,
-            viewport_size.height.0,
-        );
-    }
-
     pub fn update_transparency(&self, transparent: bool) {
         self.layer.set_opaque(!transparent);
     }
@@ -914,12 +807,6 @@ impl MetalRenderer {
             .acquire(&self.device, required_instance_buffer_size);
 
         if !has_backdrop_blurs && self.backdrop_texture_size.is_some() {
-            if Self::backdrop_debug_enabled() {
-                eprintln!(
-                    "[gpui backdrop blur] no blur in scene; releasing backdrop textures={:.1} MiB",
-                    Self::bytes_to_mib(self.backdrop_texture_bytes()),
-                );
-            }
             self.discard_backdrop_textures();
         }
 
@@ -1542,21 +1429,6 @@ impl MetalRenderer {
                 }
             },
         );
-        let frame_backdrop_scratch_bounds = Self::backdrop_scratch_bounds(
-            &scene.backdrop_blurs,
-            viewport_size,
-        )
-        .and_then(|scratch_bounds| {
-            self.log_backdrop_scratch(&scene.backdrop_blurs, scratch_bounds, viewport_size);
-            self.ensure_backdrop_textures(scratch_bounds.texture_size, viewport_size)
-                .map(|texture_size| {
-                    Self::fit_backdrop_scratch_bounds(scratch_bounds, texture_size, viewport_size)
-                })
-        });
-        let frame_backdrop_blur_level_sizes = frame_backdrop_scratch_bounds
-            .map(|scratch_bounds| Self::backdrop_blur_level_sizes_for(scratch_bounds.texture_size))
-            .unwrap_or_default();
-
         for batch in scene.batches() {
             let ok = match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(
@@ -1569,56 +1441,46 @@ impl MetalRenderer {
                 PrimitiveBatch::BackdropBlurs(range) => {
                     let blurs = &scene.backdrop_blurs[range];
                     command_encoder.end_encoding();
-                    if blurs.is_empty() {
-                        command_encoder = new_command_encoder(
-                            command_buffer,
-                            target_texture,
-                            viewport_size,
-                            |color_attachment| {
-                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
-                            },
-                        );
-                        true
-                    } else if let Some(scratch_bounds) = frame_backdrop_scratch_bounds {
-                        let prepared_blurs = Self::prepare_backdrop_blurs(blurs, scratch_bounds);
-                        let mut pass_groups = Vec::new();
-                        let mut start = 0;
-                        while start < blurs.len() {
-                            let passes = self.backdrop_blur_passes_for_radius(
-                                blurs[start].blur_radius.0,
-                                &frame_backdrop_blur_level_sizes,
-                            );
-                            let mut end = start + 1;
-                            while end < blurs.len()
-                                && self.backdrop_blur_passes_for_radius(
-                                    blurs[end].blur_radius.0,
-                                    &frame_backdrop_blur_level_sizes,
-                                ) == passes
-                            {
-                                end += 1;
-                            }
-                            pass_groups.push((start, end, passes));
-                            start = end;
-                        }
-
-                        let needs_source_snapshot = pass_groups.len() > 1
-                            || pass_groups.iter().any(|(_, _, passes)| *passes == 0);
-                        let source_snapshot = if needs_source_snapshot {
-                            let Some(texture) = self.ensure_backdrop_source_texture() else {
-                                anyhow::bail!("failed to create backdrop source texture");
-                            };
-                            self.render_texture_copy(
-                                command_buffer,
-                                target_texture,
-                                &texture,
-                                scratch_bounds.bounds.origin.x.0,
-                                scratch_bounds.bounds.origin.y.0,
-                                scratch_bounds.texture_size,
-                            );
-                            Some(texture)
-                        } else {
-                            None
+                    let mut ok = true;
+                    for blurs in Self::backdrop_blur_clusters(blurs, viewport_size) {
+                        let Some(mut scratch_bounds) =
+                            Self::backdrop_scratch_bounds(&blurs, viewport_size)
+                        else {
+                            continue;
                         };
+                        let Some(texture_size) = self.ensure_backdrop_textures(
+                            scratch_bounds.texture_size,
+                            Self::max_backdrop_texture_size(scratch_bounds, viewport_size),
+                        ) else {
+                            continue;
+                        };
+                        scratch_bounds = Self::fit_backdrop_scratch_bounds(
+                            scratch_bounds,
+                            texture_size,
+                            viewport_size,
+                        );
+                        let level_sizes =
+                            Self::backdrop_blur_level_sizes_for(scratch_bounds.texture_size);
+                        let prepared_blurs = Self::prepare_backdrop_blurs(&blurs, scratch_bounds);
+                        let plan_groups = Self::backdrop_blur_plan_groups(&blurs, &level_sizes);
+
+                        let source_snapshot =
+                            if Self::backdrop_blur_needs_source_snapshot(&plan_groups) {
+                                let Some(texture) = self.ensure_backdrop_source_texture() else {
+                                    anyhow::bail!("failed to create backdrop source texture");
+                                };
+                                self.render_texture_copy(
+                                    command_buffer,
+                                    target_texture,
+                                    &texture,
+                                    scratch_bounds.bounds.origin.x.0,
+                                    scratch_bounds.bounds.origin.y.0,
+                                    scratch_bounds.texture_size,
+                                );
+                                Some(texture)
+                            } else {
+                                None
+                            };
 
                         let source_texture = source_snapshot
                             .as_ref()
@@ -1635,15 +1497,14 @@ impl MetalRenderer {
                                 point(ScaledPixels(0.0), ScaledPixels(0.0));
                         }
 
-                        let mut ok = true;
-                        for (start, end, passes) in pass_groups {
-                            let blur_texture = self.render_backdrop_blur_texture_for_passes(
+                        for (start, end, plan) in plan_groups {
+                            let blur_texture = self.render_backdrop_blur_texture_for_plan(
                                 command_buffer,
                                 source_texture,
                                 source_texture_size,
                                 input_scratch_bounds,
-                                passes,
-                                &frame_backdrop_blur_level_sizes,
+                                plan,
+                                &level_sizes,
                                 source_snapshot.is_none(),
                             );
                             command_encoder = new_command_encoder(
@@ -1670,26 +1531,19 @@ impl MetalRenderer {
                                 break;
                             }
                         }
-                        command_encoder = new_command_encoder(
-                            command_buffer,
-                            target_texture,
-                            viewport_size,
-                            |color_attachment| {
-                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
-                            },
-                        );
-                        ok
-                    } else {
-                        command_encoder = new_command_encoder(
-                            command_buffer,
-                            target_texture,
-                            viewport_size,
-                            |color_attachment| {
-                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
-                            },
-                        );
-                        true
+                        if !ok {
+                            break;
+                        }
                     }
+                    command_encoder = new_command_encoder(
+                        command_buffer,
+                        target_texture,
+                        viewport_size,
+                        |color_attachment| {
+                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                        },
+                    );
+                    ok
                 }
                 PrimitiveBatch::Quads(range) => self.draw_quads(
                     &scene.quads[range],
@@ -1917,6 +1771,86 @@ impl MetalRenderer {
         })
     }
 
+    fn backdrop_source_bounds(
+        blur: &BackdropBlur,
+        viewport_size: Size<DevicePixels>,
+    ) -> Option<Bounds<ScaledPixels>> {
+        let viewport_bounds = Bounds {
+            origin: point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(
+                ScaledPixels::from(viewport_size.width),
+                ScaledPixels::from(viewport_size.height),
+            ),
+        };
+        let bounds = blur
+            .bounds
+            .dilate(Self::backdrop_blur_padding(blur.blur_radius.0))
+            .intersect(&viewport_bounds);
+        if bounds.is_empty() {
+            return None;
+        }
+
+        let origin = bounds.origin.map(|component| component.floor());
+        let bottom_right = bounds.bottom_right().map(|component| component.ceil());
+        Some(Bounds::from_corners(origin, bottom_right))
+    }
+
+    fn backdrop_blur_clusters(
+        blurs: &[BackdropBlur],
+        viewport_size: Size<DevicePixels>,
+    ) -> Vec<Vec<BackdropBlur>> {
+        let mut clusters: Vec<(Bounds<ScaledPixels>, Vec<(usize, BackdropBlur)>)> = Vec::new();
+        for (blur_ix, blur) in blurs.iter().enumerate() {
+            let Some(mut cluster_bounds) = Self::backdrop_source_bounds(blur, viewport_size) else {
+                continue;
+            };
+            let mut cluster_blurs = vec![(blur_ix, blur.clone())];
+
+            loop {
+                let overlapping_cluster_ixs = clusters
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(ix, (bounds, _))| {
+                        bounds.intersects(&cluster_bounds).then_some(ix)
+                    })
+                    .collect::<Vec<_>>();
+                if overlapping_cluster_ixs.is_empty() {
+                    break;
+                }
+
+                for ix in overlapping_cluster_ixs.into_iter().rev() {
+                    let (bounds, mut blurs) = clusters.remove(ix);
+                    cluster_bounds = cluster_bounds.union(&bounds);
+                    cluster_blurs.append(&mut blurs);
+                }
+            }
+
+            clusters.push((cluster_bounds, cluster_blurs));
+        }
+
+        clusters
+            .into_iter()
+            .map(|(_, mut blurs)| {
+                blurs.sort_by_key(|(ix, _)| *ix);
+                blurs.into_iter().map(|(_, blur)| blur).collect()
+            })
+            .collect()
+    }
+
+    fn max_backdrop_texture_size(
+        scratch_bounds: BackdropScratchBounds,
+        viewport_size: Size<DevicePixels>,
+    ) -> Size<DevicePixels> {
+        Size {
+            width: DevicePixels(
+                (viewport_size.width.0 - scratch_bounds.bounds.origin.x.0 as i32).max(0),
+            ),
+            height: DevicePixels(
+                (viewport_size.height.0 - scratch_bounds.bounds.origin.y.0 as i32).max(0),
+            ),
+        }
+    }
+
     fn fit_backdrop_scratch_bounds(
         mut scratch_bounds: BackdropScratchBounds,
         texture_size: Size<DevicePixels>,
@@ -1944,7 +1878,7 @@ impl MetalRenderer {
     }
 
     fn backdrop_blur_padding(radius: f32) -> ScaledPixels {
-        ScaledPixels((radius + BACKDROP_BLUR_RADIUS_PER_LEVEL * 2.0).ceil())
+        ScaledPixels(BackdropBlurPlan::padding(radius))
     }
 
     fn prepare_backdrop_blurs(
@@ -1964,44 +1898,68 @@ impl MetalRenderer {
             .collect()
     }
 
-    fn backdrop_blur_passes_for_radius(
-        &self,
+    fn backdrop_blur_plan_for_radius(
         radius: f32,
         level_sizes: &[Size<DevicePixels>],
-    ) -> usize {
-        if radius <= 0.0 {
-            return 0;
-        }
-        let max_levels = level_sizes.len().saturating_sub(1);
-        if max_levels == 0 {
-            return 0;
-        }
-        let passes = (radius / BACKDROP_BLUR_RADIUS_PER_LEVEL).ceil() as usize;
-        passes.clamp(1, max_levels)
+    ) -> BackdropBlurPlan {
+        BackdropBlurPlan::for_radius(
+            radius,
+            level_sizes
+                .len()
+                .saturating_sub(1)
+                .min(MAX_BACKDROP_BLUR_LEVELS),
+        )
     }
 
-    fn render_backdrop_blur_texture_for_passes<'a>(
+    fn backdrop_blur_plan_groups(
+        blurs: &[BackdropBlur],
+        level_sizes: &[Size<DevicePixels>],
+    ) -> Vec<(usize, usize, BackdropBlurPlan)> {
+        let mut groups = Vec::new();
+        let mut start = 0;
+        while start < blurs.len() {
+            let plan = Self::backdrop_blur_plan_for_radius(blurs[start].blur_radius.0, level_sizes);
+            let mut end = start + 1;
+            while end < blurs.len()
+                && Self::backdrop_blur_plan_for_radius(blurs[end].blur_radius.0, level_sizes)
+                    == plan
+            {
+                end += 1;
+            }
+            groups.push((start, end, plan));
+            start = end;
+        }
+        groups
+    }
+
+    fn backdrop_blur_needs_source_snapshot(
+        plan_groups: &[(usize, usize, BackdropBlurPlan)],
+    ) -> bool {
+        plan_groups.len() > 1 || plan_groups.iter().any(|(_, _, plan)| plan.passes == 0)
+    }
+
+    fn render_backdrop_blur_texture_for_plan<'a>(
         &'a self,
         command_buffer: &metal::CommandBufferRef,
         source_texture: &'a metal::TextureRef,
         source_texture_size: Size<DevicePixels>,
         scratch_bounds: BackdropScratchBounds,
-        passes: usize,
+        plan: BackdropBlurPlan,
         level_sizes: &[Size<DevicePixels>],
         source_texture_is_target: bool,
     ) -> Option<&'a metal::TextureRef> {
-        if passes == 0 {
+        if plan.passes == 0 {
             return (!source_texture_is_target).then_some(source_texture);
         }
 
-        if self.backdrop_blur_downsample_textures.len() < passes
+        if self.backdrop_blur_downsample_textures.len() < plan.passes
             || self.backdrop_blur_upsample_textures.is_empty()
         {
             return None;
         }
 
         let mut input_texture = source_texture;
-        for level in 0..passes {
+        for level in 0..plan.passes {
             let output_texture: &metal::TextureRef = &self.backdrop_blur_downsample_textures[level];
             let input_size = level_sizes[level];
             let output_size = level_sizes[level + 1];
@@ -2025,13 +1983,14 @@ impl MetalRenderer {
                 input_size,
                 texture_size,
                 output_size,
+                plan.sample_distance,
             );
             input_texture = output_texture;
         }
 
         let mut input_texture: &metal::TextureRef =
-            &self.backdrop_blur_downsample_textures[passes - 1];
-        for level in (0..passes).rev() {
+            &self.backdrop_blur_downsample_textures[plan.passes - 1];
+        for level in (0..plan.passes).rev() {
             let output_texture: &metal::TextureRef = &self.backdrop_blur_upsample_textures[level];
             let input_size = level_sizes[level + 1];
             let output_size = level_sizes[level];
@@ -2044,6 +2003,7 @@ impl MetalRenderer {
                 input_size,
                 input_size,
                 output_size,
+                plan.sample_distance,
             );
             input_texture = output_texture;
         }
@@ -2063,6 +2023,7 @@ impl MetalRenderer {
         input_size: Size<DevicePixels>,
         texture_size: Size<DevicePixels>,
         output_size: Size<DevicePixels>,
+        sample_distance: f32,
     ) {
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         let color_attachment = render_pass_descriptor
@@ -2094,7 +2055,7 @@ impl MetalRenderer {
             input_origin,
             input_size,
             texture_size,
-            offset: BACKDROP_BLUR_OFFSET,
+            sample_distance,
             pad: 0.0,
         };
         command_encoder.set_fragment_bytes(
@@ -2941,6 +2902,36 @@ fn build_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+fn build_no_blend_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    descriptor
+        .color_attachments()
+        .object_at(0)
+        .unwrap()
+        .set_pixel_format(pixel_format);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
 fn build_path_sprite_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -3160,6 +3151,143 @@ mod tests {
             paint_range: 0..scene.paint_operation_count(),
         });
         scene
+    }
+
+    fn backdrop_blur(radius: f32) -> BackdropBlur {
+        backdrop_blur_with_bounds(0, 0.0, 100.0, radius)
+    }
+
+    fn backdrop_blur_with_bounds(order: u32, x: f32, width: f32, radius: f32) -> BackdropBlur {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(x), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(width), ScaledPixels(10.0)),
+        );
+        BackdropBlur {
+            order,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask::new(bounds),
+            corner_radii: Corners::default(),
+            blur_radius: ScaledPixels(radius),
+            source_origin_x: 0.0,
+            source_origin_y: 0.0,
+            source_width: 1.0,
+            source_height: 1.0,
+            pad2: 0,
+        }
+    }
+
+    #[test]
+    fn backdrop_blur_pyramid_supports_six_passes_and_small_textures_limit_plans() {
+        let full_level_sizes = MetalRenderer::backdrop_blur_level_sizes_for(Size::new(
+            DevicePixels(4096),
+            DevicePixels(4096),
+        ));
+        assert_eq!(full_level_sizes.len(), MAX_BACKDROP_BLUR_LEVELS + 1);
+        assert_eq!(
+            MetalRenderer::backdrop_blur_plan_for_radius(240.0, &full_level_sizes).passes,
+            MAX_BACKDROP_BLUR_LEVELS
+        );
+
+        let small_level_sizes = MetalRenderer::backdrop_blur_level_sizes_for(Size::new(
+            DevicePixels(8),
+            DevicePixels(8),
+        ));
+        assert_eq!(small_level_sizes.len(), 3);
+        assert_eq!(
+            MetalRenderer::backdrop_blur_plan_for_radius(240.0, &small_level_sizes).passes,
+            2
+        );
+    }
+
+    #[test]
+    fn backdrop_blur_groups_require_equal_sample_distance() {
+        let level_sizes = MetalRenderer::backdrop_blur_level_sizes_for(Size::new(
+            DevicePixels(256),
+            DevicePixels(256),
+        ));
+        let blurs = [backdrop_blur(8.0), backdrop_blur(8.0), backdrop_blur(9.0)];
+        let groups = MetalRenderer::backdrop_blur_plan_groups(&blurs, &level_sizes);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!((groups[0].0, groups[0].1, groups[0].2.passes), (0, 2, 1));
+        assert_eq!((groups[1].0, groups[1].1, groups[1].2.passes), (2, 3, 1));
+        assert_ne!(groups[0].2.sample_distance, groups[1].2.sample_distance);
+    }
+
+    #[test]
+    fn backdrop_blur_clusters_use_transitive_dilated_overlap_and_preserve_order() {
+        let viewport_size = Size::new(DevicePixels(200), DevicePixels(100));
+        let blurs = [
+            backdrop_blur_with_bounds(7, 0.0, 10.0, 1.0),
+            backdrop_blur_with_bounds(3, 30.0, 10.0, 1.0),
+            backdrop_blur_with_bounds(9, 11.0, 18.0, 1.0),
+            backdrop_blur_with_bounds(11, 150.0, 10.0, 1.0),
+            backdrop_blur_with_bounds(13, 300.0, 10.0, 1.0),
+        ];
+
+        let clusters = MetalRenderer::backdrop_blur_clusters(&blurs, viewport_size);
+
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(
+            clusters[0]
+                .iter()
+                .map(|blur| blur.order)
+                .collect::<Vec<_>>(),
+            vec![7, 3, 9]
+        );
+        assert_eq!(
+            clusters[1]
+                .iter()
+                .map(|blur| blur.order)
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
+    }
+
+    #[test]
+    fn backdrop_blur_texture_reuse_respects_cluster_max_bounds() {
+        let required = Size::new(DevicePixels(64), DevicePixels(64));
+        let max_size = Size::new(DevicePixels(128), DevicePixels(128));
+
+        assert!(MetalRenderer::can_reuse_backdrop_texture(
+            Size::new(DevicePixels(128), DevicePixels(128)),
+            required,
+            max_size,
+        ));
+        assert!(!MetalRenderer::can_reuse_backdrop_texture(
+            Size::new(DevicePixels(512), DevicePixels(512)),
+            required,
+            max_size,
+        ));
+        assert!(!MetalRenderer::can_reuse_backdrop_texture(
+            Size::new(DevicePixels(32), DevicePixels(128)),
+            required,
+            max_size,
+        ));
+    }
+
+    #[test]
+    fn backdrop_blur_snapshot_predicate_preserves_fast_path() {
+        let positive_plan = BackdropBlurPlan {
+            passes: 1,
+            sample_distance: 1.0,
+        };
+
+        assert!(!MetalRenderer::backdrop_blur_needs_source_snapshot(&[(
+            0,
+            1,
+            positive_plan,
+        )]));
+        assert!(MetalRenderer::backdrop_blur_needs_source_snapshot(&[(
+            0,
+            1,
+            BackdropBlurPlan::IDENTITY,
+        )]));
+        assert!(MetalRenderer::backdrop_blur_needs_source_snapshot(&[
+            (0, 1, positive_plan),
+            (1, 2, BackdropBlurPlan::IDENTITY),
+        ]));
     }
 
     #[test]

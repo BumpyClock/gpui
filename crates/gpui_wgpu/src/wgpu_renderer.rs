@@ -1,10 +1,10 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, GlobalElementId,
-    GpuSpecs, MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, RetainedLayer,
-    RetainedLayerContentRevision, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    TransformationMatrix, Underline, get_gamma_correction_ratios,
+    AtlasTextureId, BackdropBlur, BackdropBlurPlan, Background, Bounds, ContentMask, DevicePixels,
+    GlobalElementId, GpuSpecs, MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch,
+    Quad, RetainedLayer, RetainedLayerContentRevision, ScaledPixels, Scene, Shadow, Size,
+    SubpixelSprite, TransformationMatrix, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -17,7 +17,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-const BACKDROP_BLUR_RADIUS_PER_LEVEL: f32 = 6.0;
+const MAX_BACKDROP_BLUR_LEVELS: usize = BackdropBlurPlan::MAX_PASSES;
 const BACKDROP_TEXTURE_SIZE_QUANTUM: i32 = 64;
 const INITIAL_INSTANCE_BUFFER_SIZE: u64 = 2 * 1024 * 1024;
 const INSTANCE_BUFFER_SIZE_BUCKET: u64 = 1024 * 1024;
@@ -50,6 +50,10 @@ fn surface_usage(surface_usages: wgpu::TextureUsages) -> (wgpu::TextureUsages, b
         wgpu::TextureUsages::RENDER_ATTACHMENT
     };
     (usage, supports_copy_src)
+}
+
+fn backdrop_blur_format(surface_format: wgpu::TextureFormat) -> wgpu::TextureFormat {
+    surface_format.remove_srgb_suffix()
 }
 
 #[derive(Default)]
@@ -173,6 +177,14 @@ struct BackdropScratchBounds {
     texture_size: Size<DevicePixels>,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct BackdropBlurPassParams {
+    input_size: [f32; 2],
+    sample_distance: f32,
+    pad: f32,
+}
+
 pub struct WgpuSurfaceConfig {
     pub size: Size<DevicePixels>,
     pub transparent: bool,
@@ -208,6 +220,8 @@ struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     backdrop_blurs: wgpu::RenderPipeline,
+    backdrop_blur_downsample: wgpu::RenderPipeline,
+    backdrop_blur_upsample: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
     underlines: wgpu::RenderPipeline,
@@ -294,19 +308,46 @@ pub struct WgpuResources {
     backdrop_texture: Option<wgpu::Texture>,
     backdrop_view: Option<wgpu::TextureView>,
     backdrop_size: Option<Size<DevicePixels>>,
+    backdrop_blur_level_sizes: Vec<Size<DevicePixels>>,
+    backdrop_blur_downsample_textures: Vec<wgpu::Texture>,
+    backdrop_blur_downsample_views: Vec<wgpu::TextureView>,
+    backdrop_blur_upsample_textures: Vec<wgpu::Texture>,
+    backdrop_blur_upsample_views: Vec<wgpu::TextureView>,
     retained_layers: HashMap<RetainedLayerCacheKey, WgpuRetainedLayer>,
 }
 
 impl WgpuResources {
+    fn discard_backdrop_resources(&mut self) {
+        self.backdrop_texture = None;
+        self.backdrop_view = None;
+        self.backdrop_size = None;
+        self.backdrop_blur_level_sizes.clear();
+        self.backdrop_blur_downsample_textures.clear();
+        self.backdrop_blur_downsample_views.clear();
+        self.backdrop_blur_upsample_textures.clear();
+        self.backdrop_blur_upsample_views.clear();
+    }
+
+    fn destroy_backdrop_resources(&mut self) {
+        if let Some(texture) = self.backdrop_texture.take() {
+            texture.destroy();
+        }
+        for texture in self.backdrop_blur_downsample_textures.drain(..) {
+            texture.destroy();
+        }
+        for texture in self.backdrop_blur_upsample_textures.drain(..) {
+            texture.destroy();
+        }
+        self.discard_backdrop_resources();
+    }
+
     fn invalidate_cached_gpu_state(&mut self) {
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
         self.path_intermediate_size = None;
-        self.backdrop_texture = None;
-        self.backdrop_view = None;
-        self.backdrop_size = None;
+        self.discard_backdrop_resources();
         self.retained_layers.clear();
     }
 }
@@ -691,6 +732,11 @@ impl WgpuRenderer {
             backdrop_texture: None,
             backdrop_view: None,
             backdrop_size: None,
+            backdrop_blur_level_sizes: Vec::new(),
+            backdrop_blur_downsample_textures: Vec::new(),
+            backdrop_blur_downsample_views: Vec::new(),
+            backdrop_blur_upsample_textures: Vec::new(),
+            backdrop_blur_upsample_views: Vec::new(),
             retained_layers: HashMap::default(),
         };
 
@@ -956,6 +1002,31 @@ impl WgpuRenderer {
             &[Some(color_target.clone())],
             1,
         );
+        let backdrop_blur_target = wgpu::ColorTargetState {
+            format: backdrop_blur_format(surface_format),
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        };
+        let backdrop_blur_downsample = create_pipeline(
+            "backdrop_blur_downsample",
+            "vs_backdrop_blur_pass",
+            "fs_backdrop_blur_downsample",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(backdrop_blur_target.clone())],
+            1,
+        );
+        let backdrop_blur_upsample = create_pipeline(
+            "backdrop_blur_upsample",
+            "vs_backdrop_blur_pass",
+            "fs_backdrop_blur_upsample",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(backdrop_blur_target)],
+            1,
+        );
 
         let path_rasterization = create_pipeline(
             "path_rasterization",
@@ -1091,6 +1162,8 @@ impl WgpuRenderer {
             quads,
             shadows,
             backdrop_blurs,
+            backdrop_blur_downsample,
+            backdrop_blur_upsample,
             path_rasterization,
             paths,
             underlines,
@@ -1144,6 +1217,30 @@ impl WgpuRenderer {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
+    fn create_backdrop_blur_texture(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        size: Size<DevicePixels>,
+        label: &'static str,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: size.width.0.max(1) as u32,
+                height: size.height.0.max(1) as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1227,12 +1324,7 @@ impl WgpuRenderer {
             self.path_msaa_view = None;
             self.path_intermediate_size = None;
 
-            if let Some(ref texture) = self.backdrop_texture {
-                texture.destroy();
-            }
-            self.backdrop_texture = None;
-            self.backdrop_view = None;
-            self.backdrop_size = None;
+            self.destroy_backdrop_resources();
         }
     }
 
@@ -1309,11 +1401,7 @@ impl WgpuRenderer {
         if let Some(current_size) = self.backdrop_size
             && self.backdrop_texture.is_some()
         {
-            if current_size.width >= size.width
-                && current_size.height >= size.height
-                && current_size.width <= max_size.width
-                && current_size.height <= max_size.height
-            {
+            if Self::can_reuse_backdrop_texture(current_size, size, max_size) {
                 return Some(current_size);
             }
             return self.create_backdrop_resources(Size {
@@ -1323,6 +1411,17 @@ impl WgpuRenderer {
         }
 
         self.create_backdrop_resources(size)
+    }
+
+    fn can_reuse_backdrop_texture(
+        current_size: Size<DevicePixels>,
+        required_size: Size<DevicePixels>,
+        max_size: Size<DevicePixels>,
+    ) -> bool {
+        current_size.width >= required_size.width
+            && current_size.height >= required_size.height
+            && current_size.width <= max_size.width
+            && current_size.height <= max_size.height
     }
 
     fn quantize_backdrop_texture_size(
@@ -1351,9 +1450,7 @@ impl WgpuRenderer {
         size: Size<DevicePixels>,
     ) -> Option<Size<DevicePixels>> {
         if size.width.0 <= 0 || size.height.0 <= 0 {
-            self.backdrop_texture = None;
-            self.backdrop_view = None;
-            self.backdrop_size = None;
+            self.discard_backdrop_resources();
             return None;
         }
 
@@ -1363,9 +1460,40 @@ impl WgpuRenderer {
             size.width.0 as u32,
             size.height.0 as u32,
         );
+        let level_sizes = Self::backdrop_blur_level_sizes_for(size);
+        let blur_format = backdrop_blur_format(self.surface_config.format);
+        let mut downsample_textures = Vec::with_capacity(level_sizes.len().saturating_sub(1));
+        let mut downsample_views = Vec::with_capacity(level_sizes.len().saturating_sub(1));
+        for &level_size in level_sizes.iter().skip(1) {
+            let (texture, view) = Self::create_backdrop_blur_texture(
+                &self.device,
+                blur_format,
+                level_size,
+                "backdrop_blur_downsample",
+            );
+            downsample_textures.push(texture);
+            downsample_views.push(view);
+        }
+        let mut upsample_textures = Vec::with_capacity(level_sizes.len());
+        let mut upsample_views = Vec::with_capacity(level_sizes.len());
+        for &level_size in &level_sizes {
+            let (texture, view) = Self::create_backdrop_blur_texture(
+                &self.device,
+                blur_format,
+                level_size,
+                "backdrop_blur_upsample",
+            );
+            upsample_textures.push(texture);
+            upsample_views.push(view);
+        }
         self.backdrop_texture = Some(backdrop_texture);
         self.backdrop_view = Some(backdrop_view);
         self.backdrop_size = Some(size);
+        self.backdrop_blur_level_sizes = level_sizes;
+        self.backdrop_blur_downsample_textures = downsample_textures;
+        self.backdrop_blur_downsample_views = downsample_views;
+        self.backdrop_blur_upsample_textures = upsample_textures;
+        self.backdrop_blur_upsample_views = upsample_views;
         Some(size)
     }
 
@@ -1459,9 +1587,7 @@ impl WgpuRenderer {
             .iter()
             .any(|blur| Self::backdrop_source_bounds(blur, viewport_size).is_some())
         {
-            self.backdrop_texture = None;
-            self.backdrop_view = None;
-            self.backdrop_size = None;
+            self.discard_backdrop_resources();
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -2035,6 +2161,10 @@ impl WgpuRenderer {
                             };
                             let prepared_blurs =
                                 Self::prepare_backdrop_blurs(&blurs, scratch_bounds);
+                            let plan_groups = Self::backdrop_blur_plan_groups(
+                                &blurs,
+                                &self.backdrop_blur_level_sizes,
+                            );
                             drop(pass);
                             encoder.copy_texture_to_texture(
                                 wgpu::TexelCopyTextureInfo {
@@ -2059,8 +2189,54 @@ impl WgpuRenderer {
                                     depth_or_array_layers: 1,
                                 },
                             );
+
+                            for (start, end, plan) in plan_groups {
+                                if !self.render_backdrop_blur_for_plan(
+                                    encoder,
+                                    plan,
+                                    instance_offset,
+                                ) {
+                                    ok = false;
+                                    break;
+                                }
+                                let blur_view = if plan.passes == 0 {
+                                    self.backdrop_view.as_ref()
+                                } else {
+                                    self.backdrop_blur_upsample_views.first()
+                                };
+                                let Some(blur_view) = blur_view else {
+                                    ok = false;
+                                    break;
+                                };
+                                let mut blur_pass =
+                                    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                        label: Some("main_pass_backdrop"),
+                                        color_attachments: &[Some(
+                                            wgpu::RenderPassColorAttachment {
+                                                view: target_view,
+                                                resolve_target: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Load,
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                                depth_slice: None,
+                                            },
+                                        )],
+                                        depth_stencil_attachment: None,
+                                        ..Default::default()
+                                    });
+                                if !self.draw_backdrop_blurs(
+                                    &prepared_blurs[start..end],
+                                    blur_view,
+                                    instance_offset,
+                                    &mut blur_pass,
+                                ) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
                             pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("main_pass_backdrop"),
+                                label: Some("main_pass_after_backdrop"),
                                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                                     view: target_view,
                                     resolve_target: None,
@@ -2073,11 +2249,6 @@ impl WgpuRenderer {
                                 depth_stencil_attachment: None,
                                 ..Default::default()
                             });
-                            ok = self.draw_backdrop_blurs(
-                                &prepared_blurs,
-                                instance_offset,
-                                &mut pass,
-                            );
                             if !ok {
                                 break;
                             }
@@ -2289,12 +2460,10 @@ impl WgpuRenderer {
     fn draw_backdrop_blurs(
         &self,
         blurs: &[BackdropBlur],
+        backdrop_view: &wgpu::TextureView,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> bool {
-        let Some(backdrop_view) = self.backdrop_view.as_ref() else {
-            return false;
-        };
         let data = unsafe { Self::instance_bytes(blurs) };
         self.draw_instances_with_texture(
             data,
@@ -2304,6 +2473,106 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    fn render_backdrop_blur_for_plan(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: BackdropBlurPlan,
+        instance_offset: &mut u64,
+    ) -> bool {
+        if plan.passes == 0 {
+            return self.backdrop_view.is_some();
+        }
+        if self.backdrop_blur_downsample_views.len() < plan.passes
+            || self.backdrop_blur_upsample_views.is_empty()
+        {
+            return false;
+        }
+
+        for level in 0..plan.passes {
+            let input_view = if level == 0 {
+                let Some(view) = self.backdrop_view.as_ref() else {
+                    return false;
+                };
+                view
+            } else {
+                &self.backdrop_blur_downsample_views[level - 1]
+            };
+            let params = BackdropBlurPassParams {
+                input_size: [
+                    self.backdrop_blur_level_sizes[level].width.0 as f32,
+                    self.backdrop_blur_level_sizes[level].height.0 as f32,
+                ],
+                sample_distance: plan.sample_distance,
+                pad: 0.0,
+            };
+            if !self.draw_backdrop_blur_pass(
+                encoder,
+                &params,
+                input_view,
+                &self.backdrop_blur_downsample_views[level],
+                &self.pipelines.backdrop_blur_downsample,
+                instance_offset,
+            ) {
+                return false;
+            }
+        }
+
+        for level in (0..plan.passes).rev() {
+            let input_view = if level == plan.passes - 1 {
+                &self.backdrop_blur_downsample_views[level]
+            } else {
+                &self.backdrop_blur_upsample_views[level + 1]
+            };
+            let params = BackdropBlurPassParams {
+                input_size: [
+                    self.backdrop_blur_level_sizes[level + 1].width.0 as f32,
+                    self.backdrop_blur_level_sizes[level + 1].height.0 as f32,
+                ],
+                sample_distance: plan.sample_distance,
+                pad: 0.0,
+            };
+            if !self.draw_backdrop_blur_pass(
+                encoder,
+                &params,
+                input_view,
+                &self.backdrop_blur_upsample_views[level],
+                &self.pipelines.backdrop_blur_upsample,
+                instance_offset,
+            ) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn draw_backdrop_blur_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &BackdropBlurPassParams,
+        input_view: &wgpu::TextureView,
+        output_view: &wgpu::TextureView,
+        pipeline: &wgpu::RenderPipeline,
+        instance_offset: &mut u64,
+    ) -> bool {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("backdrop_blur_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: output_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        let data = unsafe { Self::instance_bytes(std::slice::from_ref(params)) };
+        self.draw_instances_with_texture(data, 1, input_view, pipeline, instance_offset, &mut pass)
     }
 
     fn draw_underlines(
@@ -2625,7 +2894,64 @@ impl WgpuRenderer {
     }
 
     fn backdrop_blur_padding(radius: f32) -> ScaledPixels {
-        ScaledPixels((radius + BACKDROP_BLUR_RADIUS_PER_LEVEL * 2.0).ceil())
+        ScaledPixels(BackdropBlurPlan::padding(radius))
+    }
+
+    fn backdrop_blur_level_sizes_for(size: Size<DevicePixels>) -> Vec<Size<DevicePixels>> {
+        let mut level_sizes = Vec::new();
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            return level_sizes;
+        }
+
+        level_sizes.push(size);
+        let mut level_size = size;
+        for _ in 0..MAX_BACKDROP_BLUR_LEVELS {
+            let next_width = level_size.width.0 / 2;
+            let next_height = level_size.height.0 / 2;
+            if next_width < 2 || next_height < 2 {
+                break;
+            }
+            level_size = Size {
+                width: DevicePixels(next_width),
+                height: DevicePixels(next_height),
+            };
+            level_sizes.push(level_size);
+        }
+        level_sizes
+    }
+
+    fn backdrop_blur_plan_for_radius(
+        radius: f32,
+        level_sizes: &[Size<DevicePixels>],
+    ) -> BackdropBlurPlan {
+        BackdropBlurPlan::for_radius(
+            radius,
+            level_sizes
+                .len()
+                .saturating_sub(1)
+                .min(MAX_BACKDROP_BLUR_LEVELS),
+        )
+    }
+
+    fn backdrop_blur_plan_groups(
+        blurs: &[BackdropBlur],
+        level_sizes: &[Size<DevicePixels>],
+    ) -> Vec<(usize, usize, BackdropBlurPlan)> {
+        let mut groups = Vec::new();
+        let mut start = 0;
+        while start < blurs.len() {
+            let plan = Self::backdrop_blur_plan_for_radius(blurs[start].blur_radius.0, level_sizes);
+            let mut end = start + 1;
+            while end < blurs.len()
+                && Self::backdrop_blur_plan_for_radius(blurs[end].blur_radius.0, level_sizes)
+                    == plan
+            {
+                end += 1;
+            }
+            groups.push((start, end, plan));
+            start = end;
+        }
+        groups
     }
 
     fn prepare_backdrop_blurs(
@@ -2787,6 +3113,9 @@ impl WgpuRenderer {
                 }
                 PrimitiveBatch::BackdropBlurs(range) => {
                     self.add_instance_bytes::<BackdropBlur>(&mut size, range.len());
+                    for _ in 0..range.len() * MAX_BACKDROP_BLUR_LEVELS * 2 {
+                        self.add_instance_bytes::<BackdropBlurPassParams>(&mut size, 1);
+                    }
                 }
                 PrimitiveBatch::Paths(range) => {
                     for path in &scene.paths[range] {
@@ -2991,6 +3320,172 @@ mod tests {
             paint_range: 0..scene.paint_operation_count(),
         };
         (scene, layer)
+    }
+
+    fn backdrop_blur(radius: f32) -> BackdropBlur {
+        backdrop_blur_with_bounds(0, 0.0, 100.0, radius)
+    }
+
+    fn backdrop_blur_with_bounds(order: u32, x: f32, width: f32, radius: f32) -> BackdropBlur {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(x), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(width), ScaledPixels(10.0)),
+        );
+        BackdropBlur {
+            order,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask::new(bounds),
+            corner_radii: Corners::default(),
+            blur_radius: ScaledPixels(radius),
+            source_origin_x: 0.0,
+            source_origin_y: 0.0,
+            source_width: 1.0,
+            source_height: 1.0,
+            pad2: 0,
+        }
+    }
+
+    #[test]
+    fn backdrop_blur_pyramid_supports_six_passes_and_small_textures_limit_plans() {
+        let full_level_sizes = WgpuRenderer::backdrop_blur_level_sizes_for(Size::new(
+            DevicePixels(4096),
+            DevicePixels(4096),
+        ));
+        assert_eq!(full_level_sizes.len(), MAX_BACKDROP_BLUR_LEVELS + 1);
+        assert_eq!(
+            WgpuRenderer::backdrop_blur_plan_for_radius(240.0, &full_level_sizes).passes,
+            MAX_BACKDROP_BLUR_LEVELS
+        );
+
+        let small_level_sizes = WgpuRenderer::backdrop_blur_level_sizes_for(Size::new(
+            DevicePixels(8),
+            DevicePixels(8),
+        ));
+        assert_eq!(small_level_sizes.len(), 3);
+        assert_eq!(
+            WgpuRenderer::backdrop_blur_plan_for_radius(240.0, &small_level_sizes).passes,
+            2
+        );
+    }
+
+    #[test]
+    fn backdrop_blur_groups_require_equal_sample_distance() {
+        let level_sizes = WgpuRenderer::backdrop_blur_level_sizes_for(Size::new(
+            DevicePixels(256),
+            DevicePixels(256),
+        ));
+        let blurs = [backdrop_blur(8.0), backdrop_blur(8.0), backdrop_blur(9.0)];
+        let groups = WgpuRenderer::backdrop_blur_plan_groups(&blurs, &level_sizes);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!((groups[0].0, groups[0].1, groups[0].2.passes), (0, 2, 1));
+        assert_eq!((groups[1].0, groups[1].1, groups[1].2.passes), (2, 3, 1));
+        assert_ne!(groups[0].2.sample_distance, groups[1].2.sample_distance);
+    }
+
+    #[test]
+    fn backdrop_blur_clusters_use_transitive_dilated_overlap_and_preserve_order() {
+        let viewport_size = Size::new(DevicePixels(200), DevicePixels(100));
+        let blurs = [
+            backdrop_blur_with_bounds(7, 0.0, 10.0, 1.0),
+            backdrop_blur_with_bounds(3, 30.0, 10.0, 1.0),
+            backdrop_blur_with_bounds(9, 11.0, 18.0, 1.0),
+            backdrop_blur_with_bounds(11, 150.0, 10.0, 1.0),
+            backdrop_blur_with_bounds(13, 300.0, 10.0, 1.0),
+        ];
+
+        let clusters = WgpuRenderer::backdrop_blur_clusters(&blurs, viewport_size);
+
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(
+            clusters[0]
+                .iter()
+                .map(|blur| blur.order)
+                .collect::<Vec<_>>(),
+            vec![7, 3, 9]
+        );
+        assert_eq!(
+            clusters[1]
+                .iter()
+                .map(|blur| blur.order)
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
+    }
+
+    #[test]
+    fn backdrop_blur_pass_params_match_wgsl_storage_layout() {
+        assert_eq!(std::mem::size_of::<BackdropBlurPassParams>(), 16);
+        assert_eq!(std::mem::align_of::<BackdropBlurPassParams>(), 4);
+    }
+
+    #[test]
+    fn backdrop_blur_intermediates_use_linear_formats() {
+        assert_eq!(
+            backdrop_blur_format(wgpu::TextureFormat::Bgra8UnormSrgb),
+            wgpu::TextureFormat::Bgra8Unorm
+        );
+        assert_eq!(
+            backdrop_blur_format(wgpu::TextureFormat::Rgba8UnormSrgb),
+            wgpu::TextureFormat::Rgba8Unorm
+        );
+        assert_eq!(
+            backdrop_blur_format(wgpu::TextureFormat::Bgra8Unorm),
+            wgpu::TextureFormat::Bgra8Unorm
+        );
+        assert_eq!(
+            backdrop_blur_format(wgpu::TextureFormat::Rgba8Unorm),
+            wgpu::TextureFormat::Rgba8Unorm
+        );
+        assert_eq!(
+            backdrop_blur_format(wgpu::TextureFormat::Rgba16Float),
+            wgpu::TextureFormat::Rgba16Float
+        );
+    }
+
+    #[test]
+    fn backdrop_blur_texture_reuse_respects_cluster_max_bounds() {
+        let required = Size::new(DevicePixels(64), DevicePixels(64));
+        let max_size = Size::new(DevicePixels(128), DevicePixels(128));
+
+        assert!(WgpuRenderer::can_reuse_backdrop_texture(
+            Size::new(DevicePixels(128), DevicePixels(128)),
+            required,
+            max_size,
+        ));
+        assert!(!WgpuRenderer::can_reuse_backdrop_texture(
+            Size::new(DevicePixels(512), DevicePixels(512)),
+            required,
+            max_size,
+        ));
+        assert!(!WgpuRenderer::can_reuse_backdrop_texture(
+            Size::new(DevicePixels(32), DevicePixels(128)),
+            required,
+            max_size,
+        ));
+    }
+
+    #[test]
+    fn shaders_parse_and_validate() {
+        let module =
+            wgpu::naga::front::wgsl::parse_str(include_str!("shaders.wgsl")).expect("parse WGSL");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("validate WGSL");
+    }
+
+    #[test]
+    fn backdrop_blur_shader_uses_fixed_downsample_and_weighted_tent_upsample() {
+        let source = include_str!("shaders.wgsl");
+        assert!(source.contains("let offset = texel * 0.75;"));
+        assert!(source.contains("let offsets = array<vec2<f32>, 8>("));
+        assert!(source.contains("let weights = array<f32, 8>("));
+        assert!(source.contains("1.0 / 12.0,"));
+        assert!(source.contains("1.0 / 6.0,"));
     }
 
     #[test]

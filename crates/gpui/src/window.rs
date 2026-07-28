@@ -3709,6 +3709,10 @@ impl Window {
     }
 
     /// Paint a backdrop blur region into the scene for the next frame.
+    ///
+    /// `blur_radius` approximates the filter's three-sigma support. At render
+    /// scale, positive radii below the pyramid's roughly 3.7-device-pixel
+    /// minimum use that minimum.
     pub fn paint_backdrop_blur(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -3716,6 +3720,10 @@ impl Window {
         blur_radius: Pixels,
     ) {
         self.invalidator.debug_assert_paint();
+        if !blur_radius.0.is_finite() || blur_radius <= Pixels::ZERO {
+            return;
+        }
+
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         self.next_frame.scene.insert_primitive(BackdropBlur {

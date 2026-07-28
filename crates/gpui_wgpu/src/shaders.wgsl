@@ -1090,6 +1090,107 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
 
 // --- backdrop blurs --- //
 
+struct BackdropBlurPassParams {
+    input_size: vec2<f32>,
+    sample_distance: f32,
+    pad: f32,
+}
+@group(1) @binding(0) var<storage, read> b_backdrop_blur_pass_params: array<BackdropBlurPassParams>;
+
+struct BackdropBlurPassVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_backdrop_blur_pass(@builtin(vertex_index) vertex_id: u32) -> BackdropBlurPassVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    var out = BackdropBlurPassVarying();
+    out.position = vec4<f32>(
+        unit_vertex * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0),
+        0.0,
+        1.0,
+    );
+    out.uv = unit_vertex;
+    return out;
+}
+
+fn backdrop_blur_downsample_color(uv: vec2<f32>) -> vec4<f32> {
+    let params = b_backdrop_blur_pass_params[0];
+    let texel = 1.0 / max(params.input_size, vec2<f32>(1.0));
+    let offset = texel * 0.75;
+    let offsets = array<vec2<f32>, 4>(
+        vec2<f32>(-offset.x, -offset.y),
+        vec2<f32>(offset.x, -offset.y),
+        vec2<f32>(-offset.x, offset.y),
+        vec2<f32>(offset.x, offset.y),
+    );
+
+    var rgb_sum = vec3<f32>(0.0);
+    var alpha_sum = 0.0;
+    for (var i = 0u; i < 4u; i += 1u) {
+        let sample = textureSample(t_sprite, s_sprite, uv + offsets[i]);
+        if (sample.a > 0.0) {
+            rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
+            alpha_sum += sample.a;
+        }
+    }
+
+    let alpha = alpha_sum * 0.25;
+    let rgb = linear_to_srgb(rgb_sum / max(alpha_sum, 0.0001)) * alpha;
+    return vec4<f32>(rgb, alpha);
+}
+
+fn backdrop_blur_upsample_color(uv: vec2<f32>) -> vec4<f32> {
+    let params = b_backdrop_blur_pass_params[0];
+    let texel = 1.0 / max(params.input_size, vec2<f32>(1.0));
+    let offset = texel * params.sample_distance;
+    let offsets = array<vec2<f32>, 8>(
+        vec2<f32>(-2.0 * offset.x, 0.0),
+        vec2<f32>(2.0 * offset.x, 0.0),
+        vec2<f32>(0.0, -2.0 * offset.y),
+        vec2<f32>(0.0, 2.0 * offset.y),
+        vec2<f32>(-offset.x, -offset.y),
+        vec2<f32>(offset.x, -offset.y),
+        vec2<f32>(-offset.x, offset.y),
+        vec2<f32>(offset.x, offset.y),
+    );
+    let weights = array<f32, 8>(
+        1.0 / 12.0,
+        1.0 / 12.0,
+        1.0 / 12.0,
+        1.0 / 12.0,
+        1.0 / 6.0,
+        1.0 / 6.0,
+        1.0 / 6.0,
+        1.0 / 6.0,
+    );
+
+    var rgb_sum = vec3<f32>(0.0);
+    var alpha_sum = 0.0;
+    for (var i = 0u; i < 8u; i += 1u) {
+        let sample = textureSample(t_sprite, s_sprite, uv + offsets[i]);
+        let weight = weights[i];
+        if (sample.a > 0.0) {
+            rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a * weight;
+            alpha_sum += sample.a * weight;
+        }
+    }
+
+    let rgb = linear_to_srgb(rgb_sum / max(alpha_sum, 0.0001)) * alpha_sum;
+    return vec4<f32>(rgb, alpha_sum);
+}
+
+@fragment
+fn fs_backdrop_blur_downsample(input: BackdropBlurPassVarying) -> @location(0) vec4<f32> {
+    return backdrop_blur_downsample_color(input.uv);
+}
+
+@fragment
+fn fs_backdrop_blur_upsample(input: BackdropBlurPassVarying) -> @location(0) vec4<f32> {
+    return backdrop_blur_upsample_color(input.uv);
+}
+
 struct BackdropBlur {
     order: u32,
     pad: u32,
@@ -1142,45 +1243,16 @@ fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
     let source_origin = vec2<f32>(blur.source_origin_x, blur.source_origin_y);
     let source_size = max(vec2<f32>(blur.source_width, blur.source_height), vec2<f32>(1.0));
     let uv = (input.position.xy - source_origin) / source_size;
-    let texel = 1.0 / source_size;
-    let radius_scale = max(blur.blur_radius / 3.0, 1.0);
-    let step = texel * radius_scale;
-
-    var accum_linear = vec3<f32>(0.0);
-    var accum_alpha = 0.0;
-    var weight_sum = 0.0;
-
-    let weights = array<f32, 9>(0.204164, 0.123841, 0.123841, 0.123841, 0.123841, 0.0751136, 0.0751136, 0.0751136, 0.0751136);
-    let offsets = array<vec2<f32>, 9>(
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(step.x, 0.0),
-        vec2<f32>(-step.x, 0.0),
-        vec2<f32>(0.0, step.y),
-        vec2<f32>(0.0, -step.y),
-        vec2<f32>(step.x, step.y),
-        vec2<f32>(-step.x, step.y),
-        vec2<f32>(step.x, -step.y),
-        vec2<f32>(-step.x, -step.y),
-    );
-
-    for (var i = 0u; i < 9u; i += 1u) {
-        let w = weights[i];
-        let sample = textureSample(t_sprite, s_sprite, uv + offsets[i]);
-        if (sample.a > 0.0) {
-            accum_linear += srgb_to_linear(sample.rgb / sample.a) * sample.a * w;
-            accum_alpha += sample.a * w;
-        }
-        weight_sum += w;
+    let color = textureSample(t_sprite, s_sprite, uv);
+    var straight_rgb = vec3<f32>(0.0);
+    if (color.a > 0.0) {
+        straight_rgb = color.rgb / color.a;
     }
-
-    let safe_alpha = max(accum_alpha, 0.0001);
-    let blurred_rgb = linear_to_srgb(accum_linear / safe_alpha);
 
     let distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
     let surface_alpha = saturate(0.5 - distance);
-    let alpha = (accum_alpha / max(weight_sum, 0.0001)) * surface_alpha;
     return apply_content_mask(
-        blend_color(vec4<f32>(blurred_rgb, 1.0), alpha),
+        blend_color(vec4<f32>(straight_rgb, color.a), surface_alpha),
         input.position.xy,
         blur.content_mask,
     );

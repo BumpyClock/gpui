@@ -40,9 +40,7 @@ pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSI
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
-const BACKDROP_BLUR_RADIUS_PER_LEVEL: f32 = 6.0;
-const MAX_BACKDROP_BLUR_LEVELS: usize = 4;
-const BACKDROP_BLUR_OFFSET: f32 = 1.0;
+const MAX_BACKDROP_BLUR_LEVELS: usize = BackdropBlurPlan::MAX_PASSES;
 const BACKDROP_TEXTURE_SIZE_QUANTUM: i32 = 64;
 const MAX_STRUCTURED_BUFFER_BYTES: usize = 256 * 1024 * 1024;
 
@@ -599,24 +597,28 @@ impl DirectXRenderer {
                             let prepared_blurs =
                                 Self::prepare_backdrop_blurs(&blurs, scratch_bounds);
                             self.copy_render_target_to_backdrop(scratch_bounds)?;
-                            let mut current_passes = None;
+                            let max_backdrop_blur_levels = self.max_backdrop_blur_levels();
+                            let mut current_plan = None;
                             let mut current_blur_srv = None;
                             let mut start = 0;
                             while start < blurs.len() {
-                                let passes =
-                                    self.backdrop_blur_passes_for_radius(blurs[start].blur_radius.0);
+                                let plan = Self::backdrop_blur_plan_for_radius(
+                                    blurs[start].blur_radius.0,
+                                    max_backdrop_blur_levels,
+                                );
                                 let mut end = start + 1;
                                 while end < blurs.len()
-                                    && self
-                                        .backdrop_blur_passes_for_radius(blurs[end].blur_radius.0)
-                                        == passes
+                                    && Self::backdrop_blur_plan_for_radius(
+                                        blurs[end].blur_radius.0,
+                                        max_backdrop_blur_levels,
+                                    ) == plan
                                 {
                                     end += 1;
                                 }
-                                if current_passes != Some(passes) {
+                                if current_plan != Some(plan) {
                                     current_blur_srv =
-                                        self.run_backdrop_blur_passes_for_passes(passes)?;
-                                    current_passes = Some(passes);
+                                        self.run_backdrop_blur_passes(plan)?;
+                                    current_plan = Some(plan);
                                 }
                                 self.draw_backdrop_blurs(
                                     &prepared_blurs[start..end],
@@ -1133,7 +1135,7 @@ impl DirectXRenderer {
     }
 
     fn backdrop_blur_padding(radius: f32) -> ScaledPixels {
-        ScaledPixels((radius + BACKDROP_BLUR_RADIUS_PER_LEVEL * 2.0).ceil())
+        ScaledPixels(BackdropBlurPlan::padding(radius))
     }
 
     fn prepare_backdrop_blurs(
@@ -1153,24 +1155,17 @@ impl DirectXRenderer {
             .collect()
     }
 
-    fn backdrop_blur_passes_for_radius(&self, radius: f32) -> usize {
-        if radius <= 0.0 {
-            return 0;
-        }
-        let resources = match self.resources.as_ref() {
-            Some(resources) => resources,
-            None => return 0,
-        };
-        let max_levels = resources
-            .backdrop_blur
+    fn max_backdrop_blur_levels(&self) -> usize {
+        self.resources
             .as_ref()
+            .and_then(|resources| resources.backdrop_blur.as_ref())
             .map(|blur| blur.level_sizes.len().saturating_sub(1))
-            .unwrap_or(0);
-        if max_levels == 0 {
-            return 0;
-        }
-        let passes = (radius / BACKDROP_BLUR_RADIUS_PER_LEVEL).ceil() as usize;
-        passes.clamp(1, max_levels)
+            .unwrap_or(0)
+            .min(MAX_BACKDROP_BLUR_LEVELS)
+    }
+
+    fn backdrop_blur_plan_for_radius(radius: f32, max_levels: usize) -> BackdropBlurPlan {
+        BackdropBlurPlan::for_radius(radius, max_levels.min(MAX_BACKDROP_BLUR_LEVELS))
     }
 
     fn draw_backdrop_blurs(
@@ -1202,9 +1197,9 @@ impl DirectXRenderer {
             )
     }
 
-    fn run_backdrop_blur_passes_for_passes(
+    fn run_backdrop_blur_passes(
         &mut self,
-        passes: usize,
+        plan: BackdropBlurPlan,
     ) -> Result<Option<ID3D11ShaderResourceView>> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
@@ -1212,15 +1207,17 @@ impl DirectXRenderer {
             .backdrop_blur
             .as_ref()
             .context("backdrop blur resources missing")?;
-        if passes == 0 {
+        if plan.passes == 0 {
             return Ok(resources.backdrop_srv.clone());
         }
-        if backdrop_blur.downsample_srvs.len() < passes || backdrop_blur.upsample_srvs.is_empty() {
+        if backdrop_blur.downsample_srvs.len() < plan.passes
+            || backdrop_blur.upsample_srvs.is_empty()
+        {
             return Ok(resources.backdrop_srv.clone());
         }
 
         let mut input_srv = resources.backdrop_srv.clone();
-        for level in 0..passes {
+        for level in 0..plan.passes {
             let input_size = backdrop_blur.level_sizes[level];
             let output_size = backdrop_blur.level_sizes[level + 1];
             let output_view = backdrop_blur.downsample_views[level].as_ref();
@@ -1234,7 +1231,7 @@ impl DirectXRenderer {
             };
             let params = BackdropBlurParams {
                 input_size: [input_size.0 as f32, input_size.1 as f32],
-                offset: BACKDROP_BLUR_OFFSET,
+                sample_distance: plan.sample_distance,
                 pad: 0.0,
             };
             Self::draw_backdrop_blur_pass(
@@ -1250,8 +1247,8 @@ impl DirectXRenderer {
             input_srv = backdrop_blur.downsample_srvs[level].clone();
         }
 
-        let mut input_srv = backdrop_blur.downsample_srvs[passes - 1].clone();
-        for level in (0..passes).rev() {
+        let mut input_srv = backdrop_blur.downsample_srvs[plan.passes - 1].clone();
+        for level in (0..plan.passes).rev() {
             let input_size = backdrop_blur.level_sizes[level + 1];
             let output_size = backdrop_blur.level_sizes[level];
             let output_view = backdrop_blur.upsample_views[level].as_ref();
@@ -1265,7 +1262,7 @@ impl DirectXRenderer {
             };
             let params = BackdropBlurParams {
                 input_size: [input_size.0 as f32, input_size.1 as f32],
-                offset: BACKDROP_BLUR_OFFSET,
+                sample_distance: plan.sample_distance,
                 pad: 0.0,
             };
             Self::draw_backdrop_blur_pass(
@@ -1897,14 +1894,14 @@ impl DirectXRenderPipelines {
             "backdrop_blur_downsample_pipeline",
             ShaderModule::BackdropBlurDownsample,
             4,
-            create_blend_state(device)?,
+            create_blend_state_without_blending(device)?,
         )?;
         let backdrop_blur_upsample_pipeline = PipelineState::new(
             device,
             "backdrop_blur_upsample_pipeline",
             ShaderModule::BackdropBlurUpsample,
             4,
-            create_blend_state(device)?,
+            create_blend_state_without_blending(device)?,
         )?;
         let quad_pipeline = PipelineState::new(
             device,
@@ -2252,7 +2249,7 @@ struct GlobalParams {
 #[repr(C)]
 struct BackdropBlurParams {
     input_size: [f32; 2],
-    offset: f32,
+    sample_distance: f32,
     pad: f32,
 }
 
@@ -2800,6 +2797,17 @@ fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
+#[inline]
+fn create_blend_state_without_blending(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
     desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
     unsafe {
         let mut state = None;
@@ -3379,15 +3387,83 @@ mod amd {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Bounds, ContentMask, Corners, ScaledPixels, point, size};
+    use gpui::{
+        BackdropBlur, Bounds, ContentMask, Corners, Point, ScaledPixels, Size, point, size,
+    };
 
     use super::{
-        GlobalParams, RetainedLayerClip, retained_layer_clip, rounded_backdrop_rebuild_requested,
+        BackdropBlurParams, DirectXRenderer, GlobalParams, RetainedLayerClip,
+        backdrop_blur_level_sizes, retained_layer_clip, rounded_backdrop_rebuild_requested,
     };
+
+    fn backdrop_blur_with_bounds(order: u32, x: f32, width: f32, radius: f32) -> BackdropBlur {
+        let bounds = Bounds::new(
+            Point::new(ScaledPixels(x), ScaledPixels(0.0)),
+            Size::new(ScaledPixels(width), ScaledPixels(10.0)),
+        );
+        BackdropBlur {
+            order,
+            pad: 0,
+            bounds,
+            content_mask: ContentMask::new(bounds),
+            corner_radii: Corners::default(),
+            blur_radius: ScaledPixels(radius),
+            source_origin_x: 0.0,
+            source_origin_y: 0.0,
+            source_width: 1.0,
+            source_height: 1.0,
+            pad2: 0,
+        }
+    }
 
     #[test]
     fn global_params_preserve_hlsl_constant_buffer_alignment() {
         assert_eq!(std::mem::size_of::<GlobalParams>(), 48);
+    }
+
+    #[test]
+    fn backdrop_blur_params_preserve_hlsl_buffer_layout() {
+        assert_eq!(std::mem::size_of::<BackdropBlurParams>(), 16);
+    }
+
+    #[test]
+    fn backdrop_blur_pyramid_caps_levels_and_groups_by_full_plan() {
+        assert_eq!(backdrop_blur_level_sizes(4_096, 4_096).len(), 7);
+        assert_eq!(backdrop_blur_level_sizes(3, 3), vec![(3, 3)]);
+
+        let first = DirectXRenderer::backdrop_blur_plan_for_radius(8.0, 6);
+        let second = DirectXRenderer::backdrop_blur_plan_for_radius(9.0, 6);
+        assert_eq!(first.passes, second.passes);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn backdrop_blur_clusters_use_transitive_dilated_overlap_and_preserve_order() {
+        let blurs = [
+            backdrop_blur_with_bounds(7, 0.0, 10.0, 1.0),
+            backdrop_blur_with_bounds(3, 30.0, 10.0, 1.0),
+            backdrop_blur_with_bounds(9, 11.0, 18.0, 1.0),
+            backdrop_blur_with_bounds(11, 150.0, 10.0, 1.0),
+            backdrop_blur_with_bounds(13, 300.0, 10.0, 1.0),
+        ];
+
+        let clusters = DirectXRenderer::backdrop_blur_clusters(&blurs, 200, 100);
+
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(
+            clusters[0]
+                .iter()
+                .map(|blur| blur.order)
+                .collect::<Vec<_>>(),
+            vec![7, 3, 9]
+        );
+        assert_eq!(
+            clusters[1]
+                .iter()
+                .map(|blur| blur.order)
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
     }
 
     #[test]
