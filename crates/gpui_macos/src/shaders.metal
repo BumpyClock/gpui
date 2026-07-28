@@ -137,7 +137,7 @@ fragment float4 backdrop_blur_downsample_fragment(
   float2 texture_size = float2((float)params->texture_size.width,
                                (float)params->texture_size.height);
   float2 texel = 1.0 / max(input_size, float2(1.0));
-  float2 offset = texel * (params->offset + 0.5);
+  float2 offset = texel * 0.75;
   float3 rgb_sum = float3(0.0);
   float alpha_sum = 0.0;
   float4 sample =
@@ -183,34 +183,60 @@ fragment float4 backdrop_blur_upsample_fragment(
   float2 texture_size = float2((float)params->texture_size.width,
                                (float)params->texture_size.height);
   float2 texel = 1.0 / max(input_size, float2(1.0));
-  float2 offset = texel * (params->offset + 0.5);
+  float2 offset = texel * params->sample_distance;
   float3 rgb_sum = float3(0.0);
   float alpha_sum = 0.0;
+  constexpr float axial_weight = 1.0 / 12.0;
+  constexpr float diagonal_weight = 1.0 / 6.0;
   float4 sample =
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(-2.0 * offset.x, 0.0), input_origin, input_size, texture_size));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a * axial_weight;
+    alpha_sum += sample.a * axial_weight;
+  }
+  sample =
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(2.0 * offset.x, 0.0), input_origin, input_size, texture_size));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a * axial_weight;
+    alpha_sum += sample.a * axial_weight;
+  }
+  sample =
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(0.0, -2.0 * offset.y), input_origin, input_size, texture_size));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a * axial_weight;
+    alpha_sum += sample.a * axial_weight;
+  }
+  sample =
+      source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(0.0, 2.0 * offset.y), input_origin, input_size, texture_size));
+  if (sample.a > 0.0) {
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a * axial_weight;
+    alpha_sum += sample.a * axial_weight;
+  }
+  sample =
       source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(-offset.x, -offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
-    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
-    alpha_sum += sample.a;
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a * diagonal_weight;
+    alpha_sum += sample.a * diagonal_weight;
   }
   sample =
       source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(offset.x, -offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
-    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
-    alpha_sum += sample.a;
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a * diagonal_weight;
+    alpha_sum += sample.a * diagonal_weight;
   }
   sample =
       source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(-offset.x, offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
-    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
-    alpha_sum += sample.a;
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a * diagonal_weight;
+    alpha_sum += sample.a * diagonal_weight;
   }
   sample =
       source_texture.sample(blur_sampler, backdrop_blur_sample_coord(input.uv + float2(offset.x, offset.y), input_origin, input_size, texture_size));
   if (sample.a > 0.0) {
-    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
-    alpha_sum += sample.a;
+    rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a * diagonal_weight;
+    alpha_sum += sample.a * diagonal_weight;
   }
-  float alpha = alpha_sum * 0.25;
+  float alpha = alpha_sum;
   float safe_alpha = max(alpha_sum, 0.0001);
   float3 rgb = linear_to_srgb(rgb_sum / safe_alpha) * alpha;
   return float4(rgb, alpha);
@@ -262,7 +288,9 @@ fragment float4 backdrop_blur_fragment(
   float alpha = clamp(0.5 - distance, 0.0, 1.0);
   alpha *= content_mask_alpha(input.position.xy, blur.content_mask.rounded_bounds,
                               blur.content_mask.corner_radii);
-  return color * alpha;
+  float3 straight_rgb =
+      color.a > 0.0 ? color.rgb / color.a : float3(0.0);
+  return float4(straight_rgb, color.a * alpha);
 }
 
 vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],

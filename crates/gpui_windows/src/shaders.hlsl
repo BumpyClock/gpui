@@ -128,12 +128,12 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds bounds, Bo
 
 // Convert linear RGB to sRGB
 float3 linear_to_srgb(float3 color) {
-    return pow(color, float3(2.2, 2.2, 2.2));
+    return pow(color, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
 }
 
 // Convert sRGB to linear RGB
 float3 srgb_to_linear(float3 color) {
-    return pow(color, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
+    return pow(color, float3(2.2, 2.2, 2.2));
 }
 
 /// Hsla to linear RGBA conversion.
@@ -564,7 +564,7 @@ struct BackdropBlur {
 
 struct BackdropBlurParams {
     float2 input_size;
-    float offset;
+    float sample_distance;
     float pad;
 };
 
@@ -608,7 +608,7 @@ BackdropBlurPassVertexOutput backdrop_blur_upsample_vertex(uint vertex_id: SV_Ve
 float4 backdrop_blur_downsample_fragment(BackdropBlurPassVertexOutput input) : SV_Target {
     BackdropBlurParams params = backdrop_blur_params[0];
     float2 texel = 1.0 / max(params.input_size, float2(1.0, 1.0));
-    float2 offset = texel * (params.offset + 0.5);
+    float2 offset = texel * 0.75;
     float3 rgb_sum = float3(0.0, 0.0, 0.0);
     float alpha_sum = 0.0;
     float4 sample = t_sprite.Sample(s_sprite, input.uv + float2(-offset.x, -offset.y));
@@ -640,30 +640,51 @@ float4 backdrop_blur_downsample_fragment(BackdropBlurPassVertexOutput input) : S
 float4 backdrop_blur_upsample_fragment(BackdropBlurPassVertexOutput input) : SV_Target {
     BackdropBlurParams params = backdrop_blur_params[0];
     float2 texel = 1.0 / max(params.input_size, float2(1.0, 1.0));
-    float2 offset = texel * (params.offset + 0.5);
+    float2 diagonal_offset = texel * params.sample_distance;
+    float2 axial_offset = diagonal_offset * 2.0;
     float3 rgb_sum = float3(0.0, 0.0, 0.0);
     float alpha_sum = 0.0;
-    float4 sample = t_sprite.Sample(s_sprite, input.uv + float2(-offset.x, -offset.y));
+    float4 sample = t_sprite.Sample(s_sprite, input.uv + float2(-axial_offset.x, 0.0));
     if (sample.a > 0.0) {
-        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
-        alpha_sum += sample.a;
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a / 12.0;
+        alpha_sum += sample.a / 12.0;
     }
-    sample = t_sprite.Sample(s_sprite, input.uv + float2(offset.x, -offset.y));
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(axial_offset.x, 0.0));
     if (sample.a > 0.0) {
-        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
-        alpha_sum += sample.a;
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a / 12.0;
+        alpha_sum += sample.a / 12.0;
     }
-    sample = t_sprite.Sample(s_sprite, input.uv + float2(-offset.x, offset.y));
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(0.0, -axial_offset.y));
     if (sample.a > 0.0) {
-        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
-        alpha_sum += sample.a;
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a / 12.0;
+        alpha_sum += sample.a / 12.0;
     }
-    sample = t_sprite.Sample(s_sprite, input.uv + float2(offset.x, offset.y));
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(0.0, axial_offset.y));
     if (sample.a > 0.0) {
-        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a;
-        alpha_sum += sample.a;
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a / 12.0;
+        alpha_sum += sample.a / 12.0;
     }
-    float alpha = alpha_sum * 0.25;
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(-diagonal_offset.x, -diagonal_offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a / 6.0;
+        alpha_sum += sample.a / 6.0;
+    }
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(diagonal_offset.x, -diagonal_offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a / 6.0;
+        alpha_sum += sample.a / 6.0;
+    }
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(-diagonal_offset.x, diagonal_offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a / 6.0;
+        alpha_sum += sample.a / 6.0;
+    }
+    sample = t_sprite.Sample(s_sprite, input.uv + float2(diagonal_offset.x, diagonal_offset.y));
+    if (sample.a > 0.0) {
+        rgb_sum += srgb_to_linear(sample.rgb / sample.a) * sample.a / 6.0;
+        alpha_sum += sample.a / 6.0;
+    }
+    float alpha = alpha_sum;
     float safe_alpha = max(alpha_sum, 0.0001);
     float3 rgb = linear_to_srgb(rgb_sum / safe_alpha) * alpha;
     return float4(rgb, alpha);
@@ -698,7 +719,8 @@ float4 backdrop_blur_fragment(BackdropBlurFragmentInput input) : SV_Target {
     float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
     float alpha = saturate(0.5 - distance);
     alpha *= content_mask_alpha(input.position.xy, blur.content_mask);
-    return color * alpha;
+    float3 rgb = color.a > 0.0 ? color.rgb / color.a : float3(0.0, 0.0, 0.0);
+    return float4(rgb, color.a * alpha);
 }
 
 QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint quad_id: SV_InstanceID) {

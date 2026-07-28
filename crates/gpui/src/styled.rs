@@ -759,7 +759,12 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Sets the blur radius applied to content behind this element.
+    /// Sets the blur extent applied to content behind this element.
+    ///
+    /// The radius approximates the filter's three-sigma support. At render
+    /// scale, positive radii below the pyramid's roughly 3.7-device-pixel
+    /// minimum use that minimum. Non-positive and non-finite values disable
+    /// the effect.
     fn backdrop_blur(mut self, blur_radius: Pixels) -> Self {
         self.style().backdrop_blur = Some(blur_radius);
         self
