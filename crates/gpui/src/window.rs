@@ -75,6 +75,12 @@ pub const DEFAULT_ADDITIONAL_WINDOW_SIZE: Size<Pixels> = Size {
     height: Pixels(750.),
 };
 
+/// Backdrop blur is skipped below this effective element opacity. Half of one
+/// 8-bit step is the most such a composite can move any channel, so dropping
+/// the primitive here saves the source snapshot and blur pyramid without a
+/// visible step at the end of a fade.
+const MINIMUM_BACKDROP_BLUR_OPACITY: f32 = 0.5 / 255.;
+
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DispatchPhase {
@@ -3713,6 +3719,10 @@ impl Window {
     /// `blur_radius` approximates the filter's three-sigma support. At render
     /// scale, positive radii below the pyramid's roughly 3.7-device-pixel
     /// minimum use that minimum.
+    ///
+    /// The blurred backdrop is composited over the unblurred one with the
+    /// element's effective opacity as its weight, so an element fading out
+    /// stops contributing blur at the same rate as the rest of its painting.
     pub fn paint_backdrop_blur(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -3721,6 +3731,11 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
         if !blur_radius.0.is_finite() || blur_radius <= Pixels::ZERO {
+            return;
+        }
+
+        let opacity = self.element_opacity();
+        if !opacity.is_finite() || opacity < MINIMUM_BACKDROP_BLUR_OPACITY {
             return;
         }
 
@@ -3737,7 +3752,7 @@ impl Window {
             source_origin_y: 0.0,
             source_width: 1.0,
             source_height: 1.0,
-            pad2: 0,
+            opacity: opacity.min(1.0),
         });
     }
 
@@ -6505,5 +6520,54 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+#[cfg(test)]
+mod backdrop_blur_tests {
+    use crate::{
+        DrawPhase, Drawable, TestAppContext, VisualTestContext, div, prelude::*, px, size,
+    };
+
+    fn paint_backdrop_blur(cx: &mut VisualTestContext, opacity: f32) -> Vec<f32> {
+        cx.update(|window, cx| {
+            window.next_frame.clear();
+            window.invalidator.set_phase(DrawPhase::Prepaint);
+            let mut element =
+                Drawable::new(div().size_full().backdrop_blur(px(12.)).opacity(opacity));
+            element.layout_as_root(size(px(100.), px(100.)).into(), window, cx);
+            window.with_absolute_element_offset(Default::default(), |window| {
+                element.prepaint(window, cx)
+            });
+
+            window.invalidator.set_phase(DrawPhase::Paint);
+            element.paint(window, cx);
+            window.invalidator.set_phase(DrawPhase::None);
+
+            window
+                .next_frame
+                .scene
+                .backdrop_blurs
+                .iter()
+                .map(|blur| blur.opacity)
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn backdrop_blur_carries_element_opacity(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        assert_eq!(paint_backdrop_blur(cx, 1.0), vec![1.0]);
+        assert_eq!(paint_backdrop_blur(cx, 0.4), vec![0.4]);
+    }
+
+    #[gpui::test]
+    fn backdrop_blur_is_skipped_once_invisible(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        assert!(paint_backdrop_blur(cx, 0.0).is_empty());
+        assert!(paint_backdrop_blur(cx, 0.001).is_empty());
+        assert_eq!(paint_backdrop_blur(cx, 0.01), vec![0.01]);
     }
 }

@@ -1092,7 +1092,9 @@ pub struct BackdropBlur {
     pub source_origin_y: f32,
     pub source_width: f32,
     pub source_height: f32,
-    pub pad2: u32, // align storage buffer stride to WGSL layout
+    /// Effective element opacity, used as the composite weight of the blurred
+    /// backdrop. Also aligns the storage buffer stride to the WGSL layout.
+    pub opacity: f32,
 }
 
 impl From<BackdropBlur> for Primitive {
@@ -1542,7 +1544,7 @@ mod tests {
             source_origin_y: 0.0,
             source_width: 1.0,
             source_height: 1.0,
-            pad2: 0,
+            opacity: 1.0,
         }
     }
 
@@ -1568,7 +1570,7 @@ mod tests {
         assert_eq!(offset_of!(BackdropBlur, source_origin_y), 96);
         assert_eq!(offset_of!(BackdropBlur, source_width), 100);
         assert_eq!(offset_of!(BackdropBlur, source_height), 104);
-        assert_eq!(offset_of!(BackdropBlur, pad2), 108);
+        assert_eq!(offset_of!(BackdropBlur, opacity), 108);
     }
 
     #[test]
@@ -1739,6 +1741,46 @@ mod tests {
         assert_eq!(prepared[0].source_origin_y, 0.0);
         assert_eq!(prepared[0].source_width, 64.0);
         assert_eq!(prepared[0].source_height, 64.0);
+    }
+
+    #[test]
+    fn backdrop_blur_opacity_does_not_split_clusters_or_plan_groups() {
+        let mut blurs = [
+            test_backdrop_blur_with_bounds(1, 0.0, 10.0, 12.0),
+            test_backdrop_blur_with_bounds(2, 15.0, 10.0, 12.0),
+            test_backdrop_blur_with_bounds(3, 30.0, 10.0, 12.0),
+        ];
+        let viewport_size = size(DevicePixels(200), DevicePixels(100));
+        let opaque_clusters = backdrop_blur_clusters(&blurs, viewport_size);
+        let opaque_groups = backdrop_blur_plan_groups(&blurs, BackdropBlurPlan::MAX_PASSES);
+
+        // Mid-fade each blur carries a different opacity; batching must not
+        // notice, or a fading stack of surfaces would fragment into one
+        // snapshot and blur pyramid per surface.
+        blurs[0].opacity = 0.25;
+        blurs[1].opacity = 0.5;
+        blurs[2].opacity = 0.75;
+
+        let faded_clusters = backdrop_blur_clusters(&blurs, viewport_size);
+        assert_eq!(faded_clusters.len(), 1);
+        assert_eq!(faded_clusters.len(), opaque_clusters.len());
+        assert_eq!(faded_clusters[0].len(), opaque_clusters[0].len());
+        assert_eq!(
+            backdrop_blur_plan_groups(&blurs, BackdropBlurPlan::MAX_PASSES),
+            opaque_groups
+        );
+    }
+
+    #[test]
+    fn prepare_backdrop_blurs_preserves_opacity() {
+        let mut blurs = [test_backdrop_blur_with_bounds(1, 0.0, 10.0, 1.0)];
+        blurs[0].opacity = 0.4;
+        let viewport_size = size(DevicePixels(100), DevicePixels(100));
+        let scratch_bounds = backdrop_scratch_bounds(&blurs, viewport_size).unwrap();
+
+        let prepared = prepare_backdrop_blurs(&blurs, scratch_bounds);
+
+        assert_eq!(prepared[0].opacity, 0.4);
     }
 
     #[test]

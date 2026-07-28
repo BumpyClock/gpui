@@ -2954,7 +2954,7 @@ mod tests {
             source_origin_y: 0.0,
             source_width: 1.0,
             source_height: 1.0,
-            pad2: 0,
+            opacity: 1.0,
         });
 
         assert!(MetalRenderer::retained_layers_for_scene(&scene).is_empty());
