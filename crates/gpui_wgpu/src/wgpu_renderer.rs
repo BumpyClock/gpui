@@ -3280,7 +3280,7 @@ mod tests {
             source_origin_y: 0.0,
             source_width: 1.0,
             source_height: 1.0,
-            pad2: 0,
+            opacity: 1.0,
         });
 
         let retained_scene = scene.clone_paint_range(layer.paint_range);

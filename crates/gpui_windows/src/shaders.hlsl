@@ -560,6 +560,7 @@ struct BackdropBlur {
     float source_origin_y;
     float source_width;
     float source_height;
+    float opacity;
 };
 
 struct BackdropBlurParams {
@@ -719,6 +720,9 @@ float4 backdrop_blur_fragment(BackdropBlurFragmentInput input) : SV_Target {
     float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
     float alpha = saturate(0.5 - distance);
     alpha *= content_mask_alpha(input.position.xy, blur.content_mask);
+    // Weighting the composite by the element's opacity crossfades the blurred
+    // backdrop back to the unblurred one already in the target.
+    alpha *= saturate(blur.opacity);
     float3 rgb = color.a > 0.0 ? color.rgb / color.a : float3(0.0, 0.0, 0.0);
     return float4(rgb, color.a * alpha);
 }
