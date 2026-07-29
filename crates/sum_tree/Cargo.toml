@@ -1,8 +1,11 @@
 [package]
 name = "sum_tree"
 version = "0.1.0"
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
 edition.workspace = true
-publish = false
+publish = true
 license = "Apache-2.0"
 description = "A sum tree data structure, a concurrency-friendly B-tree"
 

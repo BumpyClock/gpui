@@ -3,8 +3,8 @@
 //! When run normally, this displays an interactive counter window.
 //! The tests below demonstrate various GPUI testing patterns.
 //!
-//! Run the app: cargo run -p gpui --example testing
-//! Run tests:   cargo test -p gpui --example testing --features test-support
+//! Run the app: cargo run -p bumpyclock-gpui --example testing
+//! Run tests:   cargo test -p bumpyclock-gpui --example testing --features test-support
 
 use gpui::{
     App, Bounds, Context, FocusHandle, Focusable, Render, Task, Window, WindowBounds,

@@ -30,15 +30,18 @@ jobs:
         uses: ./.github/actions/install-linux-dependencies
       - run: cargo fmt --all -- --check
       - run: cargo metadata --locked --format-version 1 > /dev/null
+      - run: cargo test --locked -p xtask
+      - run: cargo run --locked -p xtask -- fork validate
+      - run: cargo run --locked -p xtask -- publish-plan
       - run: cargo check --locked --workspace --all-targets
       - run: cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
       - run: cargo test --locked -p scheduler
-      - run: cargo test --locked -p gpui --features bench,profiler --lib
+      - run: cargo test --locked -p bumpyclock-gpui --features bench,profiler --lib
       - name: Test release-only accessibility duplicate handling
-        run: cargo test --locked --release -p gpui --features test-support duplicate_id
+        run: cargo test --locked --release -p bumpyclock-gpui --features test-support duplicate_id
       - run: cargo test --locked -p gpui_wgpu --lib
-      - run: cargo check --locked -p gpui --examples
-      - run: cargo check --locked -p gpui --features bench --benches
+      - run: cargo check --locked -p bumpyclock-gpui --examples
+      - run: cargo check --locked -p bumpyclock-gpui --features bench --benches
       - run: cargo check --locked -p gpui_wgpu --benches
 
   native-platform:
@@ -119,4 +122,4 @@ jobs:
         with:
           key: wasm
       - run: cargo +nightly -Zbuild-std=std,panic_abort check --locked --target wasm32-unknown-unknown -p gpui_platform
-      - run: cargo +nightly -Zbuild-std=std,panic_abort check --locked --target wasm32-unknown-unknown -p gpui --example a11y --example view_example
+      - run: cargo +nightly -Zbuild-std=std,panic_abort check --locked --target wasm32-unknown-unknown -p bumpyclock-gpui --example a11y --example view_example

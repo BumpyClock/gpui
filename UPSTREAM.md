@@ -4,10 +4,15 @@ This repository is a standalone, selective hard fork of GPUI from
 [`zed-industries/zed`](https://github.com/zed-industries/zed). It preserves APIs and renderer and
 platform behavior that do not exist upstream while periodically importing compatible GPUI work.
 
+`fork.toml` is the machine-readable source of truth for upstream URL, exact audited base commit,
+synchronization date, fork URL, and maintained patch-cluster statuses. Run `cargo run --locked -p
+xtask -- fork validate` after changing it; do not duplicate those values in downstream release
+metadata.
+
 ## Current provenance
 
 - Historical README marker: `24f62484e936aa355c72f2009313bbe2898a9fd5` (2026-04-29).
-- Current audited target: `2c4e44704c37ee87e59ac84e3e17388178b28545` (2026-07-09).
+- Current audited target and synchronization date: see `fork.toml`.
 - Audited range: 1,493 Zed commits, including 117 commits touching GPUI-family code and 126
   GPUI-family files.
 - Fork implementation range: commits after local baseline `510dedc3b44fcf80c791ab17e59530ae66e80558`.
@@ -15,6 +20,8 @@ platform behavior that do not exist upstream while periodically importing compat
 The historical marker was only a lower-bound provenance note. Earlier fork commits `b373e0b` and
 `8164718` had already imported some later upstream work. Neither upstream SHA is a byte-identical
 fork baseline or a suitable Git merge base for this fork; the current target is an audit cursor.
+The fork repository does not retain the Zed commit objects, so a Git merge-base cannot be computed
+locally; the full audited target in `fork.toml` is the strongest verifiable provenance record.
 The 2026-07 sync compared behavior and paths, then imported or adapted changes in reviewable local
 commits. It did not merge the Zed repository or copy its root manifests and lockfile.
 
@@ -101,7 +108,7 @@ The completed local matrix passed:
 - `cargo check --locked --workspace --all-targets`
 - `cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings`
 - `cargo test --locked -p scheduler` (36 tests)
-- `cargo test --locked -p gpui --features test-support` (253 unit and 3 integration tests)
+- `cargo test --locked -p bumpyclock-gpui --features test-support` (253 unit and 3 integration tests)
 - all GPUI examples, GPUI benches, and GPUI WGPU benches
 - macOS platform tests (8 tests)
 - isolated Linux no-default, Wayland, X11, and combined checks with warnings denied
@@ -119,7 +126,8 @@ atomics enabled.
 ## Next sync procedure
 
 1. Clone or update Zed in `/tmp/zed`; never overwrite tracked fork files with an upstream tree.
-2. Set `BASE=2c4e44704c37ee87e59ac84e3e17388178b28545` and the new audited `TARGET`.
+2. Read `BASE` from `fork.toml` and set the new audited `TARGET`; do not duplicate the base SHA in
+   procedure text.
 3. Inventory `BASE..TARGET` for `crates/gpui*`, `crates/scheduler`, required extracted utilities,
    shaders, examples, and platform manifests. Also compare the target trees semantically so an old
    README marker cannot hide a pre-existing gap.

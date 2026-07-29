@@ -11,7 +11,7 @@
 //!   * `Input` / `TextArea` — the shaping layer. Each takes a `String` (and grows
 //!                 the editor internally) OR an `Editor` (so you can read the cursor).
 //!
-//! Run: `cargo run -p gpui --example view_example`
+//! Run: `cargo run -p bumpyclock-gpui --example view_example`
 
 mod example_editor;
 mod example_input;

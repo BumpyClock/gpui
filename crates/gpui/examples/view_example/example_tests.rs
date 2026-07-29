@@ -1,7 +1,7 @@
 //! Tests for the input composition. Require the `test-support` feature:
 //!
 //! ```sh
-//! cargo test -p gpui --example view_example --features test-support
+//! cargo test -p bumpyclock-gpui --example view_example --features test-support
 //! ```
 
 #[cfg(test)]

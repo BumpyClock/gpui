@@ -1,8 +1,12 @@
 [package]
 name = "gpui_platform"
 version = "0.1.0"
+rust-version.workspace = true
+repository.workspace = true
+description = "Platform selection facade for the standalone GPUI framework."
+readme = "README.md"
 edition.workspace = true
-publish.workspace = true
+publish = true
 license = "Apache-2.0"
 
 [lints]

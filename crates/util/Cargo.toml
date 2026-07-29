@@ -1,8 +1,11 @@
 [package]
 name = "util"
 version = "0.1.0"
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
 edition.workspace = true
-publish = false
+publish = true
 license = "Apache-2.0"
 description = "A collection of utility structs and functions used by Zed and GPUI"
 

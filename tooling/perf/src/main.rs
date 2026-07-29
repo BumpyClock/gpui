@@ -31,7 +31,7 @@
 //!
 //! ## Comparing runs
 //! Passing `--json=ident` will save per-crate run files in `.perf-runs`, e.g.
-//! `cargo perf-test -p gpui -- --json=blah` will result in `.perf-runs/blah.gpui.json`
+//! `cargo perf-test -p bumpyclock-gpui -- --json=blah` will result in `.perf-runs/blah.gpui.json`
 //! being created (unless no tests were run). These results can be automatically
 //! compared. To do so, run `cargo perf-compare new-ident old-ident`.
 //!

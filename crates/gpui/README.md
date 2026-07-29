@@ -5,11 +5,14 @@ for Rust, designed to support a wide variety of applications.
 
 ## Getting Started
 
-GPUI is still in active development as we work on the Zed code editor, and is still pre-1.0. There will often be breaking changes between versions. You'll also need to use the latest version of stable Rust and be on macOS or Linux. Add the following to your `Cargo.toml`:
+GPUI is still in active development as we work on the Zed code editor, and is still pre-1.0. There will often be breaking changes between versions. You'll also need to use the latest version of stable Rust and be on macOS or Linux. While the fork facade is unpublished, add the following Git dependency to your `Cargo.toml` (the dependency key remains `gpui`):
 
 ```toml
-gpui = { version = "*" }
+gpui = { package = "bumpyclock-gpui", git = "https://github.com/BumpyClock/gpui", rev = "<full-40-character-commit-sha>" }
 ```
+
+Replace the placeholder with an immutable commit containing the renamed `bumpyclock-gpui`
+package; do not depend on `main`.
 
  - [Ownership and data flow](_ownership_and_data_flow)
  - [Accessibility](_accessibility)

@@ -1,7 +1,11 @@
 [package]
 name = "gpui_web"
 version = "0.1.0"
-publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Web platform backend for the standalone GPUI framework."
+readme = "README.md"
+publish = true
 edition.workspace = true
 license = "Apache-2.0"
 autoexamples = false

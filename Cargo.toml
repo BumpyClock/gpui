@@ -27,12 +27,15 @@ members = [
     "crates/ztracing",
     "crates/ztracing_macro",
     "tooling/perf",
+    "tooling/xtask",
 ]
 default-members = ["crates/gpui"]
 
 [workspace.package]
 publish = false
 edition = "2024"
+rust-version = "1.95.0"
+repository = "https://github.com/BumpyClock/gpui"
 
 [workspace.dependencies]
 
@@ -40,32 +43,32 @@ edition = "2024"
 # Workspace member crates
 #
 
-collections = { path = "crates/collections", version = "0.1.0" }
-derive_refineable = { path = "crates/refineable/derive_refineable" }
-gpui = { path = "crates/gpui", default-features = false }
-gpui_linux = { path = "crates/gpui_linux", default-features = false }
-gpui_macos = { path = "crates/gpui_macos", default-features = false }
-gpui_macros = { path = "crates/gpui_macros" }
-gpui_platform = { path = "crates/gpui_platform", default-features = false }
-gpui_shared_string = { path = "crates/gpui_shared_string" }
-gpui_wgpu = { path = "crates/gpui_wgpu" }
-gpui_windows = { path = "crates/gpui_windows", default-features = false }
-gpui_tokio = { path = "crates/gpui_tokio" }
-gpui_util = { path = "crates/gpui_util" }
-gpui_web = { path = "crates/gpui_web" }
-http_client = { path = "crates/http_client" }
-http_client_tls = { path = "crates/http_client_tls" }
-media = { path = "crates/media" }
-perf = { path = "tooling/perf" }
-refineable = { path = "crates/refineable" }
-reqwest_client = { path = "crates/reqwest_client" }
-scheduler = { path = "crates/scheduler" }
-sum_tree = { path = "crates/sum_tree" }
-util = { path = "crates/util" }
-util_macros = { path = "crates/util_macros" }
-zlog = { path = "crates/zlog" }
-ztracing = { path = "crates/ztracing" }
-ztracing_macro = { path = "crates/ztracing_macro" }
+collections = { path = "crates/collections", version = "=0.1.0" }
+derive_refineable = { path = "crates/refineable/derive_refineable", version = "=0.1.0" }
+gpui = { package = "bumpyclock-gpui", path = "crates/gpui", version = "=0.1.0", default-features = false }
+gpui_linux = { path = "crates/gpui_linux", version = "=0.1.0", default-features = false }
+gpui_macos = { path = "crates/gpui_macos", version = "=0.1.0", default-features = false }
+gpui_macros = { path = "crates/gpui_macros", version = "=0.1.0" }
+gpui_platform = { path = "crates/gpui_platform", version = "=0.1.0", default-features = false }
+gpui_shared_string = { path = "crates/gpui_shared_string", version = "=0.1.0" }
+gpui_wgpu = { path = "crates/gpui_wgpu", version = "=0.1.0" }
+gpui_windows = { path = "crates/gpui_windows", version = "=0.1.0", default-features = false }
+gpui_tokio = { path = "crates/gpui_tokio", version = "=0.1.0" }
+gpui_util = { path = "crates/gpui_util", version = "=0.1.0" }
+gpui_web = { path = "crates/gpui_web", version = "=0.1.0" }
+http_client = { path = "crates/http_client", version = "=0.1.0" }
+http_client_tls = { path = "crates/http_client_tls", version = "=0.1.0" }
+media = { path = "crates/media", version = "=0.1.0" }
+perf = { path = "tooling/perf", version = "=0.1.0" }
+refineable = { path = "crates/refineable", version = "=0.1.0" }
+reqwest_client = { path = "crates/reqwest_client", version = "=0.1.0" }
+scheduler = { path = "crates/scheduler", version = "=0.1.0" }
+sum_tree = { path = "crates/sum_tree", version = "=0.1.0" }
+util = { path = "crates/util", version = "=0.1.0" }
+util_macros = { path = "crates/util_macros", version = "=0.1.0" }
+zlog = { path = "crates/zlog", version = "=0.1.0" }
+ztracing = { path = "crates/ztracing", version = "=0.1.0" }
+ztracing_macro = { path = "crates/ztracing_macro", version = "=0.1.0" }
 
 #
 # External crates
@@ -88,7 +91,7 @@ async-channel = "2.5.0"
 async-compression = { version = "0.4", features = ["gzip", "futures-io"] }
 async-fs = "2.1"
 async-tar = "0.5.1"
-async-task = "4.7"
+async-task = "=4.7.1"
 async_zip = { version = "0.0.18", features = ["deflate", "deflate64"] }
 backtrace = "0.3"
 bitflags = "2.6.0"
@@ -176,7 +179,7 @@ quote = "1.0.9"
 rand = "0.9"
 rayon = "1.8"
 regex = "1.5"
-reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "c15662463bda39148ba154100dd44d3fba5873a4", default-features = false, features = [
+reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "c15662463bda39148ba154100dd44d3fba5873a4", version = "=0.12.15-zed", default-features = false, features = [
     "charset",
     "http2",
     "macos-system-configuration",
@@ -184,7 +187,7 @@ reqwest = { git = "https://github.com/zed-industries/reqwest.git", rev = "c15662
     "rustls-tls-native-roots",
     "socks",
     "stream",
-], package = "zed-reqwest", version = "0.12.15-zed" }
+], package = "zed-reqwest" }
 resvg = { version = "0.46.0", default-features = false, features = [
     "text",
     "system-fonts",
@@ -232,7 +235,7 @@ windows-core = "0.61"
 windows-numerics = "0.2"
 windows-registry = "0.5"
 nix = "0.29"
-scap = { git = "https://github.com/zed-industries/scap", rev = "4afea48c3b002197176fb19cd0f9b180dd36eaac", default-features = false, package = "zed-scap", version = "0.0.8-zed" }
+scap = { git = "https://github.com/zed-industries/scap", rev = "4afea48c3b002197176fb19cd0f9b180dd36eaac", default-features = false, package = "zed-scap", version = "=0.0.8-zed" }
 
 [workspace.dependencies.windows]
 version = "0.61"
@@ -290,7 +293,7 @@ features = [
 
 [patch.crates-io]
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
-calloop = { git = "https://github.com/zed-industries/calloop" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "eb6b4fd17b9af5ecc226546bdd04185391b3e265" }
 windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
 
 [profile.dev]

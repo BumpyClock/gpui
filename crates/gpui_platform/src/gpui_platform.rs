@@ -80,7 +80,7 @@ mod tests {
     // SIGABRT when interacting with macOS AppKit/Cocoa APIs.
     //
     // To run these tests, use:
-    // cargo test -p gpui visual_test_context -- --ignored --test-threads=1
+    // cargo test -p bumpyclock-gpui visual_test_context -- --ignored --test-threads=1
 
     #[test]
     #[ignore] // Requires macOS main thread

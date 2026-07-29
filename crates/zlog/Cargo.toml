@@ -1,8 +1,12 @@
 [package]
 name = "zlog"
 version = "0.1.0"
+rust-version.workspace = true
+repository.workspace = true
+description = "Logging support used by the standalone GPUI framework."
+readme = "README.md"
 edition.workspace = true
-publish.workspace = true
+publish = true
 license = "GPL-3.0-or-later"
 
 [lints]

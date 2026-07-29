@@ -1,8 +1,13 @@
 [package]
 name = "gpui_shared_string"
 version = "0.1.0"
-publish.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Shared string types used by the standalone GPUI framework."
+readme = "README.md"
+publish = true
 edition.workspace = true
+license = "Apache-2.0"
 
 [lib]
 path = "gpui_shared_string.rs"

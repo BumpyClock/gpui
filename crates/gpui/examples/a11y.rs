@@ -2,7 +2,7 @@
 
 //! Accessibility (AccessKit) demo app.
 //!
-//! Run with: `cargo run -p gpui --example a11y`.
+//! Run with: `cargo run -p bumpyclock-gpui --example a11y`.
 
 use gpui::{
     AccessibleAction, App, Context, FocusHandle, KeyBinding, Role, SharedString, Text, Toggled,
