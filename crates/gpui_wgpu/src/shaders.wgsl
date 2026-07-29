@@ -1202,6 +1202,7 @@ struct BackdropBlur {
     source_origin_y: f32,
     source_width: f32,
     source_height: f32,
+    opacity: f32,
 }
 @group(1) @binding(0) var<storage, read> b_backdrop_blurs: array<BackdropBlur>;
 
@@ -1250,7 +1251,9 @@ fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
     }
 
     let distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
-    let surface_alpha = saturate(0.5 - distance);
+    // Weighting the composite by the element's opacity crossfades the blurred
+    // backdrop back to the unblurred one already in the target.
+    let surface_alpha = saturate(0.5 - distance) * saturate(blur.opacity);
     return apply_content_mask(
         blend_color(vec4<f32>(straight_rgb, color.a), surface_alpha),
         input.position.xy,

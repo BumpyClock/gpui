@@ -288,6 +288,9 @@ fragment float4 backdrop_blur_fragment(
   float alpha = clamp(0.5 - distance, 0.0, 1.0);
   alpha *= content_mask_alpha(input.position.xy, blur.content_mask.rounded_bounds,
                               blur.content_mask.corner_radii);
+  // Weighting the composite by the element's opacity crossfades the blurred
+  // backdrop back to the unblurred one already in the target.
+  alpha *= clamp(blur.opacity, 0.0, 1.0);
   float3 straight_rgb =
       color.a > 0.0 ? color.rgb / color.a : float3(0.0);
   return float4(straight_rgb, color.a * alpha);
