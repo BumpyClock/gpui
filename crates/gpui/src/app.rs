@@ -18,7 +18,7 @@ use futures::{
     future::{LocalBoxFuture, Shared},
 };
 use itertools::Itertools;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use slotmap::SlotMap;
 
 use crate::util::{ResultExt, debug_panic};
@@ -142,6 +142,25 @@ pub struct ApplicationHandle {
     app: Rc<AppCell>,
 }
 
+#[cfg(any(target_family = "wasm", test))]
+thread_local! {
+    static WEB_APPLICATION_HANDLE: RefCell<Option<ApplicationHandle>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(any(target_family = "wasm", test))]
+fn release_web_application_handle(app: &Rc<AppCell>) {
+    WEB_APPLICATION_HANDLE.with(|application| {
+        let mut application = application.borrow_mut();
+        if application
+            .as_ref()
+            .is_some_and(|handle| Rc::ptr_eq(&handle.app, app))
+        {
+            application.take();
+        }
+    });
+}
+
 impl ApplicationHandle {
     /// Invoke `f` with the app context.
     ///
@@ -207,30 +226,67 @@ impl Application {
 
     /// Start the application. The provided callback will be called once the
     /// app is fully launched.
+    ///
+    /// Native and headless platforms block until an orderly quit completes, then
+    /// return normally. Callers should then let their entry point return as well;
+    /// restart waits for the current process to exit before relaunching. Web platforms
+    /// return after scheduling launch because the browser owns their event loop; this method
+    /// retains the application on the browser main thread until shutdown completes.
     pub fn run<F>(self, on_finish_launching: F)
     where
         F: 'static + FnOnce(&mut App),
     {
-        let this = self.0.clone();
-        let platform = self.0.borrow().platform.clone();
-        platform.run(Box::new(move || {
-            let cx = &mut *this.borrow_mut();
-            on_finish_launching(cx);
-        }));
+        #[cfg(target_family = "wasm")]
+        {
+            let app = self.0;
+            WEB_APPLICATION_HANDLE.with(|application| {
+                let mut application = application.borrow_mut();
+                assert!(
+                    application.is_none(),
+                    "Application::run may only own one web application per thread"
+                );
+                *application = Some(ApplicationHandle { app: app.clone() });
+            });
+
+            let this = Rc::downgrade(&app);
+            let platform = app.borrow().platform.clone();
+            platform.run(Box::new(move || {
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                let cx = &mut *this.borrow_mut();
+                on_finish_launching(cx);
+            }));
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let this = self.0.clone();
+            let platform = self.0.borrow().platform.clone();
+            platform.run(Box::new(move || {
+                let cx = &mut *this.borrow_mut();
+                on_finish_launching(cx);
+            }));
+        }
     }
 
     /// Start the application for an embedder that drives the run loop itself.
     ///
-    /// Embedded platforms invoke the launch callback and return immediately from
-    /// [`Platform::run`]. The returned handle keeps the application alive and lets the
-    /// embedder re-enter it when its external run loop yields control.
+    /// Platforms whose host owns the run loop return from [`Platform::run`] without owning the
+    /// application lifetime. They may invoke the launch callback before returning or schedule it
+    /// asynchronously. The returned handle keeps the application alive and lets the host re-enter
+    /// it when its external run loop yields control. Dropping the handle before a scheduled launch
+    /// callback runs cancels that launch.
     pub fn run_embedded<F>(self, on_finish_launching: F) -> ApplicationHandle
     where
         F: 'static + FnOnce(&mut App),
     {
-        let this = self.0.clone();
+        let this = Rc::downgrade(&self.0);
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
+            let Some(this) = this.upgrade() else {
+                return;
+            };
             let cx = &mut *this.borrow_mut();
             on_finish_launching(cx);
         }));
@@ -656,6 +712,7 @@ impl GpuiMode {
 
 /// A closure posted to the main thread via [`MainThreadPoster`].
 type MainThreadTask = Box<dyn FnOnce(&mut App) + Send + 'static>;
+type MainThreadSender = Arc<Mutex<Option<mpsc::UnboundedSender<MainThreadTask>>>>;
 
 /// A cloneable, `Send + Sync` handle for scheduling closures to run on the main thread.
 ///
@@ -670,17 +727,21 @@ type MainThreadTask = Box<dyn FnOnce(&mut App) + Send + 'static>;
 /// [`App`] access, in the order they were posted.
 #[derive(Clone)]
 pub struct MainThreadPoster {
-    tx: mpsc::UnboundedSender<MainThreadTask>,
+    tx: MainThreadSender,
 }
 
 impl MainThreadPoster {
     /// Posts `f` to run on the main thread with exclusive access to the [`App`].
     ///
-    /// Returns `true` if the closure was enqueued. Returns `false` if the app has shut down (the
-    /// main-thread receiver is gone), in which case `f` is dropped without running. Enqueued
+    /// Returns `true` if the closure was enqueued. Returns `false` after shutdown has started (the
+    /// main-thread receiver is closed), in which case `f` is dropped without running. Enqueued
     /// closures run on the main thread in the order they were posted.
     pub fn post(&self, f: impl FnOnce(&mut App) + Send + 'static) -> bool {
-        self.tx.unbounded_send(Box::new(f)).is_ok()
+        let tx = self.tx.lock();
+        let Some(tx) = tx.as_ref() else {
+            return false;
+        };
+        tx.unbounded_send(Box::new(f)).is_ok()
     }
 }
 
@@ -752,7 +813,7 @@ pub struct App {
     /// Lazily-created channel behind [`App::main_thread_poster`]. Sending on it wakes the
     /// main run loop through the platform dispatcher, so background threads can schedule
     /// work onto the main thread without polling.
-    main_thread_poster: Option<mpsc::UnboundedSender<MainThreadTask>>,
+    main_thread_poster: Option<MainThreadSender>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_renderer: Option<crate::InspectorRenderer>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -769,6 +830,9 @@ pub struct App {
     flushing_effects: bool,
     pending_updates: usize,
     quit_mode: QuitMode,
+    shutdown_started: Cell<bool>,
+    platform_quit_requested: Cell<bool>,
+    shutdown_observers_started: bool,
     quitting: bool,
 
     // We need to ensure the leak detector drops last, after all tasks, callbacks and things have been dropped.
@@ -854,6 +918,9 @@ impl App {
                 #[cfg(any(feature = "inspector", debug_assertions))]
                 inspector_element_registry: InspectorElementRegistry::default(),
                 quit_mode: QuitMode::default(),
+                shutdown_started: Cell::new(false),
+                platform_quit_requested: Cell::new(false),
+                shutdown_observers_started: false,
                 quitting: false,
                 cursor_hide_mode: CursorHideMode::default(),
                 accessibility_force_disabled: false,
@@ -898,10 +965,26 @@ impl App {
         }));
 
         platform.on_quit(Box::new({
-            let cx = Rc::downgrade(&app);
+            let app = Rc::downgrade(&app);
+            let foreground_executor = platform.foreground_executor();
             move || {
-                if let Some(cx) = cx.upgrade() {
-                    cx.borrow_mut().shutdown();
+                let Some(app) = app.upgrade() else {
+                    return;
+                };
+                if let Ok(mut cx) = app.try_borrow_mut() {
+                    cx.platform_quit_requested.set(true);
+                    cx.shutdown();
+                } else {
+                    let app = Rc::downgrade(&app);
+                    foreground_executor
+                        .spawn(async move {
+                            if let Some(app) = app.upgrade() {
+                                let mut app = app.borrow_mut();
+                                app.platform_quit_requested.set(true);
+                                app.shutdown();
+                            }
+                        })
+                        .detach();
                 }
             }
         }));
@@ -909,9 +992,28 @@ impl App {
         app
     }
 
-    /// Quit the application gracefully. Handlers registered with [`Context::on_app_quit`]
-    /// will be given 100ms to complete before exiting.
+    fn close_shutdown_admission(&self) -> bool {
+        if self.shutdown_started.replace(true) {
+            return false;
+        }
+        if let Some(poster) = &self.main_thread_poster {
+            poster.lock().take();
+        }
+        true
+    }
+
+    /// Shut the application down gracefully. Handlers registered with
+    /// [`Context::on_app_quit`] are given 100ms to complete before shutdown finishes. Native and
+    /// headless callers wait for that window before their run loop returns; Web shutdown completes
+    /// it asynchronously on the browser event loop.
     pub fn shutdown(&mut self) {
+        if self.shutdown_observers_started {
+            return;
+        }
+        self.close_shutdown_admission();
+        self.shutdown_observers_started = true;
+        self.main_thread_poster.take();
+
         let mut futures = Vec::new();
 
         for observer in self.quit_observers.remove(&()) {
@@ -920,19 +1022,51 @@ impl App {
 
         self.windows.clear();
         self.window_handles.clear();
-        self.flush_effects();
+        self.pending_effects.clear();
         self.quitting = true;
 
-        let futures = futures::future::join_all(futures);
-        if self
-            .foreground_executor
-            .block_with_timeout(SHUTDOWN_TIMEOUT, futures)
-            .is_err()
+        #[cfg(target_family = "wasm")]
         {
-            log::error!("timed out waiting on app_will_quit");
+            let app = self
+                .this
+                .upgrade()
+                .expect("app must remain alive while shutdown is starting");
+            let timeout = self.background_executor.timer(SHUTDOWN_TIMEOUT);
+            self.foreground_executor
+                .spawn(async move {
+                    let observers = futures::future::join_all(futures).boxed_local();
+                    let timeout = timeout.boxed_local();
+                    if matches!(
+                        futures::future::select(observers, timeout).await,
+                        futures::future::Either::Right(_)
+                    ) {
+                        log::error!("timed out waiting on app_will_quit");
+                    }
+
+                    {
+                        let mut state = app.borrow_mut();
+                        state.quitting = false;
+                        state.pending_effects.clear();
+                    }
+                    release_web_application_handle(&app);
+                })
+                .detach();
         }
 
-        self.quitting = false;
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let futures = futures::future::join_all(futures);
+            if self
+                .foreground_executor
+                .block_with_timeout(SHUTDOWN_TIMEOUT, futures)
+                .is_err()
+            {
+                log::error!("timed out waiting on app_will_quit");
+            }
+
+            self.quitting = false;
+            self.pending_effects.clear();
+        }
     }
 
     /// Get the id of the current keyboard layout
@@ -963,7 +1097,10 @@ impl App {
 
     /// Gracefully quit the application via the platform's standard routine.
     pub fn quit(&self) {
-        self.platform.quit();
+        self.close_shutdown_admission();
+        if !self.platform_quit_requested.replace(true) {
+            self.platform.quit();
+        }
     }
 
     /// Returns the current policy for hiding the cursor in response to
@@ -990,7 +1127,9 @@ impl App {
     /// Schedules all windows in the application to be redrawn. This can be called
     /// multiple times in an update cycle and still result in a single redraw.
     pub fn refresh_windows(&mut self) {
-        self.pending_effects.push_back(Effect::RefreshWindows);
+        if !self.shutdown_started.get() {
+            self.pending_effects.push_back(Effect::RefreshWindows);
+        }
     }
 
     pub(crate) fn update<R>(&mut self, update: impl FnOnce(&mut Self) -> R) -> R {
@@ -1005,7 +1144,9 @@ impl App {
     }
 
     pub(crate) fn finish_update(&mut self) {
-        if !self.flushing_effects && self.pending_updates == 1 {
+        if self.shutdown_started.get() {
+            self.pending_effects.clear();
+        } else if !self.flushing_effects && self.pending_updates == 1 {
             self.flushing_effects = true;
             self.flush_effects();
             self.flushing_effects = false;
@@ -1490,6 +1631,10 @@ impl App {
     }
 
     pub(crate) fn push_effect(&mut self, effect: Effect) {
+        if self.shutdown_started.get() {
+            return;
+        }
+
         match &effect {
             Effect::Notify { emitter } => {
                 if !self.pending_notifications.insert(*emitter) {
@@ -1512,6 +1657,13 @@ impl App {
     /// cause effects, so we continue looping until all effects are processed.
     fn flush_effects(&mut self) {
         loop {
+            if self.shutdown_started.get() {
+                self.pending_effects.clear();
+                self.pending_notifications.clear();
+                self.pending_global_notifications.clear();
+                break;
+            }
+
             self.release_dropped_entities();
             self.release_dropped_focus_handles();
             if let Some(effect) = self.pending_effects.pop_front() {
@@ -1814,8 +1966,8 @@ impl App {
     /// The poster is created lazily on first call and cached, so repeated calls hand back clones
     /// backed by the same channel. Closures posted through it run on the main thread with
     /// exclusive [`App`] access, in the order they were posted, and wake the run loop via the
-    /// platform dispatcher rather than by polling. Posts made after the app has shut down are
-    /// dropped harmlessly (see [`MainThreadPoster::post`]).
+    /// platform dispatcher rather than by polling. Posts made after quit is requested are dropped
+    /// harmlessly (see [`MainThreadPoster::post`]).
     ///
     /// # Example
     ///
@@ -1832,18 +1984,28 @@ impl App {
     /// # }
     /// ```
     pub fn main_thread_poster(&mut self) -> MainThreadPoster {
+        if self.shutdown_started.get() {
+            return MainThreadPoster {
+                tx: Arc::new(Mutex::new(None)),
+            };
+        }
         if let Some(tx) = &self.main_thread_poster {
             return MainThreadPoster { tx: tx.clone() };
         }
 
         let (tx, mut rx) = mpsc::unbounded::<MainThreadTask>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let channel = tx.clone();
         let weak_app = self.this.clone();
-        // A single persistent foreground task drains the channel. Sending on `tx` wakes this
-        // task's waker, which schedules it onto the main thread via the platform dispatcher, so
-        // there is no polling. The task ends (and further posts fail) once the app is dropped.
+        // A single persistent foreground task drains the channel. Sending wakes this task's waker,
+        // which schedules it onto the main thread via the platform dispatcher. Shutdown closes the
+        // shared sender before any queued task can re-enter the app.
         self.foreground_executor
             .spawn(async move {
                 while let Some(task) = rx.next().await {
+                    if channel.lock().is_none() {
+                        break;
+                    }
                     let Some(app) = weak_app.upgrade() else {
                         break;
                     };
@@ -2121,13 +2283,17 @@ impl App {
     /// Register key bindings.
     pub fn bind_keys(&mut self, bindings: impl IntoIterator<Item = KeyBinding>) {
         self.keymap.borrow_mut().add_bindings(bindings);
-        self.pending_effects.push_back(Effect::RefreshWindows);
+        if !self.shutdown_started.get() {
+            self.pending_effects.push_back(Effect::RefreshWindows);
+        }
     }
 
     /// Clear all key bindings in the app.
     pub fn clear_key_bindings(&mut self) {
         self.keymap.borrow_mut().clear();
-        self.pending_effects.push_back(Effect::RefreshWindows);
+        if !self.shutdown_started.get() {
+            self.pending_effects.push_back(Effect::RefreshWindows);
+        }
     }
 
     /// Get all key bindings in the app.
@@ -2888,25 +3054,302 @@ mod test {
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, mpsc},
+        time::Duration,
     };
 
     use crate::{
         App, AppContext, Application, BackgroundExecutor, Context, Empty, Entity,
-        ForegroundExecutor, Global, Render, TestAppContext, TestDispatcher, TestPlatform, Window,
+        ForegroundExecutor, Global, QuitMode, Render, TestAppContext, TestDispatcher, TestPlatform,
+        Window,
     };
+
+    use super::{ApplicationHandle, WEB_APPLICATION_HANDLE, release_web_application_handle};
 
     #[derive(Default)]
     struct EmbeddedState(u32);
 
     impl Global for EmbeddedState {}
 
-    fn test_application() -> (Application, Rc<TestPlatform>) {
+    fn test_application_with_dispatcher() -> (Application, Rc<TestPlatform>, Arc<TestDispatcher>) {
         let dispatcher = Arc::new(TestDispatcher::new(0));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
-        let foreground_executor = ForegroundExecutor::new(dispatcher);
+        let foreground_executor = ForegroundExecutor::new(dispatcher.clone());
         let platform = TestPlatform::new(background_executor, foreground_executor);
-        (Application::with_platform(platform.clone()), platform)
+        (
+            Application::with_platform(platform.clone()),
+            platform,
+            dispatcher,
+        )
+    }
+
+    fn test_application() -> (Application, Rc<TestPlatform>) {
+        let (application, platform, _) = test_application_with_dispatcher();
+        (application, platform)
+    }
+
+    #[test]
+    fn native_application_run_returns_after_launch_time_quit() {
+        let (application, platform) = test_application();
+        platform.simulate_native_run();
+        let observer_calls = Rc::new(Cell::new(0));
+        let poster_rejected_before_platform_callback = Rc::new(Cell::new(false));
+
+        application.run({
+            let observer_calls = observer_calls.clone();
+            let poster_rejected_before_platform_callback =
+                poster_rejected_before_platform_callback.clone();
+            move |cx| {
+                cx.on_app_quit({
+                    let observer_calls = observer_calls.clone();
+                    move |_| {
+                        observer_calls.set(observer_calls.get() + 1);
+                        async {}
+                    }
+                })
+                .detach();
+
+                let poster = cx.main_thread_poster();
+                cx.quit();
+                let new_poster = cx.main_thread_poster();
+                poster_rejected_before_platform_callback.set(
+                    !poster.post(|_| panic!("post ran after quit admission closed"))
+                        && !new_poster.post(|_| panic!("new post ran after quit admission closed")),
+                );
+                assert_eq!(observer_calls.get(), 0);
+                cx.quit();
+            }
+        });
+
+        assert!(poster_rejected_before_platform_callback.get());
+        assert_eq!(observer_calls.get(), 1);
+    }
+
+    #[test]
+    fn native_application_run_returns_after_shutdown_then_quit() {
+        let (application, platform) = test_application();
+        platform.simulate_native_run();
+        let observer_calls = Rc::new(Cell::new(0));
+
+        application.run({
+            let observer_calls = observer_calls.clone();
+            move |cx| {
+                cx.on_app_quit(move |_| {
+                    observer_calls.set(observer_calls.get() + 1);
+                    async {}
+                })
+                .detach();
+
+                cx.shutdown();
+                cx.quit();
+                cx.quit();
+            }
+        });
+
+        assert_eq!(observer_calls.get(), 1);
+    }
+
+    #[test]
+    fn synchronous_platform_quit_callback_does_not_reenter_app() {
+        let (application, platform, dispatcher) = test_application_with_dispatcher();
+        platform.simulate_synchronous_quit_callback();
+        let observer_calls = Rc::new(Cell::new(0));
+
+        let _handle = application.run_embedded({
+            let observer_calls = observer_calls.clone();
+            move |cx| {
+                cx.on_app_quit(move |_| {
+                    observer_calls.set(observer_calls.get() + 1);
+                    async {}
+                })
+                .detach();
+                cx.quit();
+            }
+        });
+
+        assert_eq!(observer_calls.get(), 0);
+        dispatcher.run_until_parked();
+        assert_eq!(observer_calls.get(), 1);
+    }
+
+    #[test]
+    fn platform_quit_runs_shutdown_once_and_closes_posters() {
+        let (application, platform) = test_application();
+        let observer_calls = Rc::new(Cell::new(0));
+        let handle = application.run_embedded({
+            let observer_calls = observer_calls.clone();
+            move |cx| {
+                cx.on_app_quit(move |_| {
+                    observer_calls.set(observer_calls.get() + 1);
+                    async {}
+                })
+                .detach();
+            }
+        });
+        let poster = handle.update(|cx| cx.main_thread_poster());
+
+        platform.simulate_quit();
+        assert!(!poster.post(|_| panic!("post ran after OS shutdown")));
+        platform.simulate_quit();
+
+        assert_eq!(observer_calls.get(), 1);
+    }
+
+    #[test]
+    fn test_platform_rejects_a_second_run_before_launch() {
+        let (_, platform) = test_application();
+        crate::Platform::run(platform.as_ref(), Box::new(|| {}));
+        let second_launch_ran = Rc::new(Cell::new(false));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let second_launch_ran = second_launch_ran.clone();
+            move || {
+                crate::Platform::run(
+                    platform.as_ref(),
+                    Box::new(move || second_launch_ran.set(true)),
+                );
+            }
+        }));
+
+        assert!(result.is_err());
+        assert!(!second_launch_ran.get());
+    }
+
+    #[test]
+    fn dropping_embedded_handle_cancels_deferred_launch() {
+        let (application, platform) = test_application();
+        platform.defer_launch();
+        let launched = Rc::new(Cell::new(false));
+
+        let handle = application.run_embedded({
+            let launched = launched.clone();
+            move |_| launched.set(true)
+        });
+        drop(handle);
+
+        platform.simulate_launch();
+        assert!(!launched.get());
+    }
+
+    #[test]
+    fn web_application_release_only_removes_the_matching_app() {
+        let (first, _) = test_application();
+        let (second, _) = test_application();
+        let first = first.0;
+        let second = second.0;
+
+        WEB_APPLICATION_HANDLE.with(|application| {
+            *application.borrow_mut() = Some(ApplicationHandle { app: first.clone() });
+        });
+
+        release_web_application_handle(&second);
+        WEB_APPLICATION_HANDLE.with(|application| {
+            let application = application.borrow();
+            assert!(
+                application
+                    .as_ref()
+                    .is_some_and(|handle| Rc::ptr_eq(&handle.app, &first))
+            );
+        });
+
+        release_web_application_handle(&first);
+        WEB_APPLICATION_HANDLE.with(|application| {
+            assert!(application.borrow().is_none());
+        });
+    }
+
+    #[test]
+    fn native_application_run_wakes_for_background_thread_quit_and_waits_for_shutdown() {
+        let (application, platform, dispatcher) = test_application_with_dispatcher();
+        dispatcher.allow_parking();
+        platform.simulate_native_run();
+        let shutdown_completed = Rc::new(Cell::new(false));
+        let thread_handle = Rc::new(RefCell::new(None));
+
+        application.with_quit_mode(QuitMode::Explicit).run({
+            let shutdown_completed = shutdown_completed.clone();
+            let thread_handle = thread_handle.clone();
+            move |cx| {
+                let executor = cx.background_executor().clone();
+                cx.on_app_quit(move |_| {
+                    let executor = executor.clone();
+                    let shutdown_completed = shutdown_completed.clone();
+                    async move {
+                        executor.timer(Duration::from_millis(1)).await;
+                        shutdown_completed.set(true);
+                    }
+                })
+                .detach();
+
+                let poster = cx.main_thread_poster();
+                let (run_started_tx, run_started_rx) = mpsc::channel();
+                *thread_handle.borrow_mut() = Some(std::thread::spawn(move || {
+                    run_started_rx.recv().unwrap();
+                    assert!(poster.post(|cx| cx.quit()));
+                }));
+                assert!(
+                    cx.main_thread_poster()
+                        .post(move |_| run_started_tx.send(()).unwrap())
+                );
+            }
+        });
+
+        let thread_handle = thread_handle.borrow_mut().take().unwrap();
+        thread_handle.join().unwrap();
+        dispatcher.scheduler().end_test();
+        assert!(shutdown_completed.get());
+    }
+
+    #[test]
+    fn shutdown_drops_queued_effects() {
+        let (application, _) = test_application();
+        let handle = application.run_embedded(|_| {});
+        let deferred = Rc::new(Cell::new(false));
+
+        handle.update({
+            let deferred = deferred.clone();
+            move |cx| {
+                cx.defer(move |_| deferred.set(true));
+                cx.shutdown();
+            }
+        });
+
+        assert!(!deferred.get());
+    }
+
+    #[test]
+    fn repeated_shutdown_drops_post_shutdown_effects() {
+        let (application, _) = test_application();
+        let handle = application.run_embedded(|_| {});
+        let deferred = Rc::new(Cell::new(false));
+
+        handle.update({
+            let deferred = deferred.clone();
+            move |cx| {
+                cx.shutdown();
+                cx.defer({
+                    let deferred = deferred.clone();
+                    move |_| deferred.set(true)
+                });
+                cx.shutdown();
+                assert!(!deferred.get());
+            }
+        });
+
+        assert!(!deferred.get());
+    }
+
+    #[test]
+    fn main_thread_poster_rejects_posts_after_shutdown() {
+        let (application, _) = test_application();
+        let handle = application.run_embedded(|_| {});
+        let poster = handle.update(|cx| cx.main_thread_poster());
+
+        handle.update(|cx| cx.shutdown());
+        let new_poster = handle.update(|cx| cx.main_thread_poster());
+
+        assert!(!poster.post(|_| panic!("post ran after shutdown")));
+        assert!(!new_poster.post(|_| panic!("new post ran after shutdown")));
     }
 
     #[test]

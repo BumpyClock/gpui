@@ -29,6 +29,7 @@ pub(crate) struct TestWindowState {
     active_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     hover_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
+    scale_factor: f32,
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     input_region: Option<Vec<Bounds<Pixels>>>,
@@ -81,6 +82,7 @@ impl TestWindow {
             active_status_change_callback: None,
             hover_status_change_callback: None,
             resize_callback: None,
+            scale_factor: 2.0,
             moved_callback: None,
             input_handler: None,
             input_region: None,
@@ -98,6 +100,20 @@ impl TestWindow {
         let mut lock = self.0.lock();
         // Always update bounds, even if no callback is registered
         lock.bounds.size = size;
+        let Some(mut callback) = lock.resize_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback(size, scale_factor);
+        self.0.lock().resize_callback = Some(callback);
+    }
+
+    /// Simulates moving the window to a display with a different scale factor.
+    pub fn simulate_scale_factor(&mut self, scale_factor: f32) {
+        assert!(scale_factor.is_finite() && scale_factor > 0.0);
+        let mut lock = self.0.lock();
+        lock.scale_factor = scale_factor;
+        let size = lock.bounds.size;
         let Some(mut callback) = lock.resize_callback.take() else {
             return;
         };
@@ -156,7 +172,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn scale_factor(&self) -> f32 {
-        2.0
+        self.0.lock().scale_factor
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -306,8 +322,8 @@ impl PlatformWindow for TestWindow {
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<RgbaImage> {
         let mut state = self.0.lock();
         let size = state.bounds.size;
+        let scale_factor = state.scale_factor;
         if let Some(renderer) = &mut state.renderer {
-            let scale_factor = 2.0;
             let device_size: Size<DevicePixels> = size.to_device_pixels(scale_factor);
             renderer.render_scene_to_image(scene, device_size)
         } else {

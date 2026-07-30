@@ -106,7 +106,7 @@ impl A11y {
     }
 
     /// Force accessibility active/inactive for tests without going through a platform adapter.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_active_for_test(&mut self, active: bool) {
         self.active_flag.store(active, Ordering::SeqCst);
         self.sync_active_flag();

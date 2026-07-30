@@ -194,8 +194,11 @@ impl Platform for WebPlatform {
     }
 
     fn quit(&self) {
-        if let Some(callback) = self.callbacks.borrow_mut().quit.as_mut() {
-            callback();
+        let callback = self.callbacks.borrow_mut().quit.take();
+        if let Some(mut callback) = callback {
+            self.foreground_executor
+                .spawn(async move { callback() })
+                .detach();
         }
     }
 

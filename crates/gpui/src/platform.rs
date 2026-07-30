@@ -66,7 +66,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use strum::EnumIter;
 use uuid::Uuid;
@@ -480,6 +480,185 @@ pub struct A11yCallbacks {
     pub deactivation: Box<dyn Fn() + Send + 'static>,
 }
 
+/// Environment variable used to select the renderer adapter policy.
+pub const RENDERER_SELECTION_ENV_VAR: &str = "GPUI_RENDERER";
+
+/// Selects the adapter policy used by native renderers.
+///
+/// The default policy preserves each platform's normal hardware preference.
+/// Software mode is strict: platforms must select a software adapter or return
+/// an error rather than falling back to hardware.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RendererSelection {
+    /// Use the platform's normal adapter selection policy.
+    #[default]
+    Default,
+    /// Require a software adapter, such as D3D11 WARP or Vulkan lavapipe.
+    Software,
+}
+
+impl RendererSelection {
+    /// Reads the selection from [`RENDERER_SELECTION_ENV_VAR`].
+    ///
+    /// An unset variable uses [`RendererSelection::Default`].
+    pub fn from_environment() -> Result<Self> {
+        match std::env::var(RENDERER_SELECTION_ENV_VAR) {
+            Ok(value) => value
+                .parse()
+                .map_err(|error: String| anyhow::anyhow!(error)),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Default),
+            Err(error) => Err(anyhow::anyhow!(
+                "failed to read {RENDERER_SELECTION_ENV_VAR}: {error}"
+            )),
+        }
+    }
+
+    /// Returns whether this policy requires a software adapter.
+    pub fn requires_software_adapter(self) -> bool {
+        matches!(self, Self::Software)
+    }
+}
+
+impl std::str::FromStr for RendererSelection {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim() {
+            "default" => Ok(Self::Default),
+            "software" => Ok(Self::Software),
+            _ => Err(format!(
+                "invalid {RENDERER_SELECTION_ENV_VAR} value {value:?}; expected `default` or `software`"
+            )),
+        }
+    }
+}
+
+/// Identifies the graphics API used to render a window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RendererKind {
+    /// Apple's Metal API.
+    Metal,
+    /// Microsoft's Direct3D 11 API.
+    Direct3d11,
+    /// The portable WGPU renderer.
+    Wgpu,
+}
+
+/// Classifies the adapter selected by a renderer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RendererAdapterType {
+    /// A hardware graphics adapter.
+    Hardware,
+    /// A software adapter, such as D3D11 WARP or Vulkan lavapipe.
+    Software,
+    /// An adapter whose hardware/software classification is unavailable.
+    Unknown,
+}
+
+/// Structured evidence about the renderer and adapter backing a window.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RendererInfo {
+    /// The policy used to choose the adapter.
+    pub selection: RendererSelection,
+    /// The graphics API used by the renderer.
+    pub renderer: RendererKind,
+    /// The backend selected by the graphics API.
+    pub backend: String,
+    /// The adapter name reported by the platform.
+    pub adapter_name: String,
+    /// Whether the adapter is hardware or software.
+    pub adapter_type: RendererAdapterType,
+    /// The adapter vendor identifier, when exposed by the platform.
+    pub vendor_id: Option<u32>,
+    /// The adapter device identifier, when exposed by the platform.
+    pub device_id: Option<u32>,
+}
+
+/// The level at which a renderer established first-presentation evidence.
+///
+/// Neither variant implies that a display has completed scanout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresentationEvidence {
+    /// The presentation API call returned successfully, without backend status.
+    ///
+    /// WGPU reports this after `SurfaceTexture::present` returns. It does
+    /// not establish backend acceptance, scheduling, or the absence of an
+    /// asynchronous presentation error.
+    ApiSubmitted,
+    /// The graphics backend accepted or scheduled the presentation.
+    BackendAccepted,
+}
+
+/// Observes a window's first presentation evidence.
+///
+/// The observer is scoped to one window and sticky: subscribers added after
+/// evidence is recorded resolve immediately with that same evidence. It may be
+/// completed from a renderer callback thread.
+#[derive(Clone)]
+pub struct FirstPresentationObserver {
+    state: Arc<Mutex<FirstPresentationState>>,
+}
+
+#[derive(Default)]
+struct FirstPresentationState {
+    evidence: Option<PresentationEvidence>,
+    waiters: Vec<oneshot::Sender<PresentationEvidence>>,
+}
+
+impl Default for FirstPresentationObserver {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(FirstPresentationState::default())),
+        }
+    }
+}
+
+impl FirstPresentationObserver {
+    /// Returns zero before the first presentation evidence and one afterward.
+    pub fn presentation_count(&self) -> usize {
+        usize::from(self.state.lock().unwrap().evidence.is_some())
+    }
+
+    /// Returns a receiver that resolves with first-presentation evidence.
+    ///
+    /// If the window has already presented, the returned receiver resolves immediately.
+    pub fn subscribe(&self) -> oneshot::Receiver<PresentationEvidence> {
+        let (sender, receiver) = oneshot::channel();
+        let mut state = self.state.lock().unwrap();
+        if let Some(evidence) = state.evidence {
+            let _ = sender.send(evidence);
+        } else {
+            state.waiters.push(sender);
+        }
+        receiver
+    }
+
+    /// Records first-presentation evidence from a renderer.
+    ///
+    /// This is for platform renderer implementations. Applications should use
+    /// [`Self::subscribe`] or [`Self::presentation_count`] instead.
+    #[doc(hidden)]
+    pub fn record_presentation(&self, evidence: PresentationEvidence) -> bool {
+        let waiters = {
+            let mut state = self.state.lock().unwrap();
+            if state.evidence.is_some() {
+                return false;
+            }
+            state.evidence = Some(evidence);
+            std::mem::take(&mut state.waiters)
+        };
+
+        for waiter in waiters {
+            let _ = waiter.send(evidence);
+        }
+        true
+    }
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 #[expect(missing_docs)]
 pub struct RequestFrameOptions {
@@ -537,6 +716,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Installs a per-window observer for first-presentation evidence.
+    fn set_first_presentation_observer(&self, _observer: FirstPresentationObserver) {}
+    #[cfg(feature = "wayland-conformance")]
+    #[doc(hidden)]
+    fn request_wayland_conformance_key_press(&self) -> oneshot::Receiver<anyhow::Result<()>> {
+        let (sender, receiver) = oneshot::channel();
+        let _ = sender.send(Err(anyhow::anyhow!(
+            "Wayland conformance input is unavailable on this platform"
+        )));
+        receiver
+    }
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
@@ -591,6 +781,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
+    /// Returns structured evidence about the renderer and selected adapter.
+    fn renderer_info(&self) -> Option<RendererInfo> {
+        None
+    }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
@@ -2407,5 +2601,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(bounds.origin, point(px(5.), px(20.)));
+    }
+
+    #[test]
+    fn first_presentation_observer_notifies_once_with_sticky_evidence() {
+        let observer = FirstPresentationObserver::default();
+        let notification = observer.subscribe();
+
+        assert_eq!(observer.presentation_count(), 0);
+        assert!(observer.record_presentation(PresentationEvidence::BackendAccepted));
+        assert_eq!(observer.presentation_count(), 1);
+        assert!(!observer.record_presentation(PresentationEvidence::ApiSubmitted));
+        assert_eq!(observer.presentation_count(), 1);
+        assert_eq!(
+            pollster::block_on(notification),
+            Ok(PresentationEvidence::BackendAccepted)
+        );
+        assert_eq!(
+            pollster::block_on(observer.subscribe()),
+            Ok(PresentationEvidence::BackendAccepted)
+        );
+    }
+
+    #[test]
+    fn presentation_evidence_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_value(PresentationEvidence::ApiSubmitted).unwrap(),
+            serde_json::json!("api_submitted")
+        );
+        assert_eq!(
+            serde_json::to_value(PresentationEvidence::BackendAccepted).unwrap(),
+            serde_json::json!("backend_accepted")
+        );
+    }
+
+    #[test]
+    fn first_presentation_observer_records_from_another_thread() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<FirstPresentationObserver>();
+        let observer = FirstPresentationObserver::default();
+        let notification = observer.subscribe();
+        let recorder = observer;
+
+        std::thread::spawn(move || {
+            assert!(recorder.record_presentation(PresentationEvidence::BackendAccepted));
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            pollster::block_on(notification),
+            Ok(PresentationEvidence::BackendAccepted)
+        );
+    }
+
+    #[test]
+    fn renderer_selection_parses_and_requires_software_without_fallback() {
+        assert_eq!("default".parse(), Ok(RendererSelection::Default));
+        assert_eq!("software".parse(), Ok(RendererSelection::Software));
+        assert!("hardware".parse::<RendererSelection>().is_err());
+        assert!(!RendererSelection::Default.requires_software_adapter());
+        assert!(RendererSelection::Software.requires_software_adapter());
     }
 }

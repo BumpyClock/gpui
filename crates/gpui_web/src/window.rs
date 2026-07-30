@@ -4,11 +4,12 @@ use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
-    Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
+    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult,
+    FirstPresentationObserver, GpuSpecs, Modifiers, MouseButton, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+    PromptLevel, RendererInfo, RequestFrameOptions, ResizeEdge, Scene, Size, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowParams, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig};
 use wasm_bindgen::prelude::*;
@@ -735,6 +736,14 @@ impl PlatformWindow for WebWindow {
         self.inner.state.borrow_mut().renderer.draw(scene);
     }
 
+    fn set_first_presentation_observer(&self, observer: FirstPresentationObserver) {
+        self.inner
+            .state
+            .borrow_mut()
+            .renderer
+            .set_first_presentation_observer(observer);
+    }
+
     fn completed_frame(&self) {
         // On web, presentation happens automatically via wgpu surface present
     }
@@ -753,6 +762,10 @@ impl PlatformWindow for WebWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         Some(self.inner.state.borrow().renderer.gpu_specs())
+    }
+
+    fn renderer_info(&self) -> Option<RendererInfo> {
+        Some(self.inner.state.borrow().renderer.renderer_info())
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}

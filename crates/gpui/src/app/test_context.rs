@@ -382,6 +382,12 @@ impl TestAppContext {
         self.test_window(window_handle).simulate_resize(size);
     }
 
+    /// Simulates moving a window to a display with a different scale factor.
+    pub fn simulate_window_scale_factor(&self, window_handle: AnyWindowHandle, scale_factor: f32) {
+        self.test_window(window_handle)
+            .simulate_scale_factor(scale_factor);
+    }
+
     /// Returns true if there's an alert dialog open.
     pub fn expect_restart(&self) -> oneshot::Receiver<Option<PathBuf>> {
         let (tx, rx) = futures::channel::oneshot::channel();
@@ -851,6 +857,11 @@ impl VisualTestContext {
     /// Simulates the user resizing the window to the new size.
     pub fn simulate_resize(&self, size: Size<Pixels>) {
         self.simulate_window_resize(self.window, size)
+    }
+
+    /// Simulates moving the window to a display with a different scale factor.
+    pub fn simulate_scale_factor(&self, scale_factor: f32) {
+        self.simulate_window_scale_factor(self.window, scale_factor)
     }
 
     /// debug_bounds returns the bounds of the element with the given selector.

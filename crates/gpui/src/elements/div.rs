@@ -1170,6 +1170,12 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Set the disabled state for this element.
+    fn aria_disabled(mut self, disabled: bool) -> Self {
+        self.interactivity().a11y_state_mut().aria_disabled = Some(disabled);
+        self
+    }
+
     /// Report this node as the active descendant when one of its ancestors is focused.
     fn aria_active_descendant(mut self) -> Self {
         self.interactivity()
@@ -1901,6 +1907,7 @@ pub(crate) struct A11yState {
     report_active_descendant_focus: bool,
     override_role: Option<accesskit::Role>,
     aria_label: Option<SharedString>,
+    aria_disabled: Option<bool>,
     aria_selected: Option<bool>,
     aria_expanded: Option<bool>,
     aria_toggled: Option<accesskit::Toggled>,
@@ -3248,6 +3255,13 @@ impl A11yState {
     fn write_a11y_info(&self, node: &mut accesskit::Node) {
         if let Some(label) = &self.aria_label {
             node.set_label(label.to_string());
+        }
+        if let Some(disabled) = self.aria_disabled {
+            if disabled {
+                node.set_disabled();
+            } else {
+                node.clear_disabled();
+            }
         }
         if let Some(selected) = self.aria_selected {
             node.set_selected(selected);
@@ -4882,6 +4896,7 @@ mod tests {
     fn write_a11y_info_maps_string_and_numeric_properties() {
         let state = A11yState {
             aria_label: Some("Buffer Font Size".into()),
+            aria_disabled: Some(true),
             aria_value: Some("15".into()),
             aria_placeholder: Some("Search".into()),
             aria_numeric_value: Some(15.0),
@@ -4895,6 +4910,7 @@ mod tests {
         state.write_a11y_info(&mut node);
 
         assert_eq!(node.label(), Some("Buffer Font Size"));
+        assert!(node.is_disabled());
         assert_eq!(node.value(), Some("15"));
         assert_eq!(node.placeholder(), Some("Search"));
         assert_eq!(node.numeric_value(), Some(15.0));

@@ -7,13 +7,14 @@ use crate::{
     AsyncWindowContext, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, OverlayInputMode, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    EntityId, EventEmitter, FileDropEvent, FirstPresentationObserver, FontId, Global,
+    GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext,
+    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    OverlayInputMode, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, PresentationEvidence, Priority,
+    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, RendererInfo, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -1011,6 +1012,7 @@ pub struct Window {
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
+    first_presentation_observer: FirstPresentationObserver,
     display_id: Option<DisplayId>,
     sprite_atlas: Arc<dyn PlatformAtlas>,
     text_system: Arc<WindowTextSystem>,
@@ -1075,6 +1077,8 @@ pub struct Window {
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
     pub(crate) a11y: A11y,
+    #[cfg(any(test, feature = "test-support"))]
+    last_a11y_tree: Option<accesskit::TreeUpdate>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1263,6 +1267,9 @@ impl Window {
                 tabbing_identifier,
             },
         )?;
+
+        let first_presentation_observer = FirstPresentationObserver::default();
+        platform_window.set_first_presentation_observer(first_presentation_observer.clone());
 
         let tab_bar_visible = platform_window.tab_bar_visible();
         SystemWindowTabController::init_visible(cx, tab_bar_visible);
@@ -1616,6 +1623,7 @@ impl Window {
             invalidator,
             removed: false,
             platform_window,
+            first_presentation_observer,
             display_id,
             sprite_atlas,
             text_system,
@@ -1676,6 +1684,8 @@ impl Window {
                 accessibility_force_disabled,
                 initial_window_title,
             ),
+            #[cfg(any(test, feature = "test-support"))]
+            last_a11y_tree: None,
         })
     }
 
@@ -2853,6 +2863,10 @@ impl Window {
                     "Sending a11y tree update: {} nodes",
                     tree_update.nodes.len()
                 );
+                #[cfg(any(test, feature = "test-support"))]
+                {
+                    self.last_a11y_tree = Some(tree_update.clone());
+                }
                 self.platform_window.a11y_tree_update(tree_update);
             }
         }
@@ -5556,8 +5570,32 @@ impl Window {
         }
     }
 
-    /// Read information about the GPU backing this window.
-    /// Currently returns None on Mac and Windows.
+    /// Returns zero before the first presentation evidence and one afterward.
+    pub fn first_presentation_count(&self) -> usize {
+        self.first_presentation_observer.presentation_count()
+    }
+
+    /// Returns a receiver that resolves with this window's first-presentation evidence.
+    ///
+    /// If the window has already presented, the returned receiver resolves immediately.
+    pub fn observe_first_presentation(&self) -> oneshot::Receiver<PresentationEvidence> {
+        self.first_presentation_observer.subscribe()
+    }
+
+    #[cfg(feature = "wayland-conformance")]
+    #[doc(hidden)]
+    pub fn request_wayland_conformance_key_press(&self) -> oneshot::Receiver<anyhow::Result<()>> {
+        self.platform_window.request_wayland_conformance_key_press()
+    }
+
+    /// Returns structured evidence about the renderer and adapter backing this window.
+    pub fn renderer_info(&self) -> Option<RendererInfo> {
+        self.platform_window.renderer_info()
+    }
+
+    /// Reads legacy GPU information reported by this window's platform.
+    ///
+    /// Prefer [`Self::renderer_info`] when adapter selection evidence is required.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.platform_window.gpu_specs()
     }
@@ -5620,6 +5658,19 @@ impl Window {
     /// Returns whether assistive technology has requested an accessibility tree this frame.
     pub fn is_a11y_active(&self) -> bool {
         self.a11y.is_active()
+    }
+
+    /// Forces accessibility tree generation for deterministic conformance tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_a11y_active_for_test(&mut self, active: bool) {
+        self.a11y.set_active_for_test(active);
+        self.refresh();
+    }
+
+    /// Returns the most recent accessibility tree submitted to the platform adapter.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn last_a11y_tree_for_test(&self) -> Option<&accesskit::TreeUpdate> {
+        self.last_a11y_tree.as_ref()
     }
 
     /// Register a listener for an accessibility action on a specific node.

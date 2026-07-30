@@ -11,7 +11,7 @@ use collections::VecDeque;
 use futures::channel::oneshot;
 use parking_lot::Mutex;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::Arc,
@@ -36,7 +36,15 @@ pub(crate) struct TestPlatform {
     pub opened_url: RefCell<Option<String>>,
     pub text_system: Arc<dyn PlatformTextSystem>,
     pub expect_restart: RefCell<Option<oneshot::Sender<Option<PathBuf>>>>,
+    quit_callback: RefCell<Option<Box<dyn FnMut()>>>,
+    launch_callback: RefCell<Option<Box<dyn FnOnce()>>>,
     system_wake_callback: RefCell<Option<Box<dyn FnMut()>>>,
+    blocking_run: Cell<bool>,
+    deferred_launch: Cell<bool>,
+    synchronous_quit_callback: Cell<bool>,
+    run_started: Cell<bool>,
+    quit_requested: Cell<bool>,
+    quit_sender: RefCell<Option<oneshot::Sender<()>>>,
     headless_renderer_factory: Option<Box<dyn Fn() -> Option<Box<dyn PlatformHeadlessRenderer>>>>,
     weak: Weak<Self>,
 }
@@ -131,7 +139,15 @@ impl TestPlatform {
             active_display: Rc::new(TestDisplay::new()),
             active_window: Default::default(),
             expect_restart: Default::default(),
+            quit_callback: Default::default(),
+            launch_callback: Default::default(),
             system_wake_callback: Default::default(),
+            blocking_run: Cell::new(false),
+            deferred_launch: Cell::new(false),
+            synchronous_quit_callback: Cell::new(false),
+            run_started: Cell::new(false),
+            quit_requested: Cell::new(false),
+            quit_sender: Default::default(),
             current_clipboard_item: Mutex::new(None),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             current_primary_item: Mutex::new(None),
@@ -269,6 +285,39 @@ impl TestPlatform {
     }
 
     #[cfg(test)]
+    pub(crate) fn simulate_native_run(&self) {
+        self.blocking_run.set(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defer_launch(&self) {
+        self.deferred_launch.set(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_synchronous_quit_callback(&self) {
+        self.synchronous_quit_callback.set(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_launch(&self) {
+        let callback = self
+            .launch_callback
+            .borrow_mut()
+            .take()
+            .expect("no deferred launch callback");
+        callback();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulate_quit(&self) {
+        let Some(mut callback) = self.quit_callback.borrow_mut().take() else {
+            return;
+        };
+        callback();
+    }
+
+    #[cfg(test)]
     pub(crate) fn simulate_system_wake(&self) {
         let Some(mut callback) = self.system_wake_callback.borrow_mut().take() else {
             return;
@@ -308,10 +357,48 @@ impl Platform for TestPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
-        on_finish_launching()
+        assert!(
+            !self.run_started.replace(true),
+            "TestPlatform::run may only be called once"
+        );
+        if self.deferred_launch.replace(false) {
+            *self.launch_callback.borrow_mut() = Some(on_finish_launching);
+            return;
+        }
+        self.quit_requested.set(false);
+        let (quit_sender, quit_receiver) = oneshot::channel();
+        *self.quit_sender.borrow_mut() = Some(quit_sender);
+        on_finish_launching();
+
+        if !self.blocking_run.get() {
+            self.quit_sender.borrow_mut().take();
+            return;
+        }
+
+        self.foreground_executor
+            .block_test(quit_receiver)
+            .expect("TestPlatform quit signal was dropped before quit");
+
+        let callback = self.quit_callback.borrow_mut().take();
+        if let Some(mut callback) = callback {
+            callback();
+        }
     }
 
-    fn quit(&self) {}
+    fn quit(&self) {
+        if self.quit_requested.replace(true) {
+            return;
+        }
+        if self.synchronous_quit_callback.replace(false) {
+            let callback = self.quit_callback.borrow_mut().take();
+            if let Some(mut callback) = callback {
+                callback();
+            }
+        }
+        if let Some(quit_sender) = self.quit_sender.borrow_mut().take() {
+            quit_sender.send(()).ok();
+        }
+    }
 
     fn restart(&self, path: Option<PathBuf>) {
         if let Some(tx) = self.expect_restart.take() {
@@ -426,7 +513,9 @@ impl Platform for TestPlatform {
         unimplemented!()
     }
 
-    fn on_quit(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_quit(&self, callback: Box<dyn FnMut()>) {
+        *self.quit_callback.borrow_mut() = Some(callback);
+    }
 
     fn on_reopen(&self, _callback: Box<dyn FnMut()>) {
         unimplemented!()

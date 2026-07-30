@@ -1,24 +1,74 @@
-//! Convenience crate that re-exports GPUI's platform traits and the
-//! `current_platform` constructor so consumers don't need `#[cfg]` gating.
+//! Convenience crate that re-exports GPUI's platform traits and constructors so
+//! consumers don't need `#[cfg]` gating.
 
 pub use gpui::Platform;
 
 use std::rc::Rc;
 
 /// Returns a background executor for the current platform.
+///
+/// # Panics
+///
+/// Panics when the headless platform cannot be initialized. Call [`try_headless`] and obtain its
+/// background executor when initialization errors must be handled by the caller.
 pub fn background_executor() -> gpui::BackgroundExecutor {
     current_platform(true).background_executor()
 }
 
+/// Constructs an application for the current platform.
+///
+/// This is the legacy infallible wrapper. New code should use [`try_application`] so platform
+/// initialization errors can be handled by the caller.
+///
+/// # Panics
+///
+/// Panics when the current platform cannot be initialized. This preserves the historical API;
+/// use [`try_application`] to receive the construction error instead.
 pub fn application() -> gpui::Application {
-    gpui::Application::with_platform(current_platform(false))
+    try_application()
+        .expect("failed to initialize application; use try_application to handle errors")
 }
 
+/// Constructs a headless application for the current platform.
+///
+/// This is the legacy infallible wrapper. New code should use [`try_headless`] so platform
+/// initialization errors can be handled by the caller.
+///
+/// # Panics
+///
+/// Panics when the current headless platform cannot be initialized. This preserves the historical
+/// API; use [`try_headless`] to receive the construction error instead.
 pub fn headless() -> gpui::Application {
-    gpui::Application::with_platform(current_platform(true))
+    try_headless()
+        .expect("failed to initialize headless application; use try_headless to handle errors")
 }
 
-/// Unlike `application`, this function returns a single-threaded web application.
+/// Constructs an application for the current platform without panicking on construction failure.
+///
+/// # Errors
+///
+/// Returns an error when the platform cannot be initialized, such as when Windows OLE/DirectX or
+/// Linux X11 setup fails.
+pub fn try_application() -> gpui::Result<gpui::Application> {
+    Ok(gpui::Application::with_platform(try_current_platform(
+        false,
+    )?))
+}
+
+/// Constructs a headless application for the current platform without panicking on construction
+/// failure.
+///
+/// # Errors
+///
+/// Returns an error when the headless platform cannot be initialized. Headless Web applications
+/// are not supported.
+pub fn try_headless() -> gpui::Result<gpui::Application> {
+    Ok(gpui::Application::with_platform(try_current_platform(
+        true,
+    )?))
+}
+
+/// Unlike [`application`], this function returns a single-threaded web application.
 #[cfg(target_family = "wasm")]
 pub fn single_threaded_web() -> gpui::Application {
     gpui::Application::with_platform(Rc::new(gpui_web::WebPlatform::new(false)))
@@ -32,31 +82,54 @@ pub fn web_init() {
     gpui_web::init_logging();
 }
 
-/// Returns the default [`Platform`] for the current OS.
-pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
+/// Returns the default [`Platform`] for the current OS without panicking on construction failure.
+///
+/// # Errors
+///
+/// Returns an error when the platform cannot be initialized, such as when Windows OLE/DirectX or
+/// Linux X11 setup fails. Headless Web construction is unsupported and returns an error.
+pub fn try_current_platform(headless: bool) -> gpui::Result<Rc<dyn Platform>> {
     #[cfg(target_os = "macos")]
     {
-        Rc::new(gpui_macos::MacPlatform::new(headless))
+        Ok(Rc::new(gpui_macos::MacPlatform::new(headless)))
     }
 
     #[cfg(target_os = "windows")]
     {
-        Rc::new(
-            gpui_windows::WindowsPlatform::new(headless)
-                .expect("failed to initialize Windows platform"),
-        )
+        Ok(Rc::new(gpui_windows::WindowsPlatform::new(headless)?))
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
-        gpui_linux::current_platform(headless)
+        gpui_linux::try_current_platform(headless)
     }
 
     #[cfg(target_family = "wasm")]
     {
-        assert!(!headless, "headless web platform is not supported");
-        Rc::new(gpui_web::WebPlatform::new(true))
+        if headless {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "headless web platform is not supported",
+            )
+            .into())
+        } else {
+            Ok(Rc::new(gpui_web::WebPlatform::new(true)))
+        }
     }
+}
+
+/// Returns the default [`Platform`] for the current OS.
+///
+/// This is the legacy infallible wrapper. New code should use [`try_current_platform`] so
+/// platform initialization errors can be handled by the caller.
+///
+/// # Panics
+///
+/// Panics when the current platform cannot be initialized. This preserves the historical API;
+/// use [`try_current_platform`] to receive the construction error instead.
+pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
+    try_current_platform(headless)
+        .expect("failed to initialize current platform; use try_current_platform to handle errors")
 }
 
 /// Returns a new [`HeadlessRenderer`] for the current platform, if available.
@@ -66,6 +139,21 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
     // Metal renderer also carries retained-layer and backdrop-blur state that the upstream
     // headless renderer does not model, so report that no compatible renderer is available.
     None
+}
+
+#[cfg(test)]
+mod api_tests {
+    use super::*;
+
+    #[test]
+    fn platform_constructor_signatures_remain_compatible() {
+        let _: fn(bool) -> gpui::Result<Rc<dyn Platform>> = try_current_platform;
+        let _: fn() -> gpui::Result<gpui::Application> = try_application;
+        let _: fn() -> gpui::Result<gpui::Application> = try_headless;
+        let _: fn(bool) -> Rc<dyn Platform> = current_platform;
+        let _: fn() -> gpui::Application = application;
+        let _: fn() -> gpui::Application = headless;
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
