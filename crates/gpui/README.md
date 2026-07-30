@@ -1,11 +1,11 @@
-# Welcome to GPUI!
+# Welcome to GPUI
 
 GPUI is a hybrid immediate and retained mode, GPU accelerated, UI framework
 for Rust, designed to support a wide variety of applications.
 
 ## Getting Started
 
-GPUI is still in active development as we work on the Zed code editor, and is still pre-1.0. There will often be breaking changes between versions. You'll also need to use the latest version of stable Rust and be on macOS or Linux. While the fork facade is unpublished, add the following Git dependency to your `Cargo.toml` (the dependency key remains `gpui`):
+GPUI is still pre-1.0 and may make breaking changes between versions. Native backends exist for macOS, Windows, Linux X11, and Linux Wayland, but their validation maturity differs; Web is a separate asynchronous host contract. Use the repository-pinned Rust toolchain and consult the root platform-evidence matrix before making support claims. While the fork facade is unpublished, add the following Git dependency to your `Cargo.toml` (the dependency key remains `gpui`):
 
 ```toml
 gpui = { package = "bumpyclock-gpui", git = "https://github.com/BumpyClock/gpui", rev = "<full-40-character-commit-sha>" }
@@ -14,10 +14,42 @@ gpui = { package = "bumpyclock-gpui", git = "https://github.com/BumpyClock/gpui"
 Replace the placeholder with an immutable commit containing the renamed `bumpyclock-gpui`
 package; do not depend on `main`.
 
- - [Ownership and data flow](_ownership_and_data_flow)
- - [Accessibility](_accessibility)
+- [Ownership and data flow](_ownership_and_data_flow)
+- [Accessibility](_accessibility)
 
 Everything in GPUI starts with an `Application`. You can create one with `Application::new()`, and kick off your application by passing a callback to `Application::run()`. Inside this callback, you can create a new window with `App::open_window()`, and register your first root view. See [gpui.rs](https://www.gpui.rs/) for a complete example.
+
+## Application lifecycle
+
+GPUI library code performs orderly shutdown and returns control to its host; it does not terminate
+the process. Executables remain responsible for choosing an exit code or restart policy after
+`Application::run` returns.
+
+| Host | `Application::run` ownership and return |
+| --- | --- |
+| Native and headless | Blocks in the platform loop, gives `on_app_quit` futures up to 100 ms, then returns normally. Native platform loops are one-shot. |
+| Web | Returns after scheduling asynchronous launch. GPUI retains the application on the browser thread until shutdown; quit observers and the 100 ms timeout finish asynchronously because the browser event loop cannot be blocked. |
+| Embedded | `run_embedded` returns an `ApplicationHandle`; the embedder owns that handle and drives the host run loop. Dropping it before an asynchronously scheduled launch cancels that launch. |
+
+A quit requested during launch or later through `App::quit` wakes a blocking native/headless loop.
+Cross-thread callers should submit the request through `MainThreadPoster`. The first quit closes
+poster admission, drops queued/deferred effects, invokes the platform quit callback and shutdown
+observers once, and starts the observer window. Repeated quit requests are no-ops, and posters
+obtained before or after shutdown reject new submissions.
+
+`QuitMode` controls window-driven shutdown:
+
+- `Explicit` remains alive with zero windows until `App::quit` or an implemented OS quit request.
+- `LastWindowClosed` quits after the final window closes.
+- `Default` is `Explicit` on macOS and `LastWindowClosed` elsewhere.
+- On macOS, an AppKit termination request enters the same orderly quit path and cancels immediate
+  process termination while GPUI stops and wakes its owned run loop. Windows session-end messages
+  (`WM_QUERYENDSESSION` / `WM_ENDSESSION`) remain unsupported and do not enter GPUI's orderly
+  shutdown path.
+
+Headless Web construction is unsupported and is reported by the fallible `gpui_platform::try_headless`
+and `try_current_platform` APIs. The legacy infallible constructor wrappers remain for compatibility
+and panic when platform initialization fails.
 
 ### Dependencies
 
@@ -42,6 +74,14 @@ On macOS, GPUI uses Metal for rendering. In order to use Metal, you need to do t
   ```sh
   sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
   ```
+
+## Renderer conformance
+
+`RendererSelection::{Default, Software}` is selected with `GPUI_RENDERER=default|software`. Software mode is strict: Windows selects D3D11 WARP; WGPU-backed native platforms require a Vulkan CPU/software adapter such as lavapipe. A software request fails if the platform cannot configure that adapter; it never falls back to hardware or GL. Exact lavapipe evidence also requires a constrained ICD and matching adapter name. Metal has no software adapter, so macOS rejects this selection.
+
+Use `Window::renderer_info()` for structured renderer and adapter evidence. `Window::observe_first_presentation()` resolves once with `PresentationEvidence`: `backend_accepted` means the renderer backend accepted or scheduled the presentation; `api_submitted` means only that the native presentation API returned. WGPU reports `api_submitted` after `SurfaceTexture::present()` returns because public WGPU does not expose per-surface backend status. Successful DXGI `Present` and backend-specific Metal status do not prove scanout. Software-GPU evidence does not prove hardware-GPU execution.
+
+`Window` exposes both `HasWindowHandle` and `HasDisplayHandle`. Pointer-free native conformance should record matching handle kinds, not raw values or addresses. Window/display construction evidence is separate from renderer selection and presentation evidence; constructing a window does not prove presentation.
 
 ## The Big Picture
 
