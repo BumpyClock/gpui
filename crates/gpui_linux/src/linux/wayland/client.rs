@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context as _;
 use ashpd::WindowIdentifier;
 use calloop::{
     EventLoop, LoopHandle,
@@ -73,6 +74,8 @@ use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blu
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use xkbcommon::xkb::ffi::XKB_KEYMAP_FORMAT_TEXT_V1;
 use xkbcommon::xkb::{self, KEYMAP_COMPILE_NO_FLAGS, Keycode};
+#[cfg(feature = "wayland-conformance")]
+use {super::weston_test::protocol::weston_test, futures::channel::oneshot};
 
 use super::{
     display::WaylandDisplay,
@@ -109,6 +112,8 @@ const MIN_KEYCODE: u32 = 8;
 const UNKNOWN_KEYBOARD_LAYOUT_NAME: SharedString = SharedString::new_static("unknown");
 #[derive(Clone)]
 pub struct Globals {
+    #[cfg(feature = "wayland-conformance")]
+    global_list: Rc<GlobalList>,
     pub qh: QueueHandle<WaylandClientStatePtr>,
     pub activation: Option<xdg_activation_v1::XdgActivationV1>,
     pub compositor: wl_compositor::WlCompositor,
@@ -137,9 +142,9 @@ impl Globals {
         executor: ForegroundExecutor,
         qh: QueueHandle<WaylandClientStatePtr>,
         seat: wl_seat::WlSeat,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let dialog_v = XdgWmDialogV1::interface().version;
-        Globals {
+        Ok(Globals {
             activation: globals.bind(&qh, 1..=1, ()).ok(),
             compositor: globals
                 .bind(
@@ -148,7 +153,7 @@ impl Globals {
                         ..=wl_surface::EVT_PREFERRED_BUFFER_SCALE_SINCE,
                     (),
                 )
-                .unwrap(),
+                .context("failed to bind required wl_compositor global")?,
             cursor_shape_manager: globals.bind(&qh, 1..=1, ()).ok(),
             data_device_manager: globals
                 .bind(
@@ -158,9 +163,13 @@ impl Globals {
                 )
                 .ok(),
             primary_selection_manager: globals.bind(&qh, 1..=1, ()).ok(),
-            shm: globals.bind(&qh, 1..=1, ()).unwrap(),
+            shm: globals
+                .bind(&qh, 1..=1, ())
+                .context("failed to bind required wl_shm global")?,
             seat,
-            wm_base: globals.bind(&qh, 1..=5, ()).unwrap(),
+            wm_base: globals
+                .bind(&qh, 1..=5, ())
+                .context("failed to bind required xdg_wm_base global")?,
             viewporter: globals.bind(&qh, 1..=1, ()).ok(),
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
@@ -169,9 +178,11 @@ impl Globals {
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
             system_bell: globals.bind(&qh, 1..=1, ()).ok(),
+            #[cfg(feature = "wayland-conformance")]
+            global_list: Rc::new(globals),
             executor,
             qh,
-        }
+        })
     }
 }
 
@@ -210,6 +221,10 @@ pub struct Output {
 
 pub(crate) struct WaylandClientState {
     serial_tracker: SerialTracker,
+    #[cfg(feature = "wayland-conformance")]
+    weston_test: Option<weston_test::WestonTest>,
+    #[cfg(feature = "wayland-conformance")]
+    pending_conformance_input: Option<PendingWaylandConformanceInput>,
     globals: Globals,
     pub gpu_context: GpuContext,
     pub compositor_gpu: Option<CompositorGpuHint>,
@@ -260,6 +275,40 @@ pub(crate) struct WaylandClientState {
     event_loop: Option<EventLoop<'static, WaylandClientStatePtr>>,
     pub common: LinuxCommon,
     ime_enabled: Option<bool>,
+}
+
+// Linux evdev KEY_A.
+#[cfg(feature = "wayland-conformance")]
+const CONFORMANCE_KEY_A: u32 = 30;
+
+#[cfg(feature = "wayland-conformance")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WaylandConformanceInputPhase {
+    AwaitingKeyboardEnter,
+    AwaitingKeyPress,
+}
+
+#[cfg(feature = "wayland-conformance")]
+struct PendingWaylandConformanceInput {
+    surface_id: ObjectId,
+    phase: WaylandConformanceInputPhase,
+    sender: oneshot::Sender<anyhow::Result<()>>,
+}
+
+#[cfg(feature = "wayland-conformance")]
+fn conformance_input_timestamp() -> anyhow::Result<(u32, u32, u32)> {
+    let mut timestamp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `timestamp` points to initialized writable storage.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("read monotonic clock");
+    }
+
+    let seconds = u64::try_from(timestamp.tv_sec).context("negative monotonic clock seconds")?;
+    let nanoseconds = u32::try_from(timestamp.tv_nsec).context("invalid monotonic nanoseconds")?;
+    Ok(((seconds >> 32) as u32, seconds as u32, nanoseconds))
 }
 
 pub struct DragState {
@@ -317,6 +366,139 @@ impl WaylandClientStatePtr {
 
     pub fn get_serial(&self, kind: SerialKind) -> u32 {
         self.0.upgrade().unwrap().borrow().serial_tracker.get(kind)
+    }
+
+    #[cfg(feature = "wayland-conformance")]
+    pub fn request_wayland_conformance_key_press(
+        &self,
+        surface: &wl_surface::WlSurface,
+    ) -> oneshot::Receiver<anyhow::Result<()>> {
+        let (sender, receiver) = oneshot::channel();
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        if state.pending_conformance_input.is_some() {
+            let _ = sender.send(Err(anyhow::anyhow!(
+                "a Wayland conformance input request is already pending"
+            )));
+            return receiver;
+        }
+
+        let weston_test = if let Some(weston_test) = state.weston_test.clone() {
+            weston_test
+        } else {
+            let weston_test: weston_test::WestonTest =
+                match state.globals.global_list.bind(&state.globals.qh, 1..=1, ()) {
+                    Ok(weston_test) => weston_test,
+                    Err(error) => {
+                        let _ = sender.send(Err(anyhow::anyhow!(
+                            "Wayland compositor does not provide the Weston test protocol: {error}"
+                        )));
+                        return receiver;
+                    }
+                };
+            state.weston_test = Some(weston_test.clone());
+            weston_test
+        };
+
+        state.pending_conformance_input = Some(PendingWaylandConformanceInput {
+            surface_id: surface.id(),
+            phase: WaylandConformanceInputPhase::AwaitingKeyboardEnter,
+            sender,
+        });
+        weston_test.activate_surface(Some(surface));
+
+        receiver
+    }
+
+    #[cfg(feature = "wayland-conformance")]
+    fn inject_wayland_conformance_key_press(&self, surface_id: &ObjectId) {
+        let client = self.get_client();
+        let weston_test = {
+            let mut state = client.borrow_mut();
+            let Some(pending) = state.pending_conformance_input.as_mut() else {
+                return;
+            };
+            if pending.surface_id != *surface_id
+                || pending.phase != WaylandConformanceInputPhase::AwaitingKeyboardEnter
+            {
+                return;
+            }
+            pending.phase = WaylandConformanceInputPhase::AwaitingKeyPress;
+            state.weston_test.clone()
+        };
+
+        let Some(weston_test) = weston_test else {
+            self.fail_wayland_conformance_key_press(
+                surface_id,
+                anyhow::anyhow!("Weston test protocol disappeared before key injection"),
+            );
+            return;
+        };
+        let timestamp = match conformance_input_timestamp() {
+            Ok(timestamp) => timestamp,
+            Err(error) => {
+                self.fail_wayland_conformance_key_press(surface_id, error);
+                return;
+            }
+        };
+        weston_test.send_key(
+            timestamp.0,
+            timestamp.1,
+            timestamp.2,
+            CONFORMANCE_KEY_A,
+            wl_keyboard::KeyState::Pressed as u32,
+        );
+        weston_test.send_key(
+            timestamp.0,
+            timestamp.1,
+            timestamp.2,
+            CONFORMANCE_KEY_A,
+            wl_keyboard::KeyState::Released as u32,
+        );
+    }
+
+    #[cfg(feature = "wayland-conformance")]
+    fn fail_wayland_conformance_key_press(&self, surface_id: &ObjectId, error: anyhow::Error) {
+        let client = self.get_client();
+        let sender = {
+            let mut state = client.borrow_mut();
+            let matches_pending_surface = state
+                .pending_conformance_input
+                .as_ref()
+                .is_some_and(|pending| pending.surface_id == *surface_id);
+            matches_pending_surface.then(|| state.pending_conformance_input.take().unwrap().sender)
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(Err(error));
+        }
+    }
+
+    #[cfg(feature = "wayland-conformance")]
+    fn complete_wayland_conformance_key_press(
+        &self,
+        focused_window: &WaylandWindowStatePtr,
+        key: u32,
+    ) {
+        if key != CONFORMANCE_KEY_A {
+            return;
+        }
+
+        let client = self.get_client();
+        let sender = {
+            let mut state = client.borrow_mut();
+            let matches_pending_surface =
+                state
+                    .pending_conformance_input
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.surface_id == focused_window.surface().id()
+                            && pending.phase == WaylandConformanceInputPhase::AwaitingKeyPress
+                    });
+            matches_pending_surface.then(|| state.pending_conformance_input.take().unwrap().sender)
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(Ok(()));
+        }
     }
 
     pub fn set_pending_activation(&self, window: ObjectId) {
@@ -430,6 +612,19 @@ impl WaylandClientStatePtr {
         {
             state.cursor_hidden_window = Some(window);
         }
+        #[cfg(feature = "wayland-conformance")]
+        let pending_sender = state
+            .pending_conformance_input
+            .as_ref()
+            .is_some_and(|pending| pending.surface_id == *surface_id)
+            .then(|| state.pending_conformance_input.take().unwrap().sender);
+        drop(state);
+        #[cfg(feature = "wayland-conformance")]
+        if let Some(sender) = pending_sender {
+            let _ = sender.send(Err(anyhow::anyhow!(
+                "Wayland conformance input window closed before key dispatch"
+            )));
+        }
     }
 }
 
@@ -524,40 +719,38 @@ impl Drop for WaylandClient {
 
 const WL_DATA_DEVICE_MANAGER_VERSION: u32 = 3;
 
-fn wl_seat_version(version: u32) -> u32 {
+fn wl_seat_version(version: u32) -> anyhow::Result<u32> {
     // We rely on the wl_pointer.frame event
     const WL_SEAT_MIN_VERSION: u32 = 5;
     const WL_SEAT_MAX_VERSION: u32 = 9;
 
-    if version < WL_SEAT_MIN_VERSION {
-        panic!(
-            "wl_seat below required version: {} < {}",
-            version, WL_SEAT_MIN_VERSION
-        );
-    }
+    anyhow::ensure!(
+        version >= WL_SEAT_MIN_VERSION,
+        "wayland compositor advertised wl_seat version {version}, but version {WL_SEAT_MIN_VERSION} or later is required"
+    );
 
-    version.clamp(WL_SEAT_MIN_VERSION, WL_SEAT_MAX_VERSION)
+    Ok(version.clamp(WL_SEAT_MIN_VERSION, WL_SEAT_MAX_VERSION))
 }
 
-fn wl_output_version(version: u32) -> u32 {
+fn wl_output_version(version: u32) -> anyhow::Result<u32> {
     const WL_OUTPUT_MIN_VERSION: u32 = 2;
     const WL_OUTPUT_MAX_VERSION: u32 = 4;
 
-    if version < WL_OUTPUT_MIN_VERSION {
-        panic!(
-            "wl_output below required version: {} < {}",
-            version, WL_OUTPUT_MIN_VERSION
-        );
-    }
+    anyhow::ensure!(
+        version >= WL_OUTPUT_MIN_VERSION,
+        "wayland compositor advertised wl_output version {version}, but version {WL_OUTPUT_MIN_VERSION} or later is required"
+    );
 
-    version.clamp(WL_OUTPUT_MIN_VERSION, WL_OUTPUT_MAX_VERSION)
+    Ok(version.clamp(WL_OUTPUT_MIN_VERSION, WL_OUTPUT_MAX_VERSION))
 }
 
 impl WaylandClient {
-    pub(crate) fn new(startup_activation_token: Option<String>) -> Self {
-        let conn = Connection::connect_to_env().unwrap();
+    pub(crate) fn new(startup_activation_token: Option<String>) -> anyhow::Result<Self> {
+        let conn =
+            Connection::connect_to_env().context("failed to connect to Wayland compositor")?;
 
-        let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn).unwrap();
+        let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn)
+            .context("failed to initialize Wayland registry")?;
         let qh = event_queue.handle();
 
         let mut seat: Option<wl_seat::WlSeat> = None;
@@ -565,21 +758,23 @@ impl WaylandClient {
         let mut in_progress_outputs = HashMap::default();
         #[allow(clippy::mutable_key_type)]
         let mut wl_outputs: HashMap<ObjectId, wl_output::WlOutput> = HashMap::default();
-        globals.contents().with_list(|list| {
+        globals.contents().with_list(|list| -> anyhow::Result<()> {
             for global in list {
                 match &global.interface[..] {
                     "wl_seat" => {
+                        let version = wl_seat_version(global.version)?;
                         seat = Some(globals.registry().bind::<wl_seat::WlSeat, _, _>(
                             global.name,
-                            wl_seat_version(global.version),
+                            version,
                             &qh,
                             (),
                         ));
                     }
                     "wl_output" => {
+                        let version = wl_output_version(global.version)?;
                         let output = globals.registry().bind::<wl_output::WlOutput, _, _>(
                             global.name,
-                            wl_output_version(global.version),
+                            version,
                             &qh,
                             (),
                         );
@@ -589,11 +784,15 @@ impl WaylandClient {
                     _ => {}
                 }
             }
-        });
+            Ok(())
+        })?;
+        let seat = seat.context("wayland compositor did not advertise required wl_seat global")?;
 
-        let event_loop = EventLoop::<WaylandClientStatePtr>::try_new().unwrap();
+        let event_loop = EventLoop::<WaylandClientStatePtr>::try_new()
+            .context("failed to create Wayland event loop")?;
 
-        let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal());
+        let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal())
+            .context("failed to initialize Wayland platform services")?;
 
         let handle = event_loop.handle();
         handle
@@ -611,7 +810,8 @@ impl WaylandClient {
                     }
                 }
             })
-            .unwrap();
+            .map_err(calloop::Error::from)
+            .context("failed to register foreground task source")?;
 
         handle
             .insert_source(
@@ -622,19 +822,19 @@ impl WaylandClient {
                     }
                 },
             )
-            .unwrap();
+            .map_err(calloop::Error::from)
+            .context("failed to register Wayland wake source")?;
 
         let compositor_gpu = detect_compositor_gpu();
         // This could be unified with the notification handling in zed/main:fail_to_open_window.
         let gpu_context = Rc::new(RefCell::new(None));
 
-        let seat = seat.unwrap();
         let globals = Globals::new(
             globals,
             common.foreground_executor.clone(),
             qh.clone(),
             seat.clone(),
-        );
+        )?;
 
         let data_device = globals
             .data_device_manager
@@ -648,8 +848,10 @@ impl WaylandClient {
 
         let cursor = Cursor::new(&conn, &globals, 24);
 
+        let (xdp_event_source, xdp_event_source_starter) =
+            XDPEventSource::new().context("failed to create XDG desktop portal source")?;
         handle
-            .insert_source(XDPEventSource::new(&common.background_executor), {
+            .insert_source(xdp_event_source, {
                 move |event, _, client| match event {
                     XDPEvent::WindowAppearance(appearance) => {
                         if let Some(client) = client.0.upgrade() {
@@ -676,10 +878,16 @@ impl WaylandClient {
                     }
                 }
             })
-            .unwrap();
+            .map_err(calloop::Error::from)
+            .context("failed to register XDG desktop portal source")?;
 
+        let background_executor = common.background_executor.clone();
         let state = Rc::new(RefCell::new(WaylandClientState {
             serial_tracker: SerialTracker::new(),
+            #[cfg(feature = "wayland-conformance")]
+            weston_test: None,
+            #[cfg(feature = "wayland-conformance")]
+            pending_conformance_input: None,
             globals,
             gpu_context,
             compositor_gpu,
@@ -752,9 +960,11 @@ impl WaylandClient {
 
         WaylandSource::new(conn, event_queue)
             .insert(handle)
-            .unwrap();
+            .map_err(calloop::Error::from)
+            .context("failed to register Wayland event source")?;
 
-        Self(state)
+        xdp_event_source_starter.start(&background_executor);
+        Ok(Self(state))
     }
 }
 
@@ -1150,6 +1360,13 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                 version,
             } => match &interface[..] {
                 "wl_seat" => {
+                    let version = match wl_seat_version(version) {
+                        Ok(version) => version,
+                        Err(error) => {
+                            log::error!("ignoring unsupported wl_seat global: {error:#}");
+                            return;
+                        }
+                    };
                     if let Some(wl_pointer) = state.wl_pointer.take() {
                         wl_pointer.release();
                     }
@@ -1157,20 +1374,17 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                         wl_keyboard.release();
                     }
                     state.wl_seat.release();
-                    state.wl_seat = registry.bind::<wl_seat::WlSeat, _, _>(
-                        name,
-                        wl_seat_version(version),
-                        qh,
-                        (),
-                    );
+                    state.wl_seat = registry.bind::<wl_seat::WlSeat, _, _>(name, version, qh, ());
                 }
                 "wl_output" => {
-                    let output = registry.bind::<wl_output::WlOutput, _, _>(
-                        name,
-                        wl_output_version(version),
-                        qh,
-                        (),
-                    );
+                    let version = match wl_output_version(version) {
+                        Ok(version) => version,
+                        Err(error) => {
+                            log::error!("ignoring unsupported wl_output global: {error:#}");
+                            return;
+                        }
+                    };
+                    let output = registry.bind::<wl_output::WlOutput, _, _>(name, version, qh, ());
 
                     state
                         .in_progress_outputs
@@ -1207,6 +1421,8 @@ delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextI
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+#[cfg(feature = "wayland-conformance")]
+delegate_noop!(WaylandClientStatePtr: ignore weston_test::WestonTest);
 
 impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
     fn event(
@@ -1548,28 +1764,49 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 this.handle_keyboard_layout_change();
             }
             wl_keyboard::Event::Enter { surface, .. } => {
-                state.keyboard_focused_window = get_window(&mut state, &surface.id());
+                let surface_id = surface.id();
+                state.keyboard_focused_window = get_window(&mut state, &surface_id);
                 state.enter_token = Some(());
 
                 if let Some(window) = state.keyboard_focused_window.clone() {
                     drop(state);
                     window.set_focused(true);
+                    #[cfg(feature = "wayland-conformance")]
+                    this.inject_wayland_conformance_key_press(&surface_id);
                 }
             }
             wl_keyboard::Event::Leave { surface, .. } => {
-                let keyboard_focused_window = get_window(&mut state, &surface.id());
+                let surface_id = surface.id();
+                let keyboard_focused_window = get_window(&mut state, &surface_id);
                 state.keyboard_focused_window = None;
                 state.enter_token.take();
                 // Prevent keyboard events from repeating after opening e.g. a file chooser and closing it quickly
                 state.repeat.current_id += 1;
                 state.restore_cursor_after_hide();
+                #[cfg(feature = "wayland-conformance")]
+                let conformance_input_pending = state
+                    .pending_conformance_input
+                    .as_ref()
+                    .is_some_and(|pending| pending.surface_id == surface_id);
 
-                if let Some(window) = keyboard_focused_window {
+                if keyboard_focused_window.is_some() {
                     if let Some(ref mut compose) = state.compose_state {
                         compose.reset();
                     }
                     state.pre_edit_text.take();
-                    drop(state);
+                }
+                drop(state);
+
+                #[cfg(feature = "wayland-conformance")]
+                if conformance_input_pending {
+                    this.fail_wayland_conformance_key_press(
+                        &surface_id,
+                        anyhow::anyhow!(
+                            "keyboard focus left before the conformance key press completed"
+                        ),
+                    );
+                }
+                if let Some(window) = keyboard_focused_window {
                     window.handle_ime(ImeInput::DeleteText);
                     window.set_focused(false);
                 }
@@ -1712,7 +1949,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                             .unwrap();
 
                         drop(state);
-                        focused_window.handle_input(input);
+                        if focused_window.handle_input(input) {
+                            #[cfg(feature = "wayland-conformance")]
+                            this.complete_wayland_conformance_key_press(&focused_window, key);
+                        }
                     }
                     wl_keyboard::KeyState::Released if !keysym.is_modifier_key() => {
                         let input = PlatformInput::KeyUp(KeyUpEvent {
@@ -2540,5 +2780,24 @@ impl Dispatch<XdgDialogV1, ()> for WaylandClientStatePtr {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unsupported_wayland_global_versions() {
+        assert!(wl_seat_version(4).is_err());
+        assert!(wl_output_version(1).is_err());
+    }
+
+    #[test]
+    fn caps_supported_wayland_global_versions() {
+        assert_eq!(wl_seat_version(5).unwrap(), 5);
+        assert_eq!(wl_seat_version(u32::MAX).unwrap(), 9);
+        assert_eq!(wl_output_version(2).unwrap(), 2);
+        assert_eq!(wl_output_version(u32::MAX).unwrap(), 4);
     }
 }

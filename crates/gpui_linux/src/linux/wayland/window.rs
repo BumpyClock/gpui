@@ -34,12 +34,13 @@ use crate::linux::accesskit_shims::{
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers,
-    OverlayInputMode, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowControls, WindowDecorations, WindowKind, WindowParams,
-    layer_shell::LayerShellNotSupportedError, popup::PopupOptions, px, size,
+    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, FirstPresentationObserver,
+    GpuSpecs, Modifiers, OverlayInputMode, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RendererInfo,
+    RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowKind, WindowParams, layer_shell::LayerShellNotSupportedError, popup::PopupOptions, px,
+    size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -1312,14 +1313,16 @@ impl WaylandWindowStatePtr {
         }
     }
 
-    pub fn handle_input(&self, input: PlatformInput) {
+    pub fn handle_input(&self, input: PlatformInput) -> bool {
         if self.is_blocked() {
-            return;
+            return false;
         }
-        if let Some(ref mut fun) = self.callbacks.borrow_mut().input
-            && !fun(input.clone()).propagate
-        {
-            return;
+        let mut callback_dispatched = false;
+        if let Some(ref mut fun) = self.callbacks.borrow_mut().input {
+            callback_dispatched = true;
+            if !fun(input.clone()).propagate {
+                return true;
+            }
         }
         if let PlatformInput::KeyDown(event) = input
             && event.keystroke.modifiers.is_subset_of(&Modifiers::shift())
@@ -1332,6 +1335,7 @@ impl WaylandWindowStatePtr {
                 self.state.borrow_mut().input_handler = Some(input_handler);
             }
         }
+        callback_dispatched
     }
 
     pub fn set_focused(&self, focus: bool) {
@@ -1707,6 +1711,20 @@ impl PlatformWindow for WaylandWindow {
         }
     }
 
+    fn set_first_presentation_observer(&self, observer: FirstPresentationObserver) {
+        self.borrow_mut()
+            .renderer
+            .set_first_presentation_observer(observer);
+    }
+
+    #[cfg(feature = "wayland-conformance")]
+    fn request_wayland_conformance_key_press(&self) -> Receiver<anyhow::Result<()>> {
+        let state = self.borrow();
+        state
+            .client
+            .request_wayland_conformance_key_press(&state.surface)
+    }
+
     fn completed_frame(&self) {
         let mut state = self.borrow_mut();
         if !state.renderer_presented {
@@ -1801,6 +1819,10 @@ impl PlatformWindow for WaylandWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.borrow().renderer.gpu_specs().into()
+    }
+
+    fn renderer_info(&self) -> Option<RendererInfo> {
+        Some(self.borrow().renderer.renderer_info())
     }
 
     fn play_system_bell(&self) {

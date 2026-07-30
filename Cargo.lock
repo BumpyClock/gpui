@@ -2687,6 +2687,7 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-plasma",
  "wayland-protocols-wlr",
+ "wayland-scanner",
  "wgpu",
  "x11-clipboard",
  "x11rb",

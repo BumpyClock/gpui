@@ -4,6 +4,8 @@ mod cursor;
 mod display;
 mod popup;
 mod serial;
+#[cfg(feature = "wayland-conformance")]
+mod weston_test;
 mod window;
 
 /// Contains Types for configuring layer_shell surfaces.

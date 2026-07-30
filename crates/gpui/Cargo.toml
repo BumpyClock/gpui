@@ -24,6 +24,7 @@ test-support = [
   "collections/test-support",
   "http_client/test-support",
   "wayland",
+  "wayland-conformance",
   "x11",
 ]
 bench = ["test-support", "dep:criterion", "dep:hdrhistogram"]
@@ -34,6 +35,7 @@ x11 = ["scap?/x11"]
 screen-capture = ["scap"]
 windows-manifest = ["dep:embed-resource"]
 profiler = []
+wayland-conformance = []
 
 [lib]
 name = "gpui"
