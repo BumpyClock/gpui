@@ -1793,7 +1793,17 @@ impl LinuxClient for X11Client {
             return;
         };
 
-        event_loop.run(None, &mut self.clone(), |_| {}).log_err();
+        // Checked XCB requests can buffer events while reading replies, leaving the
+        // connection fd no longer readable. Drain that queue before entering the loop and
+        // after every dispatch so an immediately delivered MapNotify cannot strand a window.
+        let xcb_connection = self.0.borrow().xcb_connection.clone();
+        self.process_x11_events(&xcb_connection).log_err();
+        event_loop
+            .run(None, &mut self.clone(), |client| {
+                let xcb_connection = client.0.borrow().xcb_connection.clone();
+                client.process_x11_events(&xcb_connection).log_err();
+            })
+            .log_err();
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
