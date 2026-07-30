@@ -1,25 +1,26 @@
 use anyhow::{Context, Result};
+use gpui::RendererSelection;
 use gpui_util::ResultExt;
 use itertools::Itertools;
+use windows::core::Interface;
 use windows::Win32::{
     Foundation::HMODULE,
     Graphics::{
         Direct3D::{
-            D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+            D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL,
+            D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
         },
         Direct3D11::{
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_DEBUG,
-            D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS, D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS,
-            D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
+            D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_CREATE_DEVICE_DEBUG, D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS,
+            D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS, D3D11_SDK_VERSION,
         },
         Dxgi::{
-            CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
-            IDXGIAdapter1, IDXGIFactory6,
+            CreateDXGIFactory2, IDXGIAdapter, IDXGIAdapter1, IDXGIFactory4, IDXGIFactory6,
+            DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
         },
     },
 };
-use windows::core::Interface;
 
 pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
     (0..5)
@@ -39,17 +40,21 @@ pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T
 pub(crate) struct DirectXDevices {
     pub(crate) adapter: IDXGIAdapter1,
     pub(crate) dxgi_factory: IDXGIFactory6,
+    pub(crate) renderer_selection: RendererSelection,
     pub(crate) device: ID3D11Device,
     pub(crate) device_context: ID3D11DeviceContext,
 }
 
 impl DirectXDevices {
     pub(crate) fn new() -> Result<Self> {
+        let renderer_selection =
+            RendererSelection::from_environment().context("Reading renderer selection")?;
         let debug_layer_available = check_debug_layer_available();
         let dxgi_factory =
             get_dxgi_factory(debug_layer_available).context("Creating DXGI factory")?;
         let (adapter, device, device_context, feature_level) =
-            get_adapter(&dxgi_factory, debug_layer_available).context("Getting DXGI adapter")?;
+            get_adapter(&dxgi_factory, debug_layer_available, renderer_selection)
+                .context("Getting DXGI adapter")?;
         match feature_level {
             D3D_FEATURE_LEVEL_11_1 => {
                 log::info!("Created device with Direct3D 11.1 feature level.")
@@ -63,9 +68,21 @@ impl DirectXDevices {
             _ => unreachable!(),
         }
 
+        let desc = unsafe { adapter.GetDesc1() }.context("Reading DXGI adapter description")?;
+        let name = String::from_utf16_lossy(&desc.Description)
+            .trim_matches(char::from(0))
+            .to_string();
+        log::info!(
+            "Selected Direct3D adapter: {name} (vendor={:#06x}, device={:#06x}, software={}, selection={renderer_selection:?})",
+            desc.VendorId,
+            desc.DeviceId,
+            (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0,
+        );
+
         Ok(Self {
             adapter,
             dxgi_factory,
+            renderer_selection,
             device,
             device_context,
         })
@@ -106,12 +123,33 @@ fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
 fn get_adapter(
     dxgi_factory: &IDXGIFactory6,
     debug_layer_available: bool,
+    renderer_selection: RendererSelection,
 ) -> Result<(
     IDXGIAdapter1,
     ID3D11Device,
     ID3D11DeviceContext,
     D3D_FEATURE_LEVEL,
 )> {
+    if renderer_selection.requires_software_adapter() {
+        let adapter = get_warp_adapter(dxgi_factory)?;
+        let mut context: Option<ID3D11DeviceContext> = None;
+        let mut feature_level = D3D_FEATURE_LEVEL::default();
+        let device = get_device(
+            None,
+            D3D_DRIVER_TYPE_WARP,
+            Some(&mut context),
+            Some(&mut feature_level),
+            debug_layer_available,
+        )
+        .context("Creating D3D11 WARP device")?;
+        return Ok((
+            adapter,
+            device,
+            context.expect("D3D11 WARP device creation returned no context"),
+            feature_level,
+        ));
+    }
+
     for adapter_index in 0.. {
         let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
         if let Ok(desc) = unsafe { adapter.GetDesc1() } {
@@ -124,8 +162,10 @@ fn get_adapter(
         // the device if it does.
         let mut context: Option<ID3D11DeviceContext> = None;
         let mut feature_level = D3D_FEATURE_LEVEL::default();
+        let d3d_adapter: IDXGIAdapter = adapter.cast().context("Getting DXGI adapter")?;
         if let Some(device) = get_device(
-            &adapter,
+            Some(&d3d_adapter),
+            D3D_DRIVER_TYPE_UNKNOWN,
             Some(&mut context),
             Some(&mut feature_level),
             debug_layer_available,
@@ -139,9 +179,22 @@ fn get_adapter(
     unreachable!()
 }
 
+fn get_warp_adapter(dxgi_factory: &IDXGIFactory6) -> Result<IDXGIAdapter1> {
+    let factory: IDXGIFactory4 = dxgi_factory.cast().context("Getting IDXGIFactory4")?;
+    let adapter: IDXGIAdapter1 =
+        unsafe { factory.EnumWarpAdapter() }.context("Getting WARP adapter")?;
+    let desc = unsafe { adapter.GetDesc1() }.context("Reading WARP adapter description")?;
+    anyhow::ensure!(
+        (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0,
+        "DXGI WARP adapter was not marked as software"
+    );
+    Ok(adapter)
+}
+
 #[inline]
 fn get_device(
-    adapter: &IDXGIAdapter1,
+    adapter: Option<&IDXGIAdapter>,
+    driver_type: D3D_DRIVER_TYPE,
     context: Option<*mut Option<ID3D11DeviceContext>>,
     feature_level: Option<*mut D3D_FEATURE_LEVEL>,
     debug_layer_available: bool,
@@ -155,7 +208,7 @@ fn get_device(
     unsafe {
         D3D11CreateDevice(
             adapter,
-            D3D_DRIVER_TYPE_UNKNOWN,
+            driver_type,
             HMODULE::default(),
             device_flags,
             // 4x MSAA is required for Direct3D Feature Level 10.1 or better

@@ -1,5 +1,6 @@
 #[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
+use gpui::RendererSelection;
 #[cfg(not(target_family = "wasm"))]
 use gpui_util::ResultExt;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ pub struct WgpuContext {
     pub queue: Arc<wgpu::Queue>,
     dual_source_blending: bool,
     device_lost: Arc<AtomicBool>,
+    renderer_selection: RendererSelection,
 }
 
 #[derive(Clone, Copy)]
@@ -20,10 +22,30 @@ pub struct CompositorGpuHint {
     pub device_id: u32,
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn accepts_adapter(
+    selection: RendererSelection,
+    reject_software: bool,
+    backend: wgpu::Backend,
+    device_type: wgpu::DeviceType,
+) -> bool {
+    if selection.requires_software_adapter() {
+        backend == wgpu::Backend::Vulkan && device_type == wgpu::DeviceType::Cpu
+    } else {
+        !reject_software || device_type != wgpu::DeviceType::Cpu
+    }
+}
+
 impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn new(compositor_gpu: Option<CompositorGpuHint>) -> anyhow::Result<Self> {
-        Self::new_internal(Self::instance(), None, compositor_gpu, false)
+        Self::new_internal(
+            Self::instance(),
+            None,
+            compositor_gpu,
+            RendererSelection::from_environment()?,
+            false,
+        )
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -32,7 +54,13 @@ impl WgpuContext {
         surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
-        Self::new_internal(instance, Some(surface), compositor_gpu, false)
+        Self::new_internal(
+            instance,
+            Some(surface),
+            compositor_gpu,
+            RendererSelection::from_environment()?,
+            false,
+        )
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -41,7 +69,29 @@ impl WgpuContext {
         surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
-        Self::new_internal(instance, Some(surface), compositor_gpu, true)
+        Self::new_internal(
+            instance,
+            Some(surface),
+            compositor_gpu,
+            RendererSelection::Default,
+            true,
+        )
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn new_for_surface_recovery(
+        instance: wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+        compositor_gpu: Option<CompositorGpuHint>,
+        renderer_selection: RendererSelection,
+    ) -> anyhow::Result<Self> {
+        Self::new_internal(
+            instance,
+            Some(surface),
+            compositor_gpu,
+            renderer_selection,
+            !renderer_selection.requires_software_adapter(),
+        )
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -49,6 +99,7 @@ impl WgpuContext {
         instance: wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'_>>,
         compositor_gpu: Option<CompositorGpuHint>,
+        renderer_selection: RendererSelection,
         reject_software: bool,
     ) -> anyhow::Result<Self> {
         let device_id_filter = match std::env::var("ZED_DEVICE_ID") {
@@ -69,13 +120,18 @@ impl WgpuContext {
                 device_id_filter,
                 compositor_gpu.as_ref(),
                 compatible_surface,
+                renderer_selection,
                 reject_software,
             ))?;
 
+        let adapter_info = adapter.get_info();
         log::info!(
-            "Selected GPU adapter: {:?} ({:?})",
-            adapter.get_info().name,
-            adapter.get_info().backend
+            "Selected GPU adapter: {} (backend={:?}, type={:?}, vendor={:#06x}, device={:#06x}, selection={renderer_selection:?})",
+            adapter_info.name,
+            adapter_info.backend,
+            adapter_info.device_type,
+            adapter_info.vendor,
+            adapter_info.device,
         );
 
         let device_lost = Arc::new(AtomicBool::new(false));
@@ -96,6 +152,7 @@ impl WgpuContext {
             queue: Arc::new(queue),
             dual_source_blending: dual_source_blending_available,
             device_lost,
+            renderer_selection,
         })
     }
 
@@ -112,6 +169,11 @@ impl WgpuContext {
 
     #[cfg(target_family = "wasm")]
     pub async fn new_web() -> anyhow::Result<Self> {
+        let renderer_selection = RendererSelection::from_environment()?;
+        anyhow::ensure!(
+            !renderer_selection.requires_software_adapter(),
+            "software renderer selection is not supported on web"
+        );
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
             flags: wgpu::InstanceFlags::default(),
@@ -129,10 +191,14 @@ impl WgpuContext {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to request GPU adapter: {e}"))?;
 
+        let adapter_info = adapter.get_info();
         log::info!(
-            "Selected GPU adapter: {:?} ({:?})",
-            adapter.get_info().name,
-            adapter.get_info().backend
+            "Selected GPU adapter: {} (backend={:?}, type={:?}, vendor={:#06x}, device={:#06x}, selection={renderer_selection:?})",
+            adapter_info.name,
+            adapter_info.backend,
+            adapter_info.device_type,
+            adapter_info.vendor,
+            adapter_info.device,
         );
 
         let dual_source_blending_available = adapter
@@ -181,6 +247,7 @@ impl WgpuContext {
             queue: Arc::new(queue),
             dual_source_blending: dual_source_blending_available,
             device_lost,
+            renderer_selection,
         })
     }
 
@@ -190,11 +257,20 @@ impl WgpuContext {
         device_id_filter: Option<u32>,
         compositor_gpu: Option<&CompositorGpuHint>,
         compatible_surface: Option<&wgpu::Surface<'_>>,
+        renderer_selection: RendererSelection,
         reject_software: bool,
     ) -> anyhow::Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue, bool)> {
-        let mut adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        let backends = if renderer_selection.requires_software_adapter() {
+            wgpu::Backends::VULKAN
+        } else {
+            wgpu::Backends::all()
+        };
+        let mut adapters: Vec<_> = instance.enumerate_adapters(backends).await;
 
         if adapters.is_empty() {
+            if renderer_selection.requires_software_adapter() {
+                anyhow::bail!("No Vulkan GPU adapters found for software renderer selection");
+            }
             anyhow::bail!("No GPU adapters found");
         }
 
@@ -272,11 +348,22 @@ impl WgpuContext {
 
         for adapter in adapters {
             let info = adapter.get_info();
-            if reject_software && info.device_type == wgpu::DeviceType::Cpu {
+            if !accepts_adapter(
+                renderer_selection,
+                reject_software,
+                info.backend,
+                info.device_type,
+            ) {
+                let reason = if renderer_selection.requires_software_adapter() {
+                    "software selection requires a Vulkan CPU adapter"
+                } else {
+                    "software adapter rejected during recovery"
+                };
                 log::info!(
-                    "Skipping software renderer: {} ({:?})",
+                    "Skipping GPU adapter {} ({:?}, {:?}): {reason}",
                     info.name,
-                    info.backend
+                    info.backend,
+                    info.device_type,
                 );
                 continue;
             }
@@ -294,6 +381,12 @@ impl WgpuContext {
                              Subpixel text antialiasing will be disabled."
                         );
                     }
+                    anyhow::ensure!(
+                        !renderer_selection.requires_software_adapter()
+                            || (info.backend == wgpu::Backend::Vulkan
+                                && info.device_type == wgpu::DeviceType::Cpu),
+                        "software renderer selection chose a non-Vulkan CPU adapter"
+                    );
                     return Ok((adapter, device, queue, dual_source_blending));
                 }
                 Err(error) => {
@@ -306,6 +399,9 @@ impl WgpuContext {
             }
         }
 
+        if renderer_selection.requires_software_adapter() {
+            anyhow::bail!("No Vulkan CPU GPU adapter found that can configure the display surface")
+        }
         anyhow::bail!("No GPU adapter found that can configure the display surface")
     }
 
@@ -391,6 +487,10 @@ impl WgpuContext {
         self.dual_source_blending
     }
 
+    pub fn renderer_selection(&self) -> RendererSelection {
+        self.renderer_selection
+    }
+
     pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
         let capabilities = surface.get_capabilities(&self.adapter);
         anyhow::ensure!(
@@ -431,7 +531,42 @@ fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use super::parse_pci_id;
+    use super::{accepts_adapter, parse_pci_id};
+    use gpui::RendererSelection;
+
+    #[test]
+    fn software_selection_requires_a_vulkan_cpu_adapter() {
+        assert!(accepts_adapter(
+            RendererSelection::Software,
+            false,
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::Cpu,
+        ));
+        assert!(accepts_adapter(
+            RendererSelection::Software,
+            true,
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::Cpu,
+        ));
+        assert!(!accepts_adapter(
+            RendererSelection::Software,
+            false,
+            wgpu::Backend::Gl,
+            wgpu::DeviceType::Cpu,
+        ));
+        assert!(!accepts_adapter(
+            RendererSelection::Software,
+            false,
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::DiscreteGpu,
+        ));
+        assert!(!accepts_adapter(
+            RendererSelection::Default,
+            true,
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::Cpu,
+        ));
+    }
 
     #[test]
     fn test_parse_device_id() {

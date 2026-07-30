@@ -2,12 +2,14 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, BackdropBlur, BackdropBlurPlan, Background, Bounds, ContentMask, DevicePixels,
-    GlobalElementId, GpuSpecs, MonochromeSprite, Path, Point, PolychromeSprite, PrimitiveBatch,
-    Quad, RetainedLayer, RetainedLayerContentRevision, ScaledPixels, Scene, Shadow, Size,
-    SubpixelSprite, TransformationMatrix, Underline, backdrop_blur_clusters,
-    backdrop_blur_level_sizes_for, backdrop_blur_plan_groups, backdrop_scratch_bounds,
-    backdrop_source_bounds, can_reuse_backdrop_texture, fit_backdrop_scratch_bounds,
-    get_gamma_correction_ratios, max_backdrop_texture_size, prepare_backdrop_blurs,
+    FirstPresentationObserver, GlobalElementId, GpuSpecs, MonochromeSprite, Path, Point,
+    PolychromeSprite, PresentationEvidence, PrimitiveBatch, Quad, RendererAdapterType,
+    RendererInfo, RendererKind, RendererSelection, RetainedLayer, RetainedLayerContentRevision,
+    ScaledPixels, Scene, Shadow, Size, SubpixelSprite, TransformationMatrix, Underline,
+    backdrop_blur_clusters, backdrop_blur_level_sizes_for, backdrop_blur_plan_groups,
+    backdrop_scratch_bounds, backdrop_source_bounds, can_reuse_backdrop_texture,
+    fit_backdrop_scratch_bounds, get_gamma_correction_ratios, max_backdrop_texture_size,
+    prepare_backdrop_blurs,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -369,6 +371,7 @@ pub struct WgpuRenderer {
     rendering_params: RenderingParameters,
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
+    renderer_selection: RendererSelection,
     transparent_alpha_mode: wgpu::CompositeAlphaMode,
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
     max_texture_size: u32,
@@ -376,6 +379,7 @@ pub struct WgpuRenderer {
     frame_failure_streak: FrameFailureStreak,
     device_lost: Arc<std::sync::atomic::AtomicBool>,
     needs_redraw: bool,
+    first_presentation_observer: Option<FirstPresentationObserver>,
 }
 
 impl std::ops::Deref for WgpuRenderer {
@@ -399,6 +403,17 @@ impl std::ops::DerefMut for WgpuRenderer {
 impl WgpuRenderer {
     pub fn supports_dual_source_blending(&self) -> bool {
         self.dual_source_blending
+    }
+
+    /// Installs the observer notified after `SurfaceTexture::present` returns.
+    pub fn set_first_presentation_observer(&mut self, observer: FirstPresentationObserver) {
+        self.first_presentation_observer = Some(observer);
+    }
+
+    fn record_first_presentation(&mut self) {
+        if let Some(observer) = self.first_presentation_observer.take() {
+            observer.record_presentation(PresentationEvidence::ApiSubmitted);
+        }
     }
 
     /// Creates a new WgpuRenderer from raw window handles.
@@ -761,6 +776,7 @@ impl WgpuRenderer {
             rendering_params,
             dual_source_blending,
             adapter_info,
+            renderer_selection: context.renderer_selection(),
             transparent_alpha_mode,
             opaque_alpha_mode,
             max_texture_size,
@@ -768,6 +784,7 @@ impl WgpuRenderer {
             frame_failure_streak: FrameFailureStreak::default(),
             device_lost: context.device_lost_flag(),
             needs_redraw: false,
+            first_presentation_observer: None,
         })
     }
 
@@ -1539,6 +1556,23 @@ impl WgpuRenderer {
         &self.atlas
     }
 
+    pub fn renderer_info(&self) -> RendererInfo {
+        let adapter_type = match self.adapter_info.device_type {
+            wgpu::DeviceType::Cpu => RendererAdapterType::Software,
+            wgpu::DeviceType::Other => RendererAdapterType::Unknown,
+            _ => RendererAdapterType::Hardware,
+        };
+        RendererInfo {
+            selection: self.renderer_selection,
+            renderer: RendererKind::Wgpu,
+            backend: format!("{:?}", self.adapter_info.backend),
+            adapter_name: self.adapter_info.name.clone(),
+            adapter_type,
+            vendor_id: Some(self.adapter_info.vendor),
+            device_id: Some(self.adapter_info.device),
+        }
+    }
+
     pub fn gpu_specs(&self) -> GpuSpecs {
         GpuSpecs {
             is_software_emulated: self.adapter_info.device_type == wgpu::DeviceType::Cpu,
@@ -1718,6 +1752,7 @@ impl WgpuRenderer {
             }
 
             frame.present();
+            self.record_first_presentation();
         }
         true
     }
@@ -3047,10 +3082,11 @@ impl WgpuRenderer {
                     raw_window_handle: handles.window,
                 })?
             };
-            let context = WgpuContext::new_for_surface_rejecting_software(
+            let context = WgpuContext::new_for_surface_recovery(
                 instance,
                 &surface,
                 self.compositor_gpu,
+                self.renderer_selection,
             )?;
             *gpu_context.borrow_mut() = Some(context);
             surface
@@ -3086,6 +3122,7 @@ impl WgpuRenderer {
         self.frame_failure_streak
             .transfer_to(&mut recovered.frame_failure_streak);
         recovered.needs_redraw = true;
+        recovered.first_presentation_observer = self.first_presentation_observer.take();
         *self = recovered;
         Ok(())
     }

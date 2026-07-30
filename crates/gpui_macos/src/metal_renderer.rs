@@ -8,10 +8,11 @@ use cocoa::{
 };
 use gpui::{
     AtlasTextureId, BackdropBlur, BackdropBlurPlan, BackdropScratchBounds, Background, Bounds,
-    ContentMask, DevicePixels, GlobalElementId, MonochromeSprite, PaintSurface, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, RetainedLayer, RetainedLayerContentRevision,
-    ScaledPixels, Scene, Shadow, Size, Surface, TransformationMatrix, Underline,
-    backdrop_blur_clusters, backdrop_blur_level_sizes_for, backdrop_blur_plan_groups,
+    ContentMask, DevicePixels, FirstPresentationObserver, GlobalElementId, MonochromeSprite,
+    PaintSurface, Path, Point, PolychromeSprite, PresentationEvidence, PrimitiveBatch, Quad,
+    RendererAdapterType, RendererInfo, RendererKind, RendererSelection, RetainedLayer,
+    RetainedLayerContentRevision, ScaledPixels, Scene, Shadow, Size, Surface, TransformationMatrix,
+    Underline, backdrop_blur_clusters, backdrop_blur_level_sizes_for, backdrop_blur_plan_groups,
     backdrop_scratch_bounds, can_reuse_backdrop_texture, fit_backdrop_scratch_bounds,
     max_backdrop_texture_size, point, prepare_backdrop_blurs, size,
 };
@@ -78,13 +79,7 @@ impl Drop for ScopedAutoreleasePool {
     }
 }
 
-pub(crate) unsafe fn new_renderer(
-    context: self::Context,
-    _native_window: *mut c_void,
-    _native_view: *mut c_void,
-    _bounds: gpui::Size<f32>,
-    transparent: bool,
-) -> Renderer {
+pub(crate) fn new_renderer(context: self::Context, transparent: bool) -> Result<Renderer> {
     MetalRenderer::new(context, transparent)
 }
 
@@ -212,6 +207,7 @@ pub(crate) struct MetalRenderer {
     path_sample_count: u32,
     is_apple_gpu: bool,
     frame_semaphore: FrameSemaphore,
+    first_presentation_observer: Option<FirstPresentationObserver>,
 }
 
 #[repr(C)]
@@ -268,8 +264,33 @@ pub struct RetainedLayerSprite {
     pub pad: [f32; 3],
 }
 
+fn first_presentation_is_scheduled(status: metal::MTLCommandBufferStatus) -> bool {
+    matches!(
+        status,
+        metal::MTLCommandBufferStatus::Scheduled | metal::MTLCommandBufferStatus::Completed
+    )
+}
+
+fn record_first_presentation_status(
+    observer: &FirstPresentationObserver,
+    status: metal::MTLCommandBufferStatus,
+) {
+    if first_presentation_is_scheduled(status) {
+        observer.record_presentation(PresentationEvidence::BackendAccepted);
+    } else if status == metal::MTLCommandBufferStatus::Error {
+        log::error!("first Metal presentation command buffer entered Error");
+    }
+}
+
+fn presentation_requires_scheduling_wait(presents_with_transaction: bool) -> bool {
+    presents_with_transaction
+}
+
 impl MetalRenderer {
-    pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>, transparent: bool) -> Self {
+    pub fn new(
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        transparent: bool,
+    ) -> Result<Self> {
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
         // Silicon, there is only ever one GPU, so this is equivalent to
         // `metal::Device::system_default()`.
@@ -279,15 +300,13 @@ impl MetalRenderer {
         {
             d
         } else {
-            // For some reason `all()` can return an empty list, see https://github.com/zed-industries/zed/issues/37689
-            // In that case, we fall back to the system default device.
+            // For some reason `all()` can return an empty list, see https://github.com/zed-industries/zed/issues/37689.
+            // In that case, fall back to the system default device.
             log::error!(
                 "Unable to enumerate Metal devices; attempting to use system default device"
             );
-            metal::Device::system_default().unwrap_or_else(|| {
-                log::error!("unable to access a compatible graphics device");
-                std::process::exit(1);
-            })
+            metal::Device::system_default()
+                .ok_or_else(|| anyhow::anyhow!("unable to access a compatible graphics device"))?
         };
 
         let layer = metal::MetalLayer::new();
@@ -453,7 +472,7 @@ impl MetalRenderer {
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
         let is_apple_gpu = device.supports_family(MTLGPUFamily::Apple1);
 
-        Self {
+        Ok(Self {
             device,
             layer,
             presents_with_transaction: false,
@@ -489,7 +508,8 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             is_apple_gpu,
             frame_semaphore: FrameSemaphore::new(MAX_FRAMES_IN_FLIGHT),
-        }
+            first_presentation_observer: None,
+        })
     }
 
     pub fn layer(&self) -> &metal::MetalLayerRef {
@@ -735,6 +755,38 @@ impl MetalRenderer {
         self.layer.set_opaque(!transparent);
     }
 
+    pub fn set_first_presentation_observer(&mut self, observer: FirstPresentationObserver) {
+        self.first_presentation_observer = Some(observer);
+    }
+
+    fn observe_first_presentation(&self, command_buffer: &metal::CommandBufferRef) {
+        let Some(observer) = &self.first_presentation_observer else {
+            return;
+        };
+        if observer.presentation_count() != 0 {
+            return;
+        }
+
+        let observer = observer.clone();
+        let handler = ConcreteBlock::new(move |command_buffer: &metal::CommandBufferRef| {
+            record_first_presentation_status(&observer, command_buffer.status());
+        });
+        let handler = handler.copy();
+        command_buffer.add_scheduled_handler(&handler);
+    }
+
+    pub fn renderer_info(&self) -> RendererInfo {
+        RendererInfo {
+            selection: RendererSelection::Default,
+            renderer: RendererKind::Metal,
+            backend: "Metal".to_string(),
+            adapter_name: self.device.name().to_string(),
+            adapter_type: RendererAdapterType::Hardware,
+            vendor_id: None,
+            device_id: None,
+        }
+    }
+
     pub fn destroy(&self) {
         // nothing to do
     }
@@ -811,12 +863,16 @@ impl MetalRenderer {
                     );
                 }
 
-                if self.presents_with_transaction {
+                if presentation_requires_scheduling_wait(self.presents_with_transaction) {
                     command_buffer.commit();
                     command_buffer.wait_until_scheduled();
                     drawable.present();
+                    if let Some(observer) = &self.first_presentation_observer {
+                        record_first_presentation_status(observer, command_buffer.status());
+                    }
                 } else {
                     command_buffer.present_drawable(drawable);
+                    self.observe_first_presentation(&command_buffer);
                     command_buffer.commit();
                 }
             }
@@ -2893,6 +2949,40 @@ pub struct SurfaceBounds {
 mod tests {
     use super::*;
     use gpui::Corners;
+
+    #[test]
+    fn first_presentation_requires_scheduled_or_completed() {
+        use metal::MTLCommandBufferStatus::{
+            Committed, Completed, Enqueued, Error, NotEnqueued, Scheduled,
+        };
+
+        assert!(first_presentation_is_scheduled(Scheduled));
+        assert!(first_presentation_is_scheduled(Completed));
+        for status in [NotEnqueued, Enqueued, Committed, Error] {
+            assert!(!first_presentation_is_scheduled(status));
+        }
+    }
+
+    #[test]
+    fn first_presentation_status_does_not_record_errors() {
+        let observer = FirstPresentationObserver::default();
+        let mut notification = observer.subscribe();
+
+        record_first_presentation_status(&observer, metal::MTLCommandBufferStatus::Error);
+        assert_eq!(observer.presentation_count(), 0);
+
+        record_first_presentation_status(&observer, metal::MTLCommandBufferStatus::Scheduled);
+        assert_eq!(
+            notification.try_recv(),
+            Ok(Some(PresentationEvidence::BackendAccepted))
+        );
+    }
+
+    #[test]
+    fn normal_presentation_does_not_wait_for_scheduling() {
+        assert!(!presentation_requires_scheduling_wait(false));
+        assert!(presentation_requires_scheduling_wait(true));
+    }
 
     fn scene_with_retained_primitive(primitive: impl Into<gpui::Primitive>) -> Scene {
         let bounds = Bounds::new(

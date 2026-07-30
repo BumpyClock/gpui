@@ -4,7 +4,6 @@ use crate::{
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
-#[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
@@ -762,9 +761,16 @@ impl MacWindow {
         foreground_executor: ForegroundExecutor,
         background_executor: BackgroundExecutor,
         renderer_context: renderer::Context,
-    ) -> Self {
+    ) -> Result<Self> {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
+            let renderer = match renderer::new_renderer(renderer_context, false) {
+                Ok(renderer) => renderer,
+                Err(error) => {
+                    pool.drain();
+                    return Err(error);
+                }
+            };
 
             let allows_automatic_window_tabbing = tabbing_identifier.is_some();
             if allows_automatic_window_tabbing {
@@ -882,13 +888,7 @@ impl MacWindow {
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
                 display_link: None,
-                renderer: renderer::new_renderer(
-                    renderer_context,
-                    native_window as *mut _,
-                    native_view as *mut _,
-                    bounds.size.map(|pixels| pixels.as_f32()),
-                    false,
-                ),
+                renderer,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -1086,7 +1086,7 @@ impl MacWindow {
 
             pool.drain();
 
-            window
+            Ok(window)
         }
     }
 
@@ -1824,12 +1824,23 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
+    fn set_first_presentation_observer(&self, observer: gpui::FirstPresentationObserver) {
+        self.0
+            .lock()
+            .renderer
+            .set_first_presentation_observer(observer);
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }
 
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
         None
+    }
+
+    fn renderer_info(&self) -> Option<gpui::RendererInfo> {
+        Some(self.0.lock().renderer.renderer_info())
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {

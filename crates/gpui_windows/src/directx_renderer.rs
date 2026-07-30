@@ -64,6 +64,7 @@ pub(crate) struct DirectXRenderer {
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
     disable_direct_composition: bool,
+    renderer_selection: RendererSelection,
     /// Windows.UI.Composition tree used for the rounded host-backdrop blur mode.
     /// When `Some`, `direct_composition` is `None` (only one composition target
     /// may exist per HWND) and the swap chain is presented through this tree.
@@ -84,6 +85,7 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+    first_presentation_observer: Option<FirstPresentationObserver>,
 }
 
 /// Direct3D objects
@@ -215,6 +217,7 @@ impl DirectXRendererDevices {
             dxgi_factory,
             device,
             device_context,
+            ..
         } = directx_devices;
         let dxgi_device = if disable_direct_composition {
             None
@@ -274,6 +277,7 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             disable_direct_composition,
+            renderer_selection: directx_devices.renderer_selection,
             rounded_backdrop: None,
             rounded_backdrop_radius: None,
             rounded_backdrop_scale: 1.0,
@@ -281,11 +285,16 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            first_presentation_observer: None,
         })
     }
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.atlas.clone()
+    }
+
+    pub(crate) fn set_first_presentation_observer(&mut self, observer: FirstPresentationObserver) {
+        self.first_presentation_observer = Some(observer);
     }
 
     fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
@@ -331,7 +340,11 @@ impl DirectXRenderer {
                 .swap_chain
                 .Present(0, DXGI_PRESENT(0))
         };
-        result.ok().context("Presenting swap chain failed")
+        result.ok().context("Presenting swap chain failed")?;
+        if let Some(observer) = self.first_presentation_observer.take() {
+            observer.record_presentation(PresentationEvidence::BackendAccepted);
+        }
+        Ok(())
     }
 
     fn update_clean_retained_layers(&mut self, scene: &Scene) -> Result<bool> {
@@ -1482,6 +1495,27 @@ impl DirectXRenderer {
             return Ok(());
         }
         Ok(())
+    }
+
+    pub(crate) fn renderer_info(&self) -> Result<RendererInfo> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let desc = unsafe { devices.adapter.GetDesc1() }?;
+        let adapter_type = if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+            RendererAdapterType::Software
+        } else {
+            RendererAdapterType::Hardware
+        };
+        Ok(RendererInfo {
+            selection: self.renderer_selection,
+            renderer: RendererKind::Direct3d11,
+            backend: "Direct3D11".to_string(),
+            adapter_name: String::from_utf16_lossy(&desc.Description)
+                .trim_matches(char::from(0))
+                .to_string(),
+            adapter_type,
+            vendor_id: Some(desc.VendorId),
+            device_id: Some(desc.DeviceId),
+        })
     }
 
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
