@@ -7,11 +7,12 @@ use crate::linux::accesskit_shims::{
 };
 use gpui::popup::PopupNotSupportedError;
 use gpui::{
-    AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
-    OverlayInputMode, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge,
-    ScaledPixels, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowDecorations, WindowKind, WindowParams, px,
+    AnyWindowHandle, Bounds, Decorations, DevicePixels, FirstPresentationObserver,
+    ForegroundExecutor, GpuSpecs, Modifiers, OverlayInputMode, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+    PromptLevel, RendererInfo, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size, Tiling,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowDecorations, WindowKind, WindowParams, px,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -1732,6 +1733,14 @@ impl PlatformWindow for X11Window {
         }
     }
 
+    fn set_first_presentation_observer(&self, observer: FirstPresentationObserver) {
+        self.0
+            .state
+            .borrow_mut()
+            .renderer
+            .set_first_presentation_observer(observer);
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         let inner = self.0.state.borrow();
         inner.renderer.sprite_atlas().clone()
@@ -1925,6 +1934,10 @@ impl PlatformWindow for X11Window {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.0.state.borrow().renderer.gpu_specs().into()
+    }
+
+    fn renderer_info(&self) -> Option<RendererInfo> {
+        Some(self.0.state.borrow().renderer.renderer_info())
     }
 
     fn play_system_bell(&self) {

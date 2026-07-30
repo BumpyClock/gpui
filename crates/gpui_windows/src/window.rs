@@ -1153,6 +1153,13 @@ impl PlatformWindow for WindowsWindow {
             .log_err();
     }
 
+    fn set_first_presentation_observer(&self, observer: FirstPresentationObserver) {
+        self.state
+            .renderer
+            .borrow_mut()
+            .set_first_presentation_observer(observer);
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.state.renderer.borrow().sprite_atlas()
     }
@@ -1163,6 +1170,10 @@ impl PlatformWindow for WindowsWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.state.renderer.borrow().gpu_specs().log_err()
+    }
+
+    fn renderer_info(&self) -> Option<RendererInfo> {
+        self.state.renderer.borrow().renderer_info().log_err()
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
@@ -1542,12 +1553,21 @@ fn register_window_class(icon_handle: HICON) {
     });
 }
 
-unsafe extern "system" fn window_procedure(
+extern "system" fn window_procedure(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        window_procedure_inner(hwnd, msg, wparam, lparam)
+    })) {
+        Ok(result) => result,
+        Err(panic) => crate::platform::window_procedure_panic(msg, panic),
+    }
+}
+
+fn window_procedure_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         let window_params = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
         let window_creation_context = window_params.lpCreateParams as *mut WindowCreateContext;

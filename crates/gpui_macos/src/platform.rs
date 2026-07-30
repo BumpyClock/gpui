@@ -4,16 +4,18 @@ use crate::{
     set_active_window_cursor_style,
 };
 use anyhow::{Context as _, anyhow};
-use block::ConcreteBlock;
+use block::{ConcreteBlock, RcBlock};
 use cocoa::{
     appkit::{
         NSApplication, NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular,
-        NSControl as _, NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel,
-        NSSavePanel, NSVisualEffectState, NSVisualEffectView, NSWindow,
+        NSApplicationTerminateReply::NSTerminateCancel, NSControl as _, NSEvent,
+        NSEventModifierFlags, NSEventSubtype, NSEventType, NSMenu, NSMenuItem, NSModalResponse,
+        NSOpenPanel, NSSavePanel, NSVisualEffectState, NSVisualEffectView, NSWindow,
     },
     base::{BOOL, NO, YES, id, nil, selector},
     foundation::{
-        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSProcessInfo, NSString, NSUInteger, NSURL,
+        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSPoint, NSProcessInfo, NSString,
+        NSUInteger, NSURL,
     },
 };
 use core_foundation::{
@@ -21,7 +23,7 @@ use core_foundation::{
     boolean::CFBoolean,
     data::CFData,
     dictionary::{CFDictionary, CFDictionaryRef, CFMutableDictionary},
-    runloop::CFRunLoopRun,
+    runloop::{CFRunLoopGetMain, CFRunLoopRun, CFRunLoopStop, CFRunLoopWakeUp},
     string::{CFString, CFStringRef},
 };
 use ctor::ctor;
@@ -31,8 +33,8 @@ use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
     KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
     PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
-    WindowParams, popup::PopupNotSupportedError,
+    PlatformWindow, RendererSelection, Result, SystemMenuType, Task, ThermalState,
+    WindowAppearance, WindowKind, WindowParams, popup::PopupNotSupportedError,
 };
 use gpui_util::{ResultExt, new_std_command};
 use itertools::Itertools;
@@ -93,8 +95,12 @@ unsafe fn build_classes() {
                 should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool),
             );
             decl.add_method(
+                sel!(applicationShouldTerminate:),
+                application_should_terminate as extern "C" fn(&mut Object, Sel, id) -> NSUInteger,
+            );
+            decl.add_method(
                 sel!(applicationWillTerminate:),
-                will_terminate as extern "C" fn(&mut Object, Sel, id),
+                application_will_terminate as extern "C" fn(&mut Object, Sel, id),
             );
             decl.add_method(
                 sel!(handleGPUIMenuItem:),
@@ -142,27 +148,200 @@ unsafe fn build_classes() {
                 open_urls as extern "C" fn(&mut Object, Sel, id, id),
             );
 
-            decl.add_method(
-                sel!(onKeyboardLayoutChange:),
-                on_keyboard_layout_change as extern "C" fn(&mut Object, Sel, id),
-            );
-
-            decl.add_method(
-                sel!(onThermalStateChange:),
-                on_thermal_state_change as extern "C" fn(&mut Object, Sel, id),
-            );
-
-            decl.add_method(
-                sel!(onSystemWake:),
-                on_system_wake as extern "C" fn(&mut Object, Sel, id),
-            );
-
             decl.register()
         }
     }
 }
 
 pub struct MacPlatform(Mutex<MacPlatformState>);
+
+struct MacRunToken;
+
+struct ActiveMacPlatform {
+    token: Arc<MacRunToken>,
+    platform: usize,
+}
+
+#[derive(Default)]
+struct ActiveMacPlatformRegistry {
+    active: Option<ActiveMacPlatform>,
+}
+
+impl ActiveMacPlatformRegistry {
+    fn activate(&mut self, token: Arc<MacRunToken>, platform: usize) {
+        assert!(
+            self.active.is_none(),
+            "only one native MacPlatform may run at a time"
+        );
+        self.active = Some(ActiveMacPlatform { token, platform });
+    }
+
+    fn deactivate(&mut self, token: &Arc<MacRunToken>) {
+        let Some(active) = self.active.as_ref() else {
+            log::warn!("native MacPlatform registration was already cleared");
+            return;
+        };
+        if !Arc::ptr_eq(&active.token, token) {
+            log::warn!("native MacPlatform registration changed before run returned");
+            return;
+        }
+        self.active = None;
+    }
+
+    fn resolve(&self, token: &Arc<MacRunToken>) -> Option<usize> {
+        self.active
+            .as_ref()
+            .and_then(|active| Arc::ptr_eq(&active.token, token).then_some(active.platform))
+    }
+}
+
+static ACTIVE_MAC_PLATFORM: OnceLock<Mutex<ActiveMacPlatformRegistry>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+enum MacNotificationKind {
+    KeyboardLayoutChange,
+    ThermalStateChange,
+    SystemWake,
+}
+
+struct MacObserverToken {
+    center: id,
+    observer: id,
+}
+
+impl Drop for MacObserverToken {
+    fn drop(&mut self) {
+        if self.center != nil && self.observer != nil {
+            // SAFETY: this token owns both retained objects and removes the observer exactly once.
+            unsafe {
+                let _: () = msg_send![self.center, removeObserver: self.observer];
+            }
+        }
+        if self.observer != nil {
+            // SAFETY: this token retained the opaque observer during registration.
+            unsafe {
+                let _: () = msg_send![self.observer, release];
+            }
+        }
+        if self.center != nil {
+            // SAFETY: this token retained the originating notification center.
+            unsafe {
+                let _: () = msg_send![self.center, release];
+            }
+        }
+    }
+}
+
+struct MacNotificationRegistration {
+    run_token: Arc<MacRunToken>,
+    observers: Vec<MacObserverToken>,
+    active: bool,
+}
+
+impl Drop for MacNotificationRegistration {
+    fn drop(&mut self) {
+        if self.active {
+            unregister_active_mac_platform(&self.run_token);
+            self.active = false;
+        }
+        self.observers.clear();
+    }
+}
+
+struct MacQuitContext {
+    headless: bool,
+    callback: Option<Box<dyn FnMut()>>,
+}
+
+fn invoke_quit_callback(callback: Option<Box<dyn FnMut()>>) {
+    if let Some(mut callback) = callback {
+        callback();
+    }
+}
+
+fn active_mac_platform() -> &'static Mutex<ActiveMacPlatformRegistry> {
+    ACTIVE_MAC_PLATFORM.get_or_init(|| Mutex::new(ActiveMacPlatformRegistry::default()))
+}
+
+fn register_active_mac_platform(platform: *const MacPlatform) -> Arc<MacRunToken> {
+    let token = Arc::new(MacRunToken);
+    active_mac_platform()
+        .lock()
+        .activate(token.clone(), platform.expose_provenance());
+    token
+}
+
+fn unregister_active_mac_platform(token: &Arc<MacRunToken>) {
+    active_mac_platform().lock().deactivate(token);
+}
+
+fn sendable_notification_block<F>(f: F) -> RcBlock<(id,), ()>
+where
+    F: Fn(id) + Send + Sync + 'static,
+{
+    ConcreteBlock::new(f).copy()
+}
+
+unsafe fn register_notification_observer(
+    center: id,
+    name: id,
+    object: id,
+    token: Arc<MacRunToken>,
+    kind: MacNotificationKind,
+) -> MacObserverToken {
+    let block = sendable_notification_block(move |_: id| {
+        let token = token.clone();
+        DispatchQueue::main().exec_async(move || invoke_notification_callback(token, kind));
+    });
+    let observer: id = msg_send![center,
+        addObserverForName: name
+        object: object
+        queue: nil
+        usingBlock: &*block
+    ];
+    if center != nil {
+        let _: id = msg_send![center, retain];
+    }
+    if observer != nil {
+        let _: id = msg_send![observer, retain];
+    }
+    MacObserverToken { center, observer }
+}
+
+fn invoke_notification_callback(token: Arc<MacRunToken>, kind: MacNotificationKind) {
+    let Some(platform) = active_mac_platform().lock().resolve(&token) else {
+        return;
+    };
+    // SAFETY: the active token was validated before deriving this platform pointer. Notification
+    // callbacks run on the main queue, so teardown cannot release the platform during this callback.
+    let platform = unsafe { &*ptr::with_exposed_provenance::<MacPlatform>(platform) };
+    let mut state = platform.0.lock();
+    let callback = match kind {
+        MacNotificationKind::KeyboardLayoutChange => {
+            state.keyboard_mapper = Rc::new(MacKeyboardMapper::new(MacKeyboardLayout::new().id()));
+            state.on_keyboard_layout_change.take()
+        }
+        MacNotificationKind::ThermalStateChange => state.on_thermal_state_change.take(),
+        MacNotificationKind::SystemWake => state.on_system_wake.take(),
+    };
+    drop(state);
+
+    if let Some(mut callback) = callback {
+        callback();
+        let mut state = platform.0.lock();
+        match kind {
+            MacNotificationKind::KeyboardLayoutChange => {
+                state.on_keyboard_layout_change.get_or_insert(callback);
+            }
+            MacNotificationKind::ThermalStateChange => {
+                state.on_thermal_state_change.get_or_insert(callback);
+            }
+            MacNotificationKind::SystemWake => {
+                state.on_system_wake.get_or_insert(callback);
+            }
+        }
+    }
+}
 
 pub(crate) struct MacPlatformState {
     background_executor: BackgroundExecutor,
@@ -176,8 +355,10 @@ pub(crate) struct MacPlatformState {
     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
     on_thermal_state_change: Option<Box<dyn FnMut()>>,
     on_system_wake: Option<Box<dyn FnMut()>>,
-    system_wake_observer_registered: bool,
     quit: Option<Box<dyn FnMut()>>,
+    quit_requested: bool,
+    run_started: bool,
+    headless_run_started: bool,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
@@ -222,6 +403,9 @@ impl MacPlatform {
             find_pasteboard: Pasteboard::find(),
             reopen: None,
             quit: None,
+            quit_requested: false,
+            run_started: false,
+            headless_run_started: false,
             menu_command: None,
             validate_menu_command: None,
             will_open_menu: None,
@@ -232,7 +416,6 @@ impl MacPlatform {
             on_keyboard_layout_change: None,
             on_thermal_state_change: None,
             on_system_wake: None,
-            system_wake_observer_registered: false,
             menus: None,
             keyboard_mapper,
             cursor_visible: Arc::new(AtomicBool::new(true)),
@@ -489,51 +672,152 @@ impl Platform for MacPlatform {
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
         let mut state = self.0.lock();
+        assert!(
+            !state.run_started,
+            "MacPlatform::run may only be called once"
+        );
+        state.run_started = true;
         if state.headless {
             drop(state);
             on_finish_launching();
+
+            let (quit_requested, callback) = {
+                let mut state = self.0.lock();
+                let quit_requested = state.quit_requested;
+                if quit_requested {
+                    (true, state.quit.take())
+                } else {
+                    state.headless_run_started = true;
+                    (false, None)
+                }
+            };
+            if quit_requested {
+                invoke_quit_callback(callback);
+                return;
+            }
+
+            // SAFETY: GPUI owns and drives the main CF run loop until it is stopped.
             unsafe { CFRunLoopRun() };
-        } else {
-            state.finish_launching = Some(on_finish_launching);
-            drop(state);
+
+            let callback = {
+                let mut state = self.0.lock();
+                state.headless_run_started = false;
+                state.quit_requested = true;
+                state.quit.take()
+            };
+            invoke_quit_callback(callback);
+            return;
         }
+
+        state.finish_launching = Some(on_finish_launching);
+        drop(state);
 
         unsafe {
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let app_delegate: id = msg_send![APP_DELEGATE_CLASS, new];
+            let self_ptr = self as *const Self;
+            (*app).set_ivar(MAC_PLATFORM_IVAR, self_ptr.cast::<c_void>());
+            (*app_delegate).set_ivar(MAC_PLATFORM_IVAR, self_ptr.cast::<c_void>());
             app.setDelegate_(app_delegate);
 
-            let self_ptr = self as *const Self as *const c_void;
-            (*app).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
-            (*app_delegate).set_ivar(MAC_PLATFORM_IVAR, self_ptr);
-
             let pool = NSAutoreleasePool::new(nil);
-            app.run();
-            pool.drain();
+            let run_token = register_active_mac_platform(self_ptr);
+            let mut registration = MacNotificationRegistration {
+                run_token,
+                observers: Vec::with_capacity(3),
+                active: true,
+            };
+            let notification_center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+            registration.observers.push(register_notification_observer(
+                notification_center,
+                ns_string("NSTextInputContextKeyboardSelectionDidChangeNotification"),
+                nil,
+                registration.run_token.clone(),
+                MacNotificationKind::KeyboardLayoutChange,
+            ));
+            let process_info: id = msg_send![class!(NSProcessInfo), processInfo];
+            registration.observers.push(register_notification_observer(
+                notification_center,
+                ns_string("NSProcessInfoThermalStateDidChangeNotification"),
+                process_info,
+                registration.run_token.clone(),
+                MacNotificationKind::ThermalStateChange,
+            ));
+            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let workspace_center: id = msg_send![workspace, notificationCenter];
+            registration.observers.push(register_notification_observer(
+                workspace_center,
+                ns_string("NSWorkspaceDidWakeNotification"),
+                nil,
+                registration.run_token.clone(),
+                MacNotificationKind::SystemWake,
+            ));
 
+            app.run();
+
+            drop(registration);
+            app.setDelegate_(nil);
             (*app).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
-            (*NSWindow::delegate(app)).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
+            (*app_delegate).set_ivar(MAC_PLATFORM_IVAR, null_mut::<c_void>());
+            let _: () = msg_send![app_delegate, release];
+            pool.drain();
         }
     }
 
     fn quit(&self) {
-        // Quitting the app causes us to close windows, which invokes `Window::on_close` callbacks
-        // synchronously before this method terminates. If we call `Platform::quit` while holding a
-        // borrow of the app state (which most of the time we will do), we will end up
-        // double-borrowing the app state in the `on_close` callbacks for our open windows. To solve
-        // this, we make quitting the application asynchronous so that we aren't holding borrows to
-        // the app state on the stack when we actually terminate the app.
+        // Shutdown closes windows and invokes `Window::on_close` callbacks. Defer it until the
+        // current app-state borrow has been released, then stop the run loop without terminating
+        // the host process.
+        let context = {
+            let mut state = self.0.lock();
+            if state.quit_requested {
+                return;
+            }
+            state.quit_requested = true;
+            if state.headless && !state.headless_run_started {
+                return;
+            }
+            Box::new(MacQuitContext {
+                headless: state.headless,
+                callback: state.quit.take(),
+            })
+        };
 
-        use dispatch2::DispatchQueue;
-
+        let context = Box::into_raw(context).cast::<c_void>();
+        // SAFETY: the boxed context remains allocated until `quit` reconstructs it.
         unsafe {
-            DispatchQueue::main().exec_async_f(ptr::null_mut(), quit);
+            DispatchQueue::main().exec_async_f(context, quit);
         }
 
-        extern "C" fn quit(_: *mut c_void) {
+        extern "C" fn quit(context: *mut c_void) {
+            // SAFETY: `context` was produced by `Box::into_raw` above and this callback runs once.
+            let mut context = unsafe { Box::from_raw(context.cast::<MacQuitContext>()) };
+            invoke_quit_callback(context.callback.take());
+
+            // SAFETY: this callback runs on the main queue and operates on the main run loop.
             unsafe {
-                let app = NSApplication::sharedApplication(nil);
-                let _: () = msg_send![app, terminate: nil];
+                let run_loop = CFRunLoopGetMain();
+                if context.headless {
+                    CFRunLoopStop(run_loop);
+                } else {
+                    let app = NSApplication::sharedApplication(nil);
+                    app.stop_(nil);
+                    // AppKit observes the stop flag after processing an event, so wake it with one.
+                    let event = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+                        nil,
+                        NSEventType::NSApplicationDefined,
+                        NSPoint::new(0.0, 0.0),
+                        NSEventModifierFlags::empty(),
+                        0.0,
+                        0,
+                        nil,
+                        NSEventSubtype::NSWindowExposedEventType,
+                        0,
+                        0,
+                    );
+                    app.postEvent_atStart_(event, NO);
+                }
+                CFRunLoopWakeUp(run_loop);
             }
         }
     }
@@ -651,6 +935,12 @@ impl Platform for MacPlatform {
             return Err(PopupNotSupportedError.into());
         }
 
+        let renderer_selection = RendererSelection::from_environment()?;
+        anyhow::ensure!(
+            !renderer_selection.requires_software_adapter(),
+            "software renderer selection is not supported on macOS because Metal has no software adapter"
+        );
+
         let (cursor_visible, foreground_executor, background_executor, renderer_context) = {
             let guard = self.0.lock();
             (
@@ -668,7 +958,7 @@ impl Platform for MacPlatform {
             foreground_executor,
             background_executor,
             renderer_context,
-        )))
+        )?))
     }
 
     fn window_appearance(&self) -> WindowAppearance {
@@ -940,22 +1230,7 @@ impl Platform for MacPlatform {
     }
 
     fn on_system_wake(&self, callback: Box<dyn FnMut()>) {
-        let mut state = self.0.lock();
-        state.on_system_wake = Some(callback);
-        if state.system_wake_observer_registered {
-            return;
-        }
-        drop(state);
-
-        // SAFETY: APP_CLASS is registered during startup and returns the shared NSApplication.
-        unsafe {
-            let app: id = msg_send![APP_CLASS, sharedApplication];
-            let delegate: id = msg_send![app, delegate];
-            if delegate != nil {
-                register_system_wake_observer(delegate);
-                self.0.lock().system_wake_observer_registered = true;
-            }
-        }
+        self.0.lock().on_system_wake = Some(callback);
     }
 
     fn thermal_state(&self) -> ThermalState {
@@ -1254,53 +1529,13 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
         let app: id = msg_send![APP_CLASS, sharedApplication];
         app.setActivationPolicy_(NSApplicationActivationPolicyRegular);
 
-        let notification_center: *mut Object =
-            msg_send![class!(NSNotificationCenter), defaultCenter];
-        let name = ns_string("NSTextInputContextKeyboardSelectionDidChangeNotification");
-        let _: () = msg_send![notification_center, addObserver: this as id
-            selector: sel!(onKeyboardLayoutChange:)
-            name: name
-            object: nil
-        ];
-
-        let thermal_name = ns_string("NSProcessInfoThermalStateDidChangeNotification");
-        let process_info: id = msg_send![class!(NSProcessInfo), processInfo];
-        let _: () = msg_send![notification_center, addObserver: this as id
-            selector: sel!(onThermalStateChange:)
-            name: thermal_name
-            object: process_info
-        ];
-
-        let observer = this as *mut Object as id;
         let platform = get_mac_platform(this);
-        let callback = {
-            let mut state = platform.0.lock();
-            if state.on_system_wake.is_some() && !state.system_wake_observer_registered {
-                register_system_wake_observer(observer);
-                state.system_wake_observer_registered = true;
-            }
-            state.finish_launching.take()
-        };
+        let callback = platform.0.lock().finish_launching.take();
         if let Some(callback) = callback {
             callback();
         }
     }
 }
-
-unsafe fn register_system_wake_observer(observer: id) {
-    // SAFETY: observer is an Objective-C object implementing onSystemWake:.
-    unsafe {
-        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let workspace_center: *mut Object = msg_send![workspace, notificationCenter];
-        let wake_name = ns_string("NSWorkspaceDidWakeNotification");
-        let _: () = msg_send![workspace_center, addObserver: observer
-            selector: sel!(onSystemWake:)
-            name: wake_name
-            object: nil
-        ];
-    }
-}
-
 extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_windows: bool) {
     if !has_open_windows {
         let platform = unsafe { get_mac_platform(this) };
@@ -1313,76 +1548,21 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
     }
 }
 
-extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
+extern "C" fn application_should_terminate(this: &mut Object, _: Sel, _: id) -> NSUInteger {
     let platform = unsafe { get_mac_platform(this) };
-    let mut lock = platform.0.lock();
-    if let Some(mut callback) = lock.quit.take() {
-        drop(lock);
-        callback();
-        platform.0.lock().quit.get_or_insert(callback);
-    }
+    platform.quit();
+    NSTerminateCancel as NSUInteger
 }
 
-extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
+extern "C" fn application_will_terminate(this: &mut Object, _: Sel, _: id) {
+    // SAFETY: `this` is the registered app delegate carrying `MAC_PLATFORM_IVAR`.
     let platform = unsafe { get_mac_platform(this) };
-    let mut lock = platform.0.lock();
-    let keyboard_layout = MacKeyboardLayout::new();
-    lock.keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
-    if let Some(mut callback) = lock.on_keyboard_layout_change.take() {
-        drop(lock);
-        callback();
-        platform
-            .0
-            .lock()
-            .on_keyboard_layout_change
-            .get_or_insert(callback);
-    }
-}
-
-extern "C" fn on_thermal_state_change(this: &mut Object, _: Sel, _: id) {
-    // Defer to the next run loop iteration to avoid re-entrant borrows of the App RefCell,
-    // as NSNotificationCenter delivers this notification synchronously and it may fire while
-    // the App is already borrowed (same pattern as quit() above).
-    let platform = unsafe { get_mac_platform(this) };
-    let platform_ptr = platform as *const MacPlatform as *mut c_void;
-    unsafe {
-        DispatchQueue::main().exec_async_f(platform_ptr, on_thermal_state_change);
-    }
-
-    extern "C" fn on_thermal_state_change(context: *mut c_void) {
-        let platform = unsafe { &*(context as *const MacPlatform) };
-        let mut lock = platform.0.lock();
-        if let Some(mut callback) = lock.on_thermal_state_change.take() {
-            drop(lock);
-            callback();
-            platform
-                .0
-                .lock()
-                .on_thermal_state_change
-                .get_or_insert(callback);
-        }
-    }
-}
-
-extern "C" fn on_system_wake(this: &mut Object, _: Sel, _: id) {
-    // SAFETY: this is the registered app delegate carrying MAC_PLATFORM_IVAR.
-    let platform = unsafe { get_mac_platform(this) };
-    let platform_ptr = platform as *const MacPlatform as *mut c_void;
-    // SAFETY: platform lives for the process lifetime while callbacks are registered.
-    unsafe {
-        DispatchQueue::main().exec_async_f(platform_ptr, on_system_wake);
-    }
-
-    extern "C" fn on_system_wake(context: *mut c_void) {
-        // SAFETY: context is the MacPlatform pointer queued above.
-        let platform = unsafe { &*(context as *const MacPlatform) };
-        let mut lock = platform.0.lock();
-        if let Some(mut callback) = lock.on_system_wake.take() {
-            drop(lock);
-            callback();
-            platform.0.lock().on_system_wake.get_or_insert(callback);
-        }
-    }
+    let callback = {
+        let mut state = platform.0.lock();
+        state.quit_requested = true;
+        state.quit.take()
+    };
+    invoke_quit_callback(callback);
 }
 
 extern "C" fn open_urls(this: &mut Object, _: Sel, _: id, urls: id) {
@@ -1536,4 +1716,23 @@ mod security {
     pub const errSecSuccess: OSStatus = 0;
     pub const errSecUserCanceled: OSStatus = -128;
     pub const errSecItemNotFound: OSStatus = -25300;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_run_token_cannot_resolve_a_new_run() {
+        let mut registry = ActiveMacPlatformRegistry::default();
+        let old_token = Arc::new(MacRunToken);
+        let new_token = Arc::new(MacRunToken);
+
+        registry.activate(old_token.clone(), 7);
+        registry.deactivate(&old_token);
+        registry.activate(new_token.clone(), 7);
+
+        assert_eq!(registry.resolve(&old_token), None);
+        assert_eq!(registry.resolve(&new_token), Some(7));
+    }
 }

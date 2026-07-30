@@ -10,13 +10,18 @@ use std::{ffi::OsString, fs::File, os::fd::AsFd, time::Duration};
 use std::{io::Read as _, os::fd::AsRawFd};
 
 use anyhow::{Context as _, anyhow};
-use calloop::{LoopSignal, channel::Sender};
-use futures::channel::oneshot;
+use calloop::LoopSignal;
+#[cfg(all(target_os = "linux", any(feature = "wayland", feature = "x11")))]
+use futures::future::Abortable;
+use futures::{channel::oneshot, future::AbortHandle};
 use gpui_util::{ResultExt as _, new_std_command};
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use xkbcommon::xkb::{self, Keycode, Keysym, State};
 
-use crate::linux::{LinuxDispatcher, PriorityQueueCalloopReceiver};
+use crate::linux::{
+    CalloopReceiver, CalloopSender, LinuxDispatcher, PriorityQueueCalloopReceiver,
+    try_calloop_channel,
+};
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
     ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
@@ -129,25 +134,30 @@ pub(crate) struct LinuxCommon {
     pub(crate) auto_hide_scrollbars: bool,
     pub(crate) callbacks: PlatformHandlers,
     pub(crate) signal: LoopSignal,
+    run_started: bool,
+    quit_requested: bool,
     pub(crate) menus: Vec<OwnedMenu>,
     #[cfg_attr(
         not(all(target_os = "linux", any(feature = "wayland", feature = "x11"))),
         allow(dead_code)
     )]
-    wake_sender: Sender<()>,
+    wake_sender: CalloopSender<()>,
     wake_listener_started: bool,
+    wake_listener_abort: Option<AbortHandle>,
 }
 
 impl LinuxCommon {
     pub fn new(
         signal: LoopSignal,
-    ) -> (
+    ) -> anyhow::Result<(
         Self,
         PriorityQueueCalloopReceiver<RunnableVariant>,
-        calloop::channel::Channel<()>,
-    ) {
-        let (main_sender, main_receiver) = PriorityQueueCalloopReceiver::new();
-        let (wake_sender, wake_receiver) = calloop::channel::channel();
+        CalloopReceiver<()>,
+    )> {
+        let (main_sender, main_receiver) = PriorityQueueCalloopReceiver::new()
+            .context("failed to create foreground task source")?;
+        let (wake_sender, wake_receiver) =
+            try_calloop_channel().context("failed to create system wake source")?;
 
         #[cfg(any(feature = "wayland", feature = "x11"))]
         let text_system = Arc::new(crate::linux::CosmicTextSystem::new());
@@ -155,25 +165,29 @@ impl LinuxCommon {
         let text_system = Arc::new(gpui::NoopTextSystem::new());
 
         let callbacks = PlatformHandlers::default();
-
-        let dispatcher = Arc::new(LinuxDispatcher::new(main_sender));
-
+        let dispatcher = Arc::new(
+            LinuxDispatcher::new(main_sender).context("failed to initialize Linux dispatcher")?,
+        );
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
+        let foreground_executor = ForegroundExecutor::new(dispatcher);
 
         let common = LinuxCommon {
             background_executor,
-            foreground_executor: ForegroundExecutor::new(dispatcher),
+            foreground_executor,
             text_system,
             appearance: WindowAppearance::Light,
             auto_hide_scrollbars: false,
             callbacks,
             signal,
+            run_started: false,
+            quit_requested: false,
             menus: Vec::new(),
             wake_sender,
             wake_listener_started: false,
+            wake_listener_abort: None,
         };
 
-        (common, main_receiver, wake_receiver)
+        Ok((common, main_receiver, wake_receiver))
     }
 
     pub(crate) fn start_wake_listener(&mut self) {
@@ -181,21 +195,33 @@ impl LinuxCommon {
             return;
         }
         #[cfg(all(target_os = "linux", any(feature = "wayland", feature = "x11")))]
-        smol::spawn({
+        {
+            let (abort_handle, registration) = AbortHandle::new_pair();
+            self.wake_listener_abort = Some(abort_handle);
             let wake_sender = self.wake_sender.clone();
-            async move {
-                if let Err(error) = listen_for_system_wake(wake_sender).await {
+            smol::spawn(async move {
+                if let Ok(Err(error)) =
+                    Abortable::new(listen_for_system_wake(wake_sender), registration).await
+                {
                     log::debug!("failed to listen for system wake events: {error:?}");
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
+        }
         self.wake_listener_started = true;
     }
 }
 
+impl Drop for LinuxCommon {
+    fn drop(&mut self) {
+        if let Some(abort_handle) = self.wake_listener_abort.take() {
+            abort_handle.abort();
+        }
+    }
+}
+
 #[cfg(all(target_os = "linux", any(feature = "wayland", feature = "x11")))]
-async fn listen_for_system_wake(wake_sender: Sender<()>) -> anyhow::Result<()> {
+async fn listen_for_system_wake(wake_sender: CalloopSender<()>) -> anyhow::Result<()> {
     use futures::StreamExt as _;
 
     let connection = ashpd::zbus::Connection::system().await?;
@@ -254,9 +280,17 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
     }
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+        let run_started = self
+            .inner
+            .with_common(|common| std::mem::replace(&mut common.run_started, true));
+        assert!(!run_started, "LinuxPlatform::run may only be called once");
+
         on_finish_launching();
 
-        LinuxClient::run(&self.inner);
+        let quit_requested = self.inner.with_common(|common| common.quit_requested);
+        if !quit_requested {
+            LinuxClient::run(&self.inner);
+        }
 
         let quit = self
             .inner
@@ -267,7 +301,11 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
     }
 
     fn quit(&self) {
-        self.inner.with_common(|common| common.signal.stop());
+        self.inner.with_common(|common| {
+            common.quit_requested = true;
+            common.signal.stop();
+            common.signal.wakeup();
+        });
     }
 
     fn compositor_name(&self) -> &'static str {
@@ -1225,7 +1263,17 @@ pub(super) fn compositor_gpu_hint_from_dev_t(dev: u64) -> Option<gpui_wgpu::Comp
 mod tests {
     #[cfg(any(feature = "wayland", feature = "x11"))]
     use super::*;
+    use super::{LinuxClient, LinuxPlatform};
+    use std::{
+        cell::{Cell, RefCell},
+        panic::{AssertUnwindSafe, catch_unwind},
+        rc::Rc,
+        sync::mpsc,
+        time::Duration,
+    };
+
     use crate::linux::HeadlessClient;
+    use gpui::{Application, QuitMode};
     #[cfg(any(feature = "wayland", feature = "x11"))]
     use gpui::{Point, px};
 
@@ -1248,9 +1296,15 @@ mod tests {
         ),);
     }
 
+    fn headless_platform() -> Rc<LinuxPlatform<HeadlessClient>> {
+        Rc::new(LinuxPlatform {
+            inner: HeadlessClient::new().unwrap(),
+        })
+    }
+
     #[test]
     fn system_wake_callback_can_reenter_client_state() {
-        let client = HeadlessClient::new();
+        let client = HeadlessClient::new().unwrap();
         let callback_client = client.clone();
         client.with_common(|common| {
             common.callbacks.system_wake = Some(Box::new(move || {
@@ -1261,6 +1315,90 @@ mod tests {
         client.handle_system_wake();
 
         assert!(client.with_common(|common| common.auto_hide_scrollbars));
+    }
+
+    #[test]
+    fn headless_run_returns_after_launch_time_quit() {
+        let platform: Rc<dyn gpui::Platform> = headless_platform();
+        let launched = Rc::new(Cell::new(false));
+
+        Application::with_platform(platform).run({
+            let launched = launched.clone();
+            move |cx| {
+                launched.set(true);
+                cx.quit();
+            }
+        });
+
+        assert!(launched.get());
+    }
+
+    #[test]
+    fn headless_background_executor_outlives_platform() {
+        let platform = headless_platform();
+        let executor = gpui::Platform::background_executor(platform.as_ref());
+        drop(platform);
+
+        let (timer_fired_tx, timer_fired_rx) = mpsc::channel();
+        let timer_executor = executor.clone();
+        executor
+            .spawn(async move {
+                timer_executor.timer(Duration::from_millis(1)).await;
+                timer_fired_tx.send(()).unwrap();
+            })
+            .detach();
+
+        timer_fired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn headless_run_wakes_for_posted_background_quit() {
+        let platform: Rc<dyn gpui::Platform> = headless_platform();
+        let join_handle = Rc::new(RefCell::new(None));
+
+        Application::with_platform(platform)
+            .with_quit_mode(QuitMode::Explicit)
+            .run({
+                let join_handle = join_handle.clone();
+                move |cx| {
+                    let poster = cx.main_thread_poster();
+                    let (run_started_tx, run_started_rx) = mpsc::channel();
+                    *join_handle.borrow_mut() = Some(std::thread::spawn(move || {
+                        run_started_rx.recv().unwrap();
+                        assert!(poster.post(|cx| cx.quit()));
+                    }));
+                    assert!(
+                        cx.main_thread_poster()
+                            .post(move |_| run_started_tx.send(()).unwrap())
+                    );
+                }
+            });
+
+        join_handle.borrow_mut().take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn headless_platform_rejects_a_second_run() {
+        let platform = headless_platform();
+        let first_run_platform = platform.clone();
+        gpui::Platform::run(
+            platform.as_ref(),
+            Box::new(move || gpui::Platform::quit(first_run_platform.as_ref())),
+        );
+
+        let second_launch_ran = Rc::new(Cell::new(false));
+        let result = catch_unwind(AssertUnwindSafe({
+            let second_launch_ran = second_launch_ran.clone();
+            move || {
+                gpui::Platform::run(
+                    platform.as_ref(),
+                    Box::new(move || second_launch_ran.set(true)),
+                );
+            }
+        }));
+
+        assert!(result.is_err());
+        assert!(!second_launch_ran.get());
     }
 
     #[cfg(feature = "wayland")]

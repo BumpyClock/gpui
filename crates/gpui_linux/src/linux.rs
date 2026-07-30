@@ -61,8 +61,21 @@ pub unsafe fn take_startup_activation_token_from_environment() -> Option<String>
 /// capture the token during single-threaded startup should call
 /// [`take_startup_activation_token_from_environment`] and pass its result to
 /// [`current_platform_with_startup_activation_token`].
+///
+/// # Panics
+///
+/// Panics when platform initialization fails. Use [`try_current_platform`] to handle the error.
 pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
-    current_platform_with_startup_activation_token(
+    try_current_platform(headless).expect("failed to initialize Linux platform")
+}
+
+/// Tries to construct the default platform implementation for the current OS.
+///
+/// # Errors
+///
+/// Returns an error when the selected backend cannot be initialized.
+pub fn try_current_platform(headless: bool) -> anyhow::Result<Rc<dyn gpui::Platform>> {
+    try_current_platform_with_startup_activation_token(
         headless,
         startup_activation_token_from_environment(),
     )
@@ -72,10 +85,29 @@ pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
 ///
 /// Passing the token explicitly lets embedders remove it at a startup boundary where process
 /// environment mutation is known to be safe. On non-Wayland backends the token is ignored.
+///
+/// # Panics
+///
+/// Panics when platform initialization fails. Use
+/// [`try_current_platform_with_startup_activation_token`] to handle the error.
 pub fn current_platform_with_startup_activation_token(
     headless: bool,
     startup_activation_token: Option<String>,
 ) -> Rc<dyn gpui::Platform> {
+    try_current_platform_with_startup_activation_token(headless, startup_activation_token)
+        .expect("failed to initialize Linux platform")
+}
+
+/// Tries to construct the default platform implementation with an explicitly captured Wayland
+/// startup token.
+///
+/// # Errors
+///
+/// Returns an error when the selected backend cannot be initialized.
+pub fn try_current_platform_with_startup_activation_token(
+    headless: bool,
+    startup_activation_token: Option<String>,
+) -> anyhow::Result<Rc<dyn gpui::Platform>> {
     #[cfg(feature = "x11")]
     use anyhow::Context as _;
 
@@ -83,29 +115,27 @@ pub fn current_platform_with_startup_activation_token(
     let _ = startup_activation_token;
 
     if headless {
-        return Rc::new(LinuxPlatform {
-            inner: HeadlessClient::new(),
-        });
+        return Ok(Rc::new(LinuxPlatform {
+            inner: HeadlessClient::new()?,
+        }));
     }
 
     match gpui::guess_compositor() {
         #[cfg(feature = "wayland")]
-        "Wayland" => Rc::new(LinuxPlatform {
-            inner: WaylandClient::new(startup_activation_token),
-        }),
+        "Wayland" => Ok(Rc::new(LinuxPlatform {
+            inner: WaylandClient::new(startup_activation_token)?,
+        })),
 
         #[cfg(feature = "x11")]
-        "X11" => Rc::new(LinuxPlatform {
-            inner: X11Client::new()
-                .context("Failed to initialize X11 client.")
-                .unwrap(),
-        }),
+        "X11" => Ok(Rc::new(LinuxPlatform {
+            inner: X11Client::new().context("failed to initialize X11 client")?,
+        })),
 
-        "Headless" => Rc::new(LinuxPlatform {
-            inner: HeadlessClient::new(),
-        }),
-        _ => unreachable!(
-            r#"At least one of the "wayland" or "x11" features must be enabled on gpui_linux or gpui_platform."#
+        "Headless" => anyhow::bail!(
+            "no graphical Linux compositor detected; pass headless=true to initialize a headless platform"
+        ),
+        _ => anyhow::bail!(
+            r#"at least one of the "wayland" or "x11" features must be enabled on gpui_linux or gpui_platform"#
         ),
     }
 }

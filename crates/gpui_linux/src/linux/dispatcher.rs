@@ -1,25 +1,318 @@
+use anyhow::Context as _;
 use calloop::{
     EventLoop, PostAction,
-    channel::{self, Sender},
-    timer::TimeoutAction,
+    channel::Event,
+    timer::{TimeoutAction, Timer},
 };
 use gpui_util::ResultExt;
+use parking_lot::{Condvar, Mutex};
 
-use std::{mem::MaybeUninit, thread, time::Duration};
+use std::{
+    mem::MaybeUninit,
+    sync::{Arc, mpsc},
+    thread,
+    time::Duration,
+};
 
 use gpui::{
     PlatformDispatcher, Priority, PriorityQueueReceiver, PriorityQueueSender, RunnableVariant,
     profiler,
 };
 
+const MAX_CHANNEL_EVENTS: usize = 1024;
+
+pub(crate) struct CalloopSender<T> {
+    sender: mpsc::Sender<T>,
+    ping: calloop::ping::Ping,
+}
+
+impl<T> Clone for CalloopSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            ping: self.ping.clone(),
+        }
+    }
+}
+
+impl<T> CalloopSender<T> {
+    pub(crate) fn send(&self, item: T) -> Result<(), mpsc::SendError<T>> {
+        self.sender.send(item).map(|()| self.ping.ping())
+    }
+}
+
+impl<T> Drop for CalloopSender<T> {
+    fn drop(&mut self) {
+        self.ping.ping();
+    }
+}
+
+pub(crate) struct CalloopReceiver<T> {
+    receiver: mpsc::Receiver<T>,
+    source: calloop::ping::PingSource,
+    ping: calloop::ping::Ping,
+}
+
+// SAFETY: A receiver can only move before it is inserted into an event loop, where it becomes
+// pinned to that loop's thread.
+unsafe impl<T: Send> Send for CalloopReceiver<T> {}
+
+pub(crate) fn try_calloop_channel<T>() -> anyhow::Result<(CalloopSender<T>, CalloopReceiver<T>)> {
+    let (ping, source) =
+        calloop::ping::make_ping().context("failed to create calloop ping source")?;
+    let (sender, receiver) = mpsc::channel();
+
+    Ok((
+        CalloopSender {
+            sender,
+            ping: ping.clone(),
+        },
+        CalloopReceiver {
+            receiver,
+            source,
+            ping,
+        },
+    ))
+}
+
+impl<T> calloop::EventSource for CalloopReceiver<T> {
+    type Event = Event<T>;
+    type Metadata = ();
+    type Ret = ();
+    type Error = ChannelError;
+
+    fn process_events<F>(
+        &mut self,
+        readiness: calloop::Readiness,
+        token: calloop::Token,
+        mut callback: F,
+    ) -> Result<calloop::PostAction, Self::Error>
+    where
+        F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
+    {
+        let mut clear_readiness = false;
+        let mut disconnected = false;
+
+        let action = self
+            .source
+            .process_events(readiness, token, |(), &mut ()| {
+                for _ in 0..MAX_CHANNEL_EVENTS {
+                    match self.receiver.try_recv() {
+                        Ok(item) => callback(Event::Msg(item), &mut ()),
+                        Err(mpsc::TryRecvError::Empty) => {
+                            clear_readiness = true;
+                            break;
+                        }
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            callback(Event::Closed, &mut ());
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(ChannelError)?;
+
+        if disconnected {
+            Ok(PostAction::Remove)
+        } else if clear_readiness {
+            Ok(action)
+        } else {
+            self.ping.ping();
+            Ok(PostAction::Continue)
+        }
+    }
+
+    fn register(
+        &mut self,
+        poll: &mut calloop::Poll,
+        token_factory: &mut calloop::TokenFactory,
+    ) -> calloop::Result<()> {
+        self.source.register(poll, token_factory)
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &mut calloop::Poll,
+        token_factory: &mut calloop::TokenFactory,
+    ) -> calloop::Result<()> {
+        self.source.reregister(poll, token_factory)
+    }
+
+    fn unregister(&mut self, poll: &mut calloop::Poll) -> calloop::Result<()> {
+        self.source.unregister(poll)
+    }
+}
+
 struct TimerAfter {
     duration: Duration,
     runnable: RunnableVariant,
 }
 
+struct TimerWorker {
+    timer_sender: CalloopSender<TimerAfter>,
+    shutdown_sender: CalloopSender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl TimerWorker {
+    fn new() -> anyhow::Result<Self> {
+        let (timer_sender, timer_receiver) =
+            try_calloop_channel().context("failed to create timer request channel")?;
+        let (shutdown_sender, shutdown_receiver) =
+            try_calloop_channel().context("failed to create timer shutdown channel")?;
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+
+        // The event loop is thread-bound, so wait until its sources are registered before
+        // reporting successful construction.
+        let thread = thread::Builder::new()
+            .name("Timer".to_owned())
+            .spawn(
+                move || match Self::initialize_event_loop(timer_receiver, shutdown_receiver) {
+                    Ok(mut event_loop) => {
+                        let _ = ready_sender.send(Ok(()));
+                        event_loop.run(None, &mut (), |_| {}).log_err();
+                    }
+                    Err(error) => {
+                        let _ = ready_sender.send(Err(error));
+                    }
+                },
+            )
+            .context("failed to spawn timer worker")?;
+
+        match ready_receiver
+            .recv()
+            .context("timer worker exited before initialization")?
+        {
+            Ok(()) => Ok(Self {
+                timer_sender,
+                shutdown_sender,
+                thread: Some(thread),
+            }),
+            Err(error) => {
+                let _ = thread.join();
+                Err(error)
+            }
+        }
+    }
+
+    fn initialize_event_loop(
+        timer_receiver: CalloopReceiver<TimerAfter>,
+        shutdown_receiver: CalloopReceiver<()>,
+    ) -> anyhow::Result<EventLoop<'static, ()>> {
+        let event_loop = EventLoop::try_new().context("failed to create timer event loop")?;
+        let handle = event_loop.handle();
+        let timer_handle = handle.clone();
+        let timer_signal = event_loop.get_signal();
+
+        handle
+            .insert_source(timer_receiver, move |event, _, _| match event {
+                Event::Msg(timer) => {
+                    let mut runnable = Some(timer.runnable);
+                    if let Err(error) = timer_handle.insert_source(
+                        Timer::from_duration(timer.duration),
+                        move |_, _, _| {
+                            if let Some(runnable) = runnable.take() {
+                                let location = runnable.metadata().location;
+                                let spawned = runnable.metadata().spawned;
+                                profiler::update_running_task(spawned, location);
+                                runnable.run();
+                                profiler::save_task_timing();
+                            }
+                            TimeoutAction::Drop
+                        },
+                    ) {
+                        let error = calloop::Error::from(error);
+                        log::error!("failed to register delayed task timer: {error}");
+                    }
+                }
+                Event::Closed => timer_signal.stop(),
+            })
+            .map_err(calloop::Error::from)
+            .context("failed to register timer request source")?;
+
+        let shutdown_signal = event_loop.get_signal();
+        handle
+            .insert_source(shutdown_receiver, move |_, _, _| shutdown_signal.stop())
+            .map_err(calloop::Error::from)
+            .context("failed to register timer shutdown source")?;
+
+        Ok(event_loop)
+    }
+
+    fn send(&self, timer: TimerAfter) -> Result<(), mpsc::SendError<TimerAfter>> {
+        self.timer_sender.send(timer)
+    }
+
+    fn stop(&self) {
+        self.shutdown_sender.send(()).ok();
+    }
+
+    fn join(&mut self) {
+        self.stop();
+        let Some(handle) = self.thread.take() else {
+            return;
+        };
+        if handle.thread().id() == thread::current().id() {
+            return;
+        }
+        if handle.join().is_err() {
+            log::error!("timer worker panicked during shutdown");
+        }
+    }
+}
+
+impl Drop for TimerWorker {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
+struct WorkerStartGate {
+    state: Mutex<WorkerStartState>,
+    changed: Condvar,
+}
+
+struct WorkerStartState {
+    released: bool,
+    cancelled: bool,
+}
+
+impl WorkerStartGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WorkerStartState {
+                released: false,
+                cancelled: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> bool {
+        let mut state = self.state.lock();
+        while !state.released && !state.cancelled {
+            self.changed.wait(&mut state);
+        }
+        state.released
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock();
+        state.released = true;
+        self.changed.notify_all();
+    }
+
+    fn cancel(&self) {
+        let mut state = self.state.lock();
+        state.cancelled = true;
+        self.changed.notify_all();
+    }
+}
+
 pub(crate) struct LinuxDispatcher {
     main_sender: PriorityQueueCalloopSender<RunnableVariant>,
-    timer_sender: Sender<TimerAfter>,
+    timer_worker: TimerWorker,
     background_sender: PriorityQueueSender<RunnableVariant>,
     _background_threads: Vec<thread::JoinHandle<()>>,
     main_thread_id: thread::ThreadId,
@@ -28,74 +321,66 @@ pub(crate) struct LinuxDispatcher {
 const MIN_THREADS: usize = 2;
 
 impl LinuxDispatcher {
-    pub fn new(main_sender: PriorityQueueCalloopSender<RunnableVariant>) -> Self {
+    pub fn new(main_sender: PriorityQueueCalloopSender<RunnableVariant>) -> anyhow::Result<Self> {
+        let timer_worker = TimerWorker::new()?;
         let (background_sender, background_receiver) = PriorityQueueReceiver::new();
         let thread_count =
             std::thread::available_parallelism().map_or(MIN_THREADS, |i| i.get().max(MIN_THREADS));
+        let start_gate = Arc::new(WorkerStartGate::new());
+        let mut background_threads = Vec::with_capacity(thread_count);
 
-        let mut background_threads = (0..thread_count)
-            .map(|i| {
-                let receiver: PriorityQueueReceiver<RunnableVariant> = background_receiver.clone();
-                std::thread::Builder::new()
-                    .name(format!("Worker-{i}"))
-                    .spawn(move || {
-                        for runnable in receiver.iter() {
-                            let location = runnable.metadata().location;
-                            let spawned = runnable.metadata().spawned;
-                            profiler::update_running_task(spawned, location);
-                            runnable.run();
-                            profiler::save_task_timing();
+        for i in 0..thread_count {
+            let receiver: PriorityQueueReceiver<RunnableVariant> = background_receiver.clone();
+            let worker_start_gate = Arc::clone(&start_gate);
+            let thread = thread::Builder::new()
+                .name(format!("Worker-{i}"))
+                .spawn(move || {
+                    if !worker_start_gate.wait() {
+                        return;
+                    }
+                    for runnable in receiver.iter() {
+                        let location = runnable.metadata().location;
+                        let spawned = runnable.metadata().spawned;
+                        profiler::update_running_task(spawned, location);
+                        runnable.run();
+                        profiler::save_task_timing();
+                    }
+                });
+
+            match thread {
+                Ok(thread) => background_threads.push(thread),
+                Err(error) => {
+                    start_gate.cancel();
+                    for thread in background_threads {
+                        if thread.join().is_err() {
+                            log::error!("background worker panicked during startup cleanup");
                         }
-                    })
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
+                    }
+                    return Err(error)
+                        .context(format!("failed to spawn Linux background worker {i}"));
+                }
+            }
+        }
 
-        let (timer_sender, timer_channel) = calloop::channel::channel::<TimerAfter>();
-        let timer_thread = std::thread::Builder::new()
-            .name("Timer".to_owned())
-            .spawn(move || {
-                let mut event_loop: EventLoop<()> =
-                    EventLoop::try_new().expect("Failed to initialize timer loop!");
+        start_gate.release();
 
-                let handle = event_loop.handle();
-                let timer_handle = event_loop.handle();
-                handle
-                    .insert_source(timer_channel, move |e, _, _| {
-                        if let channel::Event::Msg(timer) = e {
-                            let mut runnable = Some(timer.runnable);
-                            timer_handle
-                                .insert_source(
-                                    calloop::timer::Timer::from_duration(timer.duration),
-                                    move |_, _, _| {
-                                        if let Some(runnable) = runnable.take() {
-                                            let location = runnable.metadata().location;
-                                            let spawned = runnable.metadata().spawned;
-                                            profiler::update_running_task(spawned, location);
-                                            runnable.run();
-                                            profiler::save_task_timing();
-                                        }
-                                        TimeoutAction::Drop
-                                    },
-                                )
-                                .expect("Failed to start timer");
-                        }
-                    })
-                    .expect("Failed to start timer thread");
-
-                event_loop.run(None, &mut (), |_| {}).log_err();
-            })
-            .unwrap();
-
-        background_threads.push(timer_thread);
-
-        Self {
+        Ok(Self {
             main_sender,
-            timer_sender,
+            timer_worker,
             background_sender,
             _background_threads: background_threads,
             main_thread_id: thread::current().id(),
-        }
+        })
+    }
+
+    pub(crate) fn stop_timer(&self) {
+        self.timer_worker.stop();
+    }
+}
+
+impl Drop for LinuxDispatcher {
+    fn drop(&mut self) {
+        self.stop_timer();
     }
 }
 
@@ -127,7 +412,7 @@ impl PlatformDispatcher for LinuxDispatcher {
     }
 
     fn dispatch_after(&self, duration: Duration, runnable: RunnableVariant) {
-        if let Err(err) = self.timer_sender.send(TimerAfter { duration, runnable }) {
+        if let Err(err) = self.timer_worker.send(TimerAfter { duration, runnable }) {
             std::mem::forget(err);
         }
     }
@@ -187,23 +472,21 @@ pub struct PriorityQueueCalloopReceiver<T> {
 }
 
 impl<T> PriorityQueueCalloopReceiver<T> {
-    pub fn new() -> (PriorityQueueCalloopSender<T>, Self) {
-        let (ping, source) = calloop::ping::make_ping().expect("Failed to create a Ping.");
-
+    pub fn new() -> anyhow::Result<(PriorityQueueCalloopSender<T>, Self)> {
+        let (ping, source) =
+            calloop::ping::make_ping().context("failed to create calloop ping source")?;
         let (tx, rx) = PriorityQueueReceiver::new();
 
-        (
+        Ok((
             PriorityQueueCalloopSender::new(tx, ping.clone()),
             Self {
                 receiver: rx,
                 source,
                 ping,
             },
-        )
+        ))
     }
 }
-
-use calloop::channel::Event;
 
 #[derive(Debug)]
 pub struct ChannelError(calloop::ping::PingError);
@@ -309,7 +592,7 @@ mod tests {
         let mut event_loop = calloop::EventLoop::try_new().unwrap();
         let handle = event_loop.handle();
 
-        let (tx, rx) = PriorityQueueCalloopReceiver::new();
+        let (tx, rx) = PriorityQueueCalloopReceiver::new().unwrap();
 
         struct Data {
             got_msg: bool,
@@ -358,6 +641,35 @@ mod tests {
 
         assert!(data.got_msg);
         assert!(data.got_closed);
+    }
+
+    #[test]
+    fn fallible_calloop_channel_delivers_messages() {
+        let mut event_loop = EventLoop::try_new().unwrap();
+        let (sender, receiver) = try_calloop_channel().unwrap();
+        let _token = event_loop
+            .handle()
+            .insert_source(receiver, |event, _, received: &mut bool| {
+                if matches!(event, Event::Msg(())) {
+                    *received = true;
+                }
+            })
+            .unwrap();
+
+        sender.send(()).unwrap();
+        let mut received = false;
+        event_loop
+            .dispatch(Some(std::time::Duration::ZERO), &mut received)
+            .unwrap();
+
+        assert!(received);
+    }
+
+    #[test]
+    fn timer_worker_stops_after_shutdown() {
+        let mut worker = TimerWorker::new().unwrap();
+        worker.stop();
+        worker.join();
     }
 }
 

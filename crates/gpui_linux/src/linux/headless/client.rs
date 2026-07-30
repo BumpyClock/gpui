@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use anyhow::Context as _;
 use calloop::{EventLoop, LoopHandle};
 use gpui_util::ResultExt;
 
@@ -22,11 +23,10 @@ pub struct HeadlessClientState {
 pub(crate) struct HeadlessClient(Rc<RefCell<HeadlessClientState>>);
 
 impl HeadlessClient {
-    pub(crate) fn new() -> Self {
-        let event_loop = EventLoop::try_new().unwrap();
-
-        let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal());
-
+    pub(crate) fn new() -> anyhow::Result<Self> {
+        let event_loop = EventLoop::try_new().context("failed to create headless event loop")?;
+        let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal())
+            .context("failed to initialize headless platform services")?;
         let handle = event_loop.handle();
 
         handle
@@ -35,7 +35,8 @@ impl HeadlessClient {
                     runnable.run();
                 }
             })
-            .ok();
+            .map_err(calloop::Error::from)
+            .context("failed to register headless foreground task source")?;
 
         handle
             .insert_source(wake_receiver, |event, _, client: &mut HeadlessClient| {
@@ -43,14 +44,15 @@ impl HeadlessClient {
                     client.handle_system_wake();
                 }
             })
-            .ok();
+            .map_err(calloop::Error::from)
+            .context("failed to register headless wake source")?;
 
-        HeadlessClient(Rc::new(RefCell::new(HeadlessClientState {
+        Ok(HeadlessClient(Rc::new(RefCell::new(HeadlessClientState {
             event_loop: Some(event_loop),
             _loop_handle: handle,
             common,
             display: Rc::new(HeadlessDisplay::new()),
-        })))
+        }))))
     }
 }
 

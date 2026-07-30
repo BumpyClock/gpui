@@ -1,19 +1,22 @@
 use std::{
     cell::{Cell, RefCell},
     ffi::OsStr,
+    os::windows::io::AsRawHandle,
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::oneshot::{self, Receiver};
 use gpui_util::{ResultExt, get_windows_system_shell, new_std_command};
 use itertools::Itertools;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
 use windows::{
     UI::ViewManagement::UISettings,
@@ -21,13 +24,19 @@ use windows::{
         Foundation::*,
         Graphics::{Direct3D11::ID3D11Device, Gdi::*},
         Security::Credentials::*,
-        System::{Com::*, LibraryLoader::*, Ole::*, Power::*, SystemInformation::*},
+        System::{
+            Com::*, LibraryLoader::*, Ole::*, Power::*, SystemInformation::*,
+            Threading::WaitForSingleObject,
+        },
         UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
     core::*,
 };
 
-use crate::*;
+use crate::{
+    vsync_shutdown::{VSyncShutdown, VSyncShutdownAction},
+    *,
+};
 use gpui::*;
 
 pub struct WindowsPlatform {
@@ -38,12 +47,16 @@ pub struct WindowsPlatform {
     icon: HICON,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
+    run_started: Cell<bool>,
     text_system: Arc<dyn PlatformTextSystem>,
     direct_write_text_system: Option<Arc<DirectWriteTextSystem>>,
     drop_target_helper: Option<IDropTargetHelper>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     invalidate_devices: Arc<AtomicBool>,
+    vsync_thread_cancelled: Arc<VSyncCancellation>,
+    vsync_thread: RefCell<Option<JoinHandle<()>>>,
+    vsync_shutdown: Arc<Mutex<VSyncShutdown>>,
     handle: HWND,
     suspend_resume_notification: RefCell<Option<HPOWERNOTIFY>>,
     disable_direct_composition: bool,
@@ -56,6 +69,7 @@ struct WindowsPlatformInner {
     validation_number: usize,
     main_receiver: PriorityQueueReceiver<RunnableVariant>,
     dispatcher: Arc<WindowsDispatcher>,
+    vsync_shutdown: Arc<Mutex<VSyncShutdown>>,
 }
 
 pub(crate) struct WindowsPlatformState {
@@ -98,6 +112,68 @@ impl WindowsPlatformState {
     }
 }
 
+const WM_GPUI_VSYNC_THREAD_STOPPED: u32 = WM_USER + 9;
+// Existing device-loss recovery delays total 550ms. This leaves more than three times that window
+// for cancellation and COM teardown before the platform returns control to an embedding host.
+const VSYNC_THREAD_SHUTDOWN_WINDOW: Duration = Duration::from_secs(2);
+
+struct VSyncThreadShutdown {
+    shutdown: Arc<Mutex<VSyncShutdown>>,
+    platform_window: SafeHwnd,
+    validation_number: usize,
+}
+
+impl Drop for VSyncThreadShutdown {
+    fn drop(&mut self) {
+        let acknowledgement = {
+            let mut shutdown = self.shutdown.lock();
+            shutdown.worker_stopped()
+        };
+        if let Some(acknowledgement) = acknowledgement {
+            // SAFETY: this is the worker's final synchronous message. The UI loop only posts
+            // WM_QUIT after the matching acknowledgement reaches its window procedure.
+            unsafe {
+                SendMessageW(
+                    self.platform_window.as_raw(),
+                    WM_GPUI_VSYNC_THREAD_STOPPED,
+                    Some(WPARAM(self.validation_number)),
+                    Some(LPARAM(acknowledgement as isize)),
+                );
+            }
+        }
+    }
+}
+
+fn request_vsync_shutdown(
+    cancelled: &VSyncCancellation,
+    shutdown: &Mutex<VSyncShutdown>,
+) -> VSyncShutdownAction {
+    let action = shutdown.lock().request_quit();
+    if matches!(
+        action,
+        VSyncShutdownAction::CancelWorker | VSyncShutdownAction::CancelWorkerAndPostQuit
+    ) {
+        cancelled.cancel();
+    }
+    action
+}
+
+fn post_quit_for_vsync_action(action: VSyncShutdownAction) {
+    if matches!(
+        action,
+        VSyncShutdownAction::PostQuit | VSyncShutdownAction::CancelWorkerAndPostQuit
+    ) {
+        // SAFETY: callers run on the UI thread that owns the active message loop.
+        unsafe { PostQuitMessage(0) };
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum VSyncThreadJoinOutcome {
+    Completed,
+    DeadlineExceeded,
+}
+
 impl WindowsPlatform {
     pub fn new(headless: bool) -> Result<Self> {
         unsafe {
@@ -129,11 +205,15 @@ impl WindowsPlatform {
             rand::random::<u32>() as usize
         };
         let raw_window_handles = Arc::new(RwLock::new(SmallVec::new()));
+        let vsync_shutdown = Arc::new(Mutex::new(VSyncShutdown::default()));
+        let vsync_thread_cancelled =
+            Arc::new(VSyncCancellation::new().context("creating VSync cancellation")?);
 
         register_platform_window_class();
         let mut context = PlatformWindowCreateContext {
             inner: None,
             raw_window_handles: Arc::downgrade(&raw_window_handles),
+            vsync_shutdown: vsync_shutdown.clone(),
             validation_number,
             main_sender: Some(main_sender),
             main_receiver: Some(main_receiver),
@@ -193,12 +273,16 @@ impl WindowsPlatform {
             icon,
             background_executor,
             foreground_executor,
+            run_started: Cell::new(false),
             text_system,
             direct_write_text_system,
             suspend_resume_notification: RefCell::new(None),
             disable_direct_composition,
             drop_target_helper,
             invalidate_devices: Arc::new(AtomicBool::new(false)),
+            vsync_thread_cancelled,
+            vsync_thread: RefCell::new(None),
+            vsync_shutdown,
         })
     }
 
@@ -297,11 +381,25 @@ impl WindowsPlatform {
             .map(|hwnd| hwnd.as_raw())
     }
 
+    fn complete_vsync_shutdown_on_ui(&self) {
+        let action = {
+            let mut shutdown = self.vsync_shutdown.lock();
+            shutdown
+                .worker_stopped()
+                .map_or(VSyncShutdownAction::None, |acknowledgement| {
+                    shutdown.acknowledge_worker_stop(acknowledgement)
+                })
+        };
+        post_quit_for_vsync_action(action);
+    }
+
     fn begin_vsync_thread(&self) {
         let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
+            self.complete_vsync_shutdown_on_ui();
             return;
         };
         let Some(direct_write_text_system) = &self.direct_write_text_system else {
+            self.complete_vsync_shutdown_on_ui();
             return;
         };
         let mut directx_device = directx_devices;
@@ -310,13 +408,22 @@ impl WindowsPlatform {
         let all_windows = Arc::downgrade(&self.raw_window_handles);
         let text_system = Arc::downgrade(direct_write_text_system);
         let invalidate_devices = self.invalidate_devices.clone();
+        let cancelled = self.vsync_thread_cancelled.clone();
+        let shutdown = self.vsync_shutdown.clone();
 
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("VSyncProvider".to_owned())
             .spawn(move || {
-                let vsync_provider = VSyncProvider::new();
+                let _shutdown = VSyncThreadShutdown {
+                    shutdown,
+                    platform_window,
+                    validation_number,
+                };
+                let mut vsync_provider = VSyncProvider::new();
                 loop {
-                    vsync_provider.wait_for_vsync();
+                    if vsync_provider.wait_for_vsync(&cancelled) == VSyncWait::Cancelled {
+                        break;
+                    }
                     if check_device_lost(&directx_device.device)
                         || invalidate_devices.fetch_and(false, Ordering::Acquire)
                     {
@@ -326,9 +433,13 @@ impl WindowsPlatform {
                             validation_number,
                             &all_windows,
                             &text_system,
+                            &cancelled,
                         ) {
                             panic!("Device lost: {err}");
                         }
+                    }
+                    if cancelled.is_cancelled() {
+                        break;
                     }
                     let Some(all_windows) = all_windows.upgrade() else {
                         break;
@@ -339,8 +450,84 @@ impl WindowsPlatform {
                         }
                     }
                 }
-            })
-            .unwrap();
+            });
+
+        match spawn_result {
+            Ok(thread) => {
+                debug_assert!(self.vsync_thread.borrow().is_none());
+                self.vsync_thread.replace(Some(thread));
+            }
+            Err(err) => {
+                log::error!("failed to spawn VSyncProvider thread: {err}");
+                self.complete_vsync_shutdown_on_ui();
+            }
+        }
+    }
+
+    fn join_vsync_thread(&self) -> VSyncThreadJoinOutcome {
+        let Some(thread) = self.vsync_thread.borrow_mut().take() else {
+            return VSyncThreadJoinOutcome::Completed;
+        };
+
+        let thread_handle = HANDLE(thread.as_raw_handle());
+        let deadline = Instant::now() + VSYNC_THREAD_SHUTDOWN_WINDOW;
+        let mut wait_api_available = true;
+        while !thread.is_finished() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if !wait_api_available {
+                std::thread::yield_now();
+                continue;
+            }
+            let timeout_ms = u32::try_from(remaining.as_millis().max(1)).unwrap_or(u32::MAX - 1);
+            let wait_result = unsafe { WaitForSingleObject(thread_handle, timeout_ms) };
+            if wait_result == WAIT_OBJECT_0 {
+                break;
+            }
+            if wait_result == WAIT_TIMEOUT {
+                continue;
+            }
+            if wait_result == WAIT_FAILED {
+                log::error!(
+                    "waiting for VSyncProvider shutdown failed: {}",
+                    windows::core::Error::from_win32()
+                );
+            } else {
+                log::error!("unexpected VSyncProvider shutdown wait result: {wait_result:?}");
+            }
+            wait_api_available = false;
+        }
+
+        if thread.is_finished() {
+            if thread.join().is_err() {
+                log::error!("VSyncProvider thread panicked during shutdown");
+            }
+            VSyncThreadJoinOutcome::Completed
+        } else {
+            // Completed acknowledgement or direct-shutdown state suppresses every later worker
+            // message. Remaining captures are owned values or weak references, and custom HWND
+            // messages carry the platform validation token, so detaching cannot dereference
+            // borrowed Rust state.
+            log::error!(
+                "VSyncProvider did not stop within {:?}; detaching isolated worker state",
+                VSYNC_THREAD_SHUTDOWN_WINDOW
+            );
+            drop(thread);
+            VSyncThreadJoinOutcome::DeadlineExceeded
+        }
+    }
+
+    fn finish_vsync_direct_shutdown(&self) -> VSyncShutdownAction {
+        match self.join_vsync_thread() {
+            VSyncThreadJoinOutcome::Completed => {
+                self.vsync_shutdown.lock().complete_direct_shutdown()
+            }
+            VSyncThreadJoinOutcome::DeadlineExceeded => {
+                self.vsync_shutdown.lock().abandon_direct_shutdown()
+            }
+        }
     }
 }
 
@@ -400,14 +587,60 @@ impl Platform for WindowsPlatform {
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
+        assert!(
+            !self.run_started.replace(true),
+            "WindowsPlatform::run may only be called once"
+        );
+        if !self.headless {
+            self.vsync_shutdown.lock().worker_started();
+        }
         on_finish_launching();
         if !self.headless {
             self.begin_vsync_thread();
         }
 
         let mut msg = MSG::default();
-        unsafe {
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        loop {
+            // SAFETY: `msg` remains valid for the duration of this call on the UI thread.
+            let result = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+            if result.0 == -1 {
+                log::error!("GetMessageW failed: {}", windows::core::Error::from_win32());
+                let action = self.vsync_shutdown.lock().request_terminal_shutdown();
+                if action == VSyncShutdownAction::CancelWorker {
+                    self.vsync_thread_cancelled.cancel();
+                }
+                let completion = self.finish_vsync_direct_shutdown();
+                debug_assert!(
+                    action == VSyncShutdownAction::Exit || completion == VSyncShutdownAction::Exit
+                );
+                break;
+            }
+            if result.0 == 0 {
+                let action = self.vsync_shutdown.lock().should_exit_after_quit_message();
+                match action {
+                    VSyncShutdownAction::CancelWorker => {
+                        self.vsync_thread_cancelled.cancel();
+                        let completion = self.finish_vsync_direct_shutdown();
+                        debug_assert_eq!(completion, VSyncShutdownAction::Exit);
+                        break;
+                    }
+                    VSyncShutdownAction::WaitForWorker => {
+                        let completion = self.finish_vsync_direct_shutdown();
+                        debug_assert_eq!(completion, VSyncShutdownAction::Exit);
+                        break;
+                    }
+                    VSyncShutdownAction::Exit => break,
+                    VSyncShutdownAction::None => continue,
+                    VSyncShutdownAction::CancelWorkerAndPostQuit
+                    | VSyncShutdownAction::PostQuit => {
+                        debug_assert!(false, "WM_QUIT produced a queue action");
+                        continue;
+                    }
+                }
+            }
+
+            // SAFETY: `msg` was initialized by a successful `GetMessageW` call.
+            unsafe {
                 if translate_accelerator(&msg).is_none() {
                     _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -415,24 +648,22 @@ impl Platform for WindowsPlatform {
             }
         }
 
-        self.inner
-            .with_callback(|callbacks| &callbacks.quit, |callback| callback());
-
-        // Bypass the CRT exit logic, which runs atexit handlers before calling ExitProcess.
-        // aws-lc registers an atexit handler that intentionally acquires a lock without releasing it.
-        // aws-lc also has thread_local objects which acquire this lock in their destructor.
-        // Destructors for thread_locals run under the loader lock, so there is a race condition
-        // where, if a thread exits after atexit handlers have run, the TLS destructors will block
-        // indefinitely on this lock while holding the loader lock. Since ExitProcess also requires
-        // the loader lock, process teardown will deadlock.
-        unsafe {
-            windows::Win32::System::Threading::ExitProcess(0);
+        _ = self.join_vsync_thread();
+        let callback = self.inner.state.callbacks.quit.take();
+        if let Some(mut callback) = callback {
+            callback();
         }
+        resume_window_procedure_panic();
     }
 
     fn quit(&self) {
+        let cancelled = self.vsync_thread_cancelled.clone();
+        let shutdown = self.vsync_shutdown.clone();
         self.foreground_executor()
-            .spawn(async { unsafe { PostQuitMessage(0) } })
+            .spawn(async move {
+                let action = request_vsync_shutdown(&cancelled, &shutdown);
+                post_quit_for_vsync_action(action);
+            })
             .detach();
     }
 
@@ -464,6 +695,8 @@ impl Platform for WindowsPlatform {
         // can pump the Win32 message loop (via `CreateProcessW`), which
         // re-enters message handling possibly resulting in another mutable
         // borrow of the `AppCell` ending up with a double borrow panic
+        let cancelled = self.vsync_thread_cancelled.clone();
+        let shutdown = self.vsync_shutdown.clone();
         self.foreground_executor
             .spawn(async move {
                 #[allow(
@@ -476,7 +709,10 @@ impl Platform for WindowsPlatform {
                     .spawn();
 
                 match restart_process {
-                    Ok(_) => unsafe { PostQuitMessage(0) },
+                    Ok(_) => {
+                        let action = request_vsync_shutdown(&cancelled, &shutdown);
+                        post_quit_for_vsync_action(action);
+                    }
                     Err(e) => log::error!("failed to spawn restart script: {:?}", e),
                 }
             })
@@ -880,6 +1116,7 @@ impl WindowsPlatformInner {
                 .main_receiver
                 .take()
                 .context("missing main receiver")?,
+            vsync_shutdown: context.vsync_shutdown.clone(),
         }))
     }
 
@@ -908,7 +1145,8 @@ impl WindowsPlatformInner {
             | WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD
             | WM_GPUI_DOCK_MENU_ACTION
             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
-            | WM_GPUI_GPU_DEVICE_LOST => self.handle_gpui_events(msg, wparam, lparam),
+            | WM_GPUI_GPU_DEVICE_LOST
+            | WM_GPUI_VSYNC_THREAD_STOPPED => self.handle_gpui_events(msg, wparam, lparam),
             WM_POWERBROADCAST => self.handle_power_broadcast(wparam),
             _ => None,
         };
@@ -933,6 +1171,7 @@ impl WindowsPlatformInner {
             WM_GPUI_DOCK_MENU_ACTION => self.handle_dock_action_event(lparam.0 as _),
             WM_GPUI_KEYBOARD_LAYOUT_CHANGED => self.handle_keyboard_layout_change(),
             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
+            WM_GPUI_VSYNC_THREAD_STOPPED => self.handle_vsync_thread_stopped(lparam),
             _ => unreachable!(),
         }
     }
@@ -965,22 +1204,31 @@ impl WindowsPlatformInner {
                     // then quit out of foreground work to allow us to process other gpui events first before returning back to foreground task work
                     // if we don't we might not for example process window quit events
                     let mut msg = MSG::default();
-                    let process_message = |msg: &_| {
+                    let process_message = |msg: &MSG| {
+                        if msg.message == WM_QUIT {
+                            // SAFETY: preserve WM_QUIT for the outer message loop, which owns
+                            // the VSync shutdown handshake and quit callback.
+                            unsafe { PostQuitMessage(msg.wParam.0 as i32) };
+                            return false;
+                        }
                         if translate_accelerator(msg).is_none() {
                             _ = unsafe { TranslateMessage(msg) };
                             unsafe { DispatchMessageW(msg) };
                         }
+                        true
                     };
                     let peek_msg = |msg: &mut _, msg_kind| unsafe {
                         PeekMessageW(msg, None, 0, 0, PM_REMOVE | msg_kind).as_bool()
                     };
                     // We need to process a paint message here as otherwise we will re-enter `run_foreground_task` before painting if we have work remaining.
                     // The reason for this is that windows prefers custom application message processing over system messages.
-                    if peek_msg(&mut msg, PM_QS_PAINT) {
-                        process_message(&msg);
+                    if peek_msg(&mut msg, PM_QS_PAINT) && !process_message(&msg) {
+                        break 'tasks;
                     }
                     while peek_msg(&mut msg, PM_QS_INPUT) {
-                        process_message(&msg);
+                        if !process_message(&msg) {
+                            break 'tasks;
+                        }
                     }
                     // Allow the main loop to process other gpui events before going back into `run_foreground_task`
                     unsafe {
@@ -1061,6 +1309,15 @@ impl WindowsPlatformInner {
 
         Some(0)
     }
+
+    fn handle_vsync_thread_stopped(&self, acknowledgement: LPARAM) -> Option<isize> {
+        let action = self
+            .vsync_shutdown
+            .lock()
+            .acknowledge_worker_stop(acknowledgement.0 as usize);
+        post_quit_for_vsync_action(action);
+        Some(0)
+    }
 }
 
 fn is_system_wake_event(wparam: usize) -> bool {
@@ -1101,6 +1358,7 @@ pub(crate) struct WindowCreationInfo {
 struct PlatformWindowCreateContext {
     inner: Option<Result<Rc<WindowsPlatformInner>>>,
     raw_window_handles: std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    vsync_shutdown: Arc<Mutex<VSyncShutdown>>,
     validation_number: usize,
     main_sender: Option<PriorityQueueSender<RunnableVariant>>,
     main_receiver: Option<PriorityQueueReceiver<RunnableVariant>>,
@@ -1308,14 +1566,20 @@ fn handle_gpu_device_lost(
     validation_number: usize,
     all_windows: &std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
     text_system: &std::sync::Weak<DirectWriteTextSystem>,
+    cancelled: &VSyncCancellation,
 ) -> Result<()> {
     // Here we wait a bit to ensure the system has time to recover from the device lost state.
     // If we don't wait, the final drawing result will be blank.
-    std::thread::sleep(std::time::Duration::from_millis(350));
+    if cancelled.wait_for(Duration::from_millis(350)) == VSyncWait::Cancelled {
+        return Ok(());
+    }
 
     *directx_devices = try_to_recover_from_device_lost(|| {
         DirectXDevices::new().context("Failed to recreate new DirectX devices after device lost")
     })?;
+    if cancelled.is_cancelled() {
+        return Ok(());
+    }
     log::info!("DirectX devices successfully recreated.");
 
     let lparam = LPARAM(directx_devices as *const _ as _);
@@ -1331,8 +1595,14 @@ fn handle_gpu_device_lost(
     if let Some(text_system) = text_system.upgrade() {
         text_system.handle_gpu_lost(&directx_devices)?;
     }
+    if cancelled.is_cancelled() {
+        return Ok(());
+    }
     if let Some(all_windows) = all_windows.upgrade() {
         for window in all_windows.read().iter() {
+            if cancelled.is_cancelled() {
+                return Ok(());
+            }
             unsafe {
                 SendMessageW(
                     window.as_raw(),
@@ -1342,8 +1612,13 @@ fn handle_gpu_device_lost(
                 );
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        if cancelled.wait_for(Duration::from_millis(200)) == VSyncWait::Cancelled {
+            return Ok(());
+        }
         for window in all_windows.read().iter() {
+            if cancelled.is_cancelled() {
+                return Ok(());
+            }
             unsafe {
                 SendMessageW(
                     window.as_raw(),
@@ -1358,6 +1633,27 @@ fn handle_gpu_device_lost(
 }
 
 const PLATFORM_WINDOW_CLASS_NAME: PCWSTR = w!("Zed::PlatformWindow");
+pub(crate) type PanicPayload = Box<dyn std::any::Any + Send + 'static>;
+
+std::thread_local! {
+    static WINDOW_PROCEDURE_PANIC: RefCell<Option<PanicPayload>> = const { RefCell::new(None) };
+}
+
+fn record_window_procedure_panic(panic: PanicPayload) {
+    WINDOW_PROCEDURE_PANIC.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        if pending.is_none() {
+            *pending = Some(panic);
+        }
+    });
+}
+
+fn resume_window_procedure_panic() {
+    let panic = WINDOW_PROCEDURE_PANIC.with(|pending| pending.borrow_mut().take());
+    if let Some(panic) = panic {
+        std::panic::resume_unwind(panic);
+    }
+}
 
 fn register_platform_window_class() {
     let wc = WNDCLASSW {
@@ -1368,12 +1664,32 @@ fn register_platform_window_class() {
     unsafe { RegisterClassW(&wc) };
 }
 
-unsafe extern "system" fn window_procedure(
+extern "system" fn window_procedure(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        window_procedure_inner(hwnd, msg, wparam, lparam)
+    })) {
+        Ok(result) => result,
+        Err(panic) => window_procedure_panic(msg, panic),
+    }
+}
+
+pub(crate) fn window_procedure_panic(msg: u32, panic: PanicPayload) -> LRESULT {
+    record_window_procedure_panic(panic);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        log::error!("panic while handling Windows message {msg}");
+    }));
+    // SAFETY: the window procedure runs on the UI thread that owns the message queue. The outer
+    // message loop performs the VSync shutdown handshake before invoking the quit callback.
+    unsafe { PostQuitMessage(0) };
+    LRESULT(0)
+}
+
+fn window_procedure_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         let params = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
         let creation_context = params.lpCreateParams as *mut PlatformWindowCreateContext;
@@ -1409,14 +1725,10 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
-        if cfg!(debug_assertions) {
-            let inner = std::panic::AssertUnwindSafe(inner);
-            match std::panic::catch_unwind(|| { inner }.handle_msg(hwnd, msg, wparam, lparam)) {
-                Ok(result) => result,
-                Err(_) => std::process::abort(),
-            }
-        } else {
-            inner.handle_msg(hwnd, msg, wparam, lparam)
+        let inner = std::panic::AssertUnwindSafe(inner);
+        match std::panic::catch_unwind(|| { inner }.handle_msg(hwnd, msg, wparam, lparam)) {
+            Ok(result) => result,
+            Err(panic) => window_procedure_panic(msg, panic),
         }
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -1432,10 +1744,22 @@ unsafe extern "system" fn window_procedure(
 
 #[cfg(test)]
 mod tests {
-    use super::is_system_wake_event;
+    use super::{
+        is_system_wake_event, record_window_procedure_panic, resume_window_procedure_panic,
+    };
     use crate::{read_from_clipboard, write_to_clipboard};
     use gpui::ClipboardItem;
     use windows::Win32::UI::WindowsAndMessaging::{PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND};
+
+    #[test]
+    fn window_procedure_panic_is_resumed_after_cleanup() {
+        record_window_procedure_panic(Box::new("first panic"));
+        record_window_procedure_panic(Box::new("second panic"));
+
+        let panic = std::panic::catch_unwind(resume_window_procedure_panic).unwrap_err();
+
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"first panic"));
+    }
 
     #[test]
     fn only_automatic_resume_is_a_system_wake_event() {

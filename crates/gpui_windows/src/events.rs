@@ -39,6 +39,12 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        if matches!(msg, WM_GPUI_FORCE_UPDATE_WINDOW | WM_GPUI_GPU_DEVICE_LOST)
+            && wparam.0 != self.validation_number
+        {
+            return unsafe { DefWindowProcW(handle, msg, wparam, lparam) };
+        }
+
         let handled = match msg {
             // eagerly activate the window, so calls to `active_window` will work correctly
             WM_MOUSEACTIVATE => {

@@ -16,6 +16,7 @@ mod retained_compositor;
 mod system_settings;
 mod util;
 mod vsync;
+mod vsync_shutdown;
 mod window;
 mod wrapper;
 

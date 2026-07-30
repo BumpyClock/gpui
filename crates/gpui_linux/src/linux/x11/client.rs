@@ -306,9 +306,9 @@ pub(crate) struct X11Client(Rc<RefCell<X11ClientState>>);
 
 impl X11Client {
     pub(crate) fn new() -> anyhow::Result<Self> {
-        let event_loop = EventLoop::try_new()?;
-
-        let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal());
+        let event_loop = EventLoop::try_new().context("failed to create X11 event loop")?;
+        let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal())
+            .context("failed to initialize X11 platform services")?;
 
         let handle = event_loop.handle();
 
@@ -365,9 +365,9 @@ impl X11Client {
             xinput_version.minor_version,
             supports_xinput_gestures,
         );
-        assert!(
+        anyhow::ensure!(
             xinput_version.major_version >= 2,
-            "XInput version >= 2 required."
+            "XInput version 2 or later is required"
         );
 
         let pointer_device_states =
@@ -394,7 +394,7 @@ impl X11Client {
             xcb_connection
                 .xkb_use_extension(XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSION),
         )?;
-        assert!(xkb.supported);
+        anyhow::ensure!(xkb.supported, "XKB extension is required");
 
         let events = xkb::EventType::STATE_NOTIFY
             | xkb::EventType::MAP_NOTIFY
@@ -481,8 +481,10 @@ impl X11Client {
             )
             .map_err(|err| anyhow!("Failed to initialize X11 event source: {err:?}"))?;
 
+        let (xdp_event_source, xdp_event_source_starter) =
+            XDPEventSource::new().context("failed to create XDG desktop portal source")?;
         handle
-            .insert_source(XDPEventSource::new(&common.background_executor), {
+            .insert_source(xdp_event_source, {
                 move |event, _, client| match event {
                     XDPEvent::WindowAppearance(appearance) => {
                         client.with_common(|common| common.appearance = appearance);
@@ -497,9 +499,10 @@ impl X11Client {
             })
             .map_err(|err| anyhow!("Failed to initialize XDP event source: {err:?}"))?;
 
+        let background_executor = common.background_executor.clone();
         xcb_flush(&xcb_connection);
 
-        Ok(X11Client(Rc::new(RefCell::new(X11ClientState {
+        let client = X11Client(Rc::new(RefCell::new(X11ClientState {
             modifiers: Modifiers::default(),
             capslock: Capslock::default(),
             last_modifiers_changed_event: Modifiers::default(),
@@ -548,7 +551,9 @@ impl X11Client {
             clipboard,
             clipboard_item: None,
             xdnd_state: Xdnd::default(),
-        }))))
+        })));
+        xdp_event_source_starter.start(&background_executor);
+        Ok(client)
     }
 
     pub fn process_x11_events(
