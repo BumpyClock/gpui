@@ -23,6 +23,13 @@ pub struct CompositorGpuHint {
 }
 
 #[cfg(not(target_family = "wasm"))]
+// Recovery must preserve startup eligibility. Explicit software selection remains constrained to
+// Vulkan CPU adapters by `accepts_adapter`; default selection may still use CPU as a fallback.
+fn recovery_rejects_software(_selection: RendererSelection) -> bool {
+    false
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn accepts_adapter(
     selection: RendererSelection,
     reject_software: bool,
@@ -90,7 +97,7 @@ impl WgpuContext {
             Some(surface),
             compositor_gpu,
             renderer_selection,
-            !renderer_selection.requires_software_adapter(),
+            recovery_rejects_software(renderer_selection),
         )
     }
 
@@ -531,7 +538,7 @@ fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use super::{accepts_adapter, parse_pci_id};
+    use super::{accepts_adapter, parse_pci_id, recovery_rejects_software};
     use gpui::RendererSelection;
 
     #[test]
@@ -563,6 +570,23 @@ mod tests {
         assert!(!accepts_adapter(
             RendererSelection::Default,
             true,
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::Cpu,
+        ));
+    }
+
+    #[test]
+    fn default_recovery_preserves_initial_cpu_fallback_policy() {
+        let selection = RendererSelection::Default;
+        assert!(accepts_adapter(
+            selection,
+            false,
+            wgpu::Backend::Vulkan,
+            wgpu::DeviceType::Cpu,
+        ));
+        assert!(accepts_adapter(
+            selection,
+            recovery_rejects_software(selection),
             wgpu::Backend::Vulkan,
             wgpu::DeviceType::Cpu,
         ));
