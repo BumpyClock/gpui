@@ -26,4 +26,6 @@ runs:
           libxcb-cursor-dev \
           libxcb-sync-dev \
           libxcb-render0-dev \
-          libxcb-present-dev
+          libxcb-present-dev \
+          xauth \
+          xvfb

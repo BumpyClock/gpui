@@ -102,6 +102,13 @@ jobs:
         uses: ./.github/actions/install-linux-dependencies
       - run: cargo check --locked -p gpui_platform --no-default-features --features "$BACKEND" --all-targets
       - run: cargo test --locked -p gpui_linux --no-default-features --features "$BACKEND,test-support" --lib
+      - name: Test X11 buffered events after checked requests
+        if: matrix.backend == 'x11'
+        run: >-
+          xvfb-run -a cargo test --locked -p gpui_linux --no-default-features
+          --features x11,test-support --lib
+          linux::x11::client::tests::checked_map_request_leaves_buffered_event_drainable_without_fd_readiness
+          -- --ignored --exact
 
   wasm:
     name: WebAssembly
