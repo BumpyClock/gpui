@@ -176,7 +176,7 @@ impl Platform for WebPlatform {
         self.text_system.clone()
     }
 
-    fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
+    fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) -> anyhow::Result<()> {
         let wgpu_context = self.wgpu_context.clone();
         wasm_bindgen_futures::spawn_local(async move {
             match WgpuContext::new_web().await {
@@ -191,6 +191,7 @@ impl Platform for WebPlatform {
                 }
             }
         });
+        Ok(())
     }
 
     fn quit(&self) {

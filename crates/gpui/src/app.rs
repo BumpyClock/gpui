@@ -232,6 +232,12 @@ impl Application {
     /// restart waits for the current process to exit before relaunching. Web platforms
     /// return after scheduling launch because the browser owns their event loop; this method
     /// retains the application on the browser main thread until shutdown completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics after platform teardown if a terminal native event-loop failure occurs. This keeps
+    /// the established infallible API while ensuring the process cannot report a failed run as
+    /// successful.
     pub fn run<F>(self, on_finish_launching: F)
     where
         F: 'static + FnOnce(&mut App),
@@ -250,23 +256,27 @@ impl Application {
 
             let this = Rc::downgrade(&app);
             let platform = app.borrow().platform.clone();
-            platform.run(Box::new(move || {
+            if let Err(error) = platform.run(Box::new(move || {
                 let Some(this) = this.upgrade() else {
                     return;
                 };
                 let cx = &mut *this.borrow_mut();
                 on_finish_launching(cx);
-            }));
+            })) {
+                panic!("platform event loop failed: {error:#}");
+            }
         }
 
         #[cfg(not(target_family = "wasm"))]
         {
             let this = self.0.clone();
             let platform = self.0.borrow().platform.clone();
-            platform.run(Box::new(move || {
+            if let Err(error) = platform.run(Box::new(move || {
                 let cx = &mut *this.borrow_mut();
                 on_finish_launching(cx);
-            }));
+            })) {
+                panic!("platform event loop failed: {error:#}");
+            }
         }
     }
 
@@ -283,13 +293,15 @@ impl Application {
     {
         let this = Rc::downgrade(&self.0);
         let platform = self.0.borrow().platform.clone();
-        platform.run(Box::new(move || {
+        if let Err(error) = platform.run(Box::new(move || {
             let Some(this) = this.upgrade() else {
                 return;
             };
             let cx = &mut *this.borrow_mut();
             on_finish_launching(cx);
-        }));
+        })) {
+            panic!("platform event loop failed: {error:#}");
+        }
         ApplicationHandle { app: self.0 }
     }
 
@@ -3198,7 +3210,7 @@ mod test {
     #[test]
     fn test_platform_rejects_a_second_run_before_launch() {
         let (_, platform) = test_application();
-        crate::Platform::run(platform.as_ref(), Box::new(|| {}));
+        crate::Platform::run(platform.as_ref(), Box::new(|| {})).unwrap();
         let second_launch_ran = Rc::new(Cell::new(false));
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
@@ -3207,7 +3219,8 @@ mod test {
                 crate::Platform::run(
                     platform.as_ref(),
                     Box::new(move || second_launch_ran.set(true)),
-                );
+                )
+                .unwrap();
             }
         }));
 

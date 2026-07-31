@@ -356,14 +356,14 @@ impl Platform for TestPlatform {
         ThermalState::Nominal
     }
 
-    fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+    fn run(&self, on_finish_launching: Box<dyn FnOnce()>) -> anyhow::Result<()> {
         assert!(
             !self.run_started.replace(true),
             "TestPlatform::run may only be called once"
         );
         if self.deferred_launch.replace(false) {
             *self.launch_callback.borrow_mut() = Some(on_finish_launching);
-            return;
+            return Ok(());
         }
         self.quit_requested.set(false);
         let (quit_sender, quit_receiver) = oneshot::channel();
@@ -372,7 +372,7 @@ impl Platform for TestPlatform {
 
         if !self.blocking_run.get() {
             self.quit_sender.borrow_mut().take();
-            return;
+            return Ok(());
         }
 
         self.foreground_executor
@@ -383,6 +383,7 @@ impl Platform for TestPlatform {
         if let Some(mut callback) = callback {
             callback();
         }
+        Ok(())
     }
 
     fn quit(&self) {

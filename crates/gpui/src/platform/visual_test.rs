@@ -77,7 +77,7 @@ impl Platform for VisualTestPlatform {
         self.platform.text_system()
     }
 
-    fn run(&self, _on_finish_launching: Box<dyn 'static + FnOnce()>) {
+    fn run(&self, _on_finish_launching: Box<dyn 'static + FnOnce()>) -> anyhow::Result<()> {
         panic!("VisualTestPlatform::run should not be called in tests")
     }
 

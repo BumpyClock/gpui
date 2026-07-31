@@ -140,6 +140,95 @@ impl From<xim::ClientError> for EventHandlerError {
     }
 }
 
+struct X11EventBatch {
+    events: Vec<Event>,
+    windows_to_refresh: HashSet<xproto::Window>,
+}
+
+fn poll_x11_event_batch(
+    xcb_connection: &XCBConnection,
+) -> Result<X11EventBatch, EventHandlerError> {
+    let mut events = Vec::new();
+    let mut windows_to_refresh = HashSet::new();
+    let mut last_key_release = None;
+
+    // Event handlers for keyboard/remapping changes refresh state without using event details,
+    // so only the last consecutive change needs delivery.
+    let mut last_keymap_change_event: Option<Event> = None;
+
+    loop {
+        match xcb_connection.poll_for_event() {
+            Ok(Some(event)) => match event {
+                Event::Expose(expose_event) => {
+                    windows_to_refresh.insert(expose_event.window);
+                }
+                Event::KeyRelease(_) => {
+                    if let Some(last_keymap_change_event) = last_keymap_change_event.take() {
+                        if let Some(last_key_release) = last_key_release.take() {
+                            events.push(last_key_release);
+                        }
+                        events.push(last_keymap_change_event);
+                    }
+
+                    last_key_release = Some(event);
+                }
+                Event::KeyPress(key_press) => {
+                    if let Some(last_keymap_change_event) = last_keymap_change_event.take() {
+                        if let Some(last_key_release) = last_key_release.take() {
+                            events.push(last_key_release);
+                        }
+                        events.push(last_keymap_change_event);
+                    }
+
+                    if let Some(Event::KeyRelease(key_release)) = last_key_release.take() {
+                        // Ignore a near-immediate matching release before a key press; X11 emits
+                        // this pair for key repeat.
+                        if key_release.detail != key_press.detail
+                            || key_press.time.saturating_sub(key_release.time) > 20
+                        {
+                            events.push(Event::KeyRelease(key_release));
+                        }
+                    }
+                    events.push(Event::KeyPress(key_press));
+                }
+                Event::XkbNewKeyboardNotify(_) | Event::XkbMapNotify(_) => {
+                    if let Some(release_event) = last_key_release.take() {
+                        events.push(release_event);
+                    }
+                    last_keymap_change_event = Some(event);
+                }
+                _ => {
+                    if let Some(release_event) = last_key_release.take() {
+                        events.push(release_event);
+                    }
+                    events.push(event);
+                }
+            },
+            Ok(None) => break,
+            Err(err @ ConnectionError::IoError(..)) => {
+                return Err(EventHandlerError::from(err));
+            }
+            Err(err) => {
+                let err = handle_connection_error(err);
+                log::warn!("error while polling for X11 events: {err:?}");
+                break;
+            }
+        }
+    }
+
+    if let Some(release_event) = last_key_release {
+        events.push(release_event);
+    }
+    if let Some(keymap_change_event) = last_keymap_change_event {
+        events.push(keymap_change_event);
+    }
+
+    Ok(X11EventBatch {
+        events,
+        windows_to_refresh,
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct Xdnd {
     other_window: xproto::Window,
@@ -561,91 +650,10 @@ impl X11Client {
         xcb_connection: &XCBConnection,
     ) -> Result<(), EventHandlerError> {
         loop {
-            let mut events = Vec::new();
-            let mut windows_to_refresh = HashSet::new();
-
-            let mut last_key_release = None;
-
-            // event handlers for new keyboard / remapping refresh the state without using event
-            // details, this deduplicates them.
-            let mut last_keymap_change_event: Option<Event> = None;
-
-            loop {
-                match xcb_connection.poll_for_event() {
-                    Ok(Some(event)) => {
-                        match event {
-                            Event::Expose(expose_event) => {
-                                windows_to_refresh.insert(expose_event.window);
-                            }
-                            Event::KeyRelease(_) => {
-                                if let Some(last_keymap_change_event) =
-                                    last_keymap_change_event.take()
-                                {
-                                    if let Some(last_key_release) = last_key_release.take() {
-                                        events.push(last_key_release);
-                                    }
-                                    events.push(last_keymap_change_event);
-                                }
-
-                                last_key_release = Some(event);
-                            }
-                            Event::KeyPress(key_press) => {
-                                if let Some(last_keymap_change_event) =
-                                    last_keymap_change_event.take()
-                                {
-                                    if let Some(last_key_release) = last_key_release.take() {
-                                        events.push(last_key_release);
-                                    }
-                                    events.push(last_keymap_change_event);
-                                }
-
-                                if let Some(Event::KeyRelease(key_release)) =
-                                    last_key_release.take()
-                                {
-                                    // We ignore that last KeyRelease if it's too close to this KeyPress,
-                                    // suggesting that it's auto-generated by X11 as a key-repeat event.
-                                    if key_release.detail != key_press.detail
-                                        || key_press.time.saturating_sub(key_release.time) > 20
-                                    {
-                                        events.push(Event::KeyRelease(key_release));
-                                    }
-                                }
-                                events.push(Event::KeyPress(key_press));
-                            }
-                            Event::XkbNewKeyboardNotify(_) | Event::XkbMapNotify(_) => {
-                                if let Some(release_event) = last_key_release.take() {
-                                    events.push(release_event);
-                                }
-                                last_keymap_change_event = Some(event);
-                            }
-                            _ => {
-                                if let Some(release_event) = last_key_release.take() {
-                                    events.push(release_event);
-                                }
-                                events.push(event);
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        break;
-                    }
-                    Err(err @ ConnectionError::IoError(..)) => {
-                        return Err(EventHandlerError::from(err));
-                    }
-                    Err(err) => {
-                        let err = handle_connection_error(err);
-                        log::warn!("error while polling for X11 events: {err:?}");
-                        break;
-                    }
-                }
-            }
-
-            if let Some(release_event) = last_key_release.take() {
-                events.push(release_event);
-            }
-            if let Some(keymap_change_event) = last_keymap_change_event.take() {
-                events.push(keymap_change_event);
-            }
+            let X11EventBatch {
+                events,
+                windows_to_refresh,
+            } = poll_x11_event_batch(xcb_connection)?;
 
             if events.is_empty() && windows_to_refresh.is_empty() {
                 break;
@@ -1781,7 +1789,7 @@ impl LinuxClient for X11Client {
             .log_with_level(log::Level::Debug)
     }
 
-    fn run(&self) {
+    fn run(&self) -> anyhow::Result<()> {
         let Some(mut event_loop) = self
             .0
             .borrow_mut()
@@ -1790,7 +1798,7 @@ impl LinuxClient for X11Client {
             .context("X11Client::run called but it's already running")
             .log_err()
         else {
-            return;
+            return Ok(());
         };
 
         // Checked XCB requests can buffer events while reading replies, leaving the
@@ -1803,7 +1811,8 @@ impl LinuxClient for X11Client {
                 let xcb_connection = client.0.borrow().xcb_connection.clone();
                 client.process_x11_events(&xcb_connection).log_err();
             })
-            .log_err();
+            .context("X11 event loop failed")?;
+        Ok(())
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
@@ -2850,6 +2859,65 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd as _;
+    use x11rb::protocol::xproto::{CreateWindowAux, WindowClass};
+
+    #[test]
+    #[ignore = "requires an X11 server; CI runs this under xvfb-run"]
+    fn checked_map_request_leaves_buffered_event_drainable_without_fd_readiness() {
+        let (connection, screen_index) =
+            XCBConnection::connect(None).expect("connect to the test X11 server");
+        let screen = &connection.setup().roots[screen_index];
+        let window = connection.generate_id().expect("allocate X11 window id");
+        connection
+            .create_window(
+                screen.root_depth,
+                window,
+                screen.root,
+                0,
+                0,
+                64,
+                64,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+            )
+            .expect("send create-window request")
+            .check()
+            .expect("create test X11 window");
+
+        // The checked request waits for a later reply. X11 orders MapNotify before that reply,
+        // so x11rb buffers the event while satisfying `check` and consumes socket readiness.
+        connection
+            .map_window(window)
+            .expect("send checked map request")
+            .check()
+            .expect("map test X11 window");
+        let mut poll_fd = libc::pollfd {
+            fd: connection.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll_fd` points to one initialized descriptor for this nonblocking poll.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+        assert_eq!(ready, 0, "X11 fd unexpectedly remained readable");
+
+        let batch = poll_x11_event_batch(&connection).expect("drain buffered X11 events");
+        assert!(
+            batch
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::MapNotify(event) if event.window == window))
+        );
+        assert!(batch.windows_to_refresh.is_empty());
+
+        connection
+            .destroy_window(window)
+            .expect("send destroy-window request")
+            .check()
+            .expect("destroy test X11 window");
+    }
 
     #[test]
     fn cursor_is_visible_unless_hidden_window_is_focused_window() {

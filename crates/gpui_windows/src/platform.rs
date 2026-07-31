@@ -586,7 +586,7 @@ impl Platform for WindowsPlatform {
         ThermalState::Nominal
     }
 
-    fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
+    fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) -> Result<()> {
         assert!(
             !self.run_started.replace(true),
             "WindowsPlatform::run may only be called once"
@@ -600,11 +600,14 @@ impl Platform for WindowsPlatform {
         }
 
         let mut msg = MSG::default();
+        let mut terminal_error = None;
         loop {
             // SAFETY: `msg` remains valid for the duration of this call on the UI thread.
             let result = unsafe { GetMessageW(&mut msg, None, 0, 0) };
             if result.0 == -1 {
-                log::error!("GetMessageW failed: {}", windows::core::Error::from_win32());
+                let error = windows::core::Error::from_win32();
+                log::error!("GetMessageW failed: {error}");
+                terminal_error = Some(anyhow::Error::new(error).context("GetMessageW failed"));
                 let action = self.vsync_shutdown.lock().request_terminal_shutdown();
                 if action == VSyncShutdownAction::CancelWorker {
                     self.vsync_thread_cancelled.cancel();
@@ -654,6 +657,10 @@ impl Platform for WindowsPlatform {
             callback();
         }
         resume_window_procedure_panic();
+        match terminal_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn quit(&self) {

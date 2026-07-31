@@ -1181,7 +1181,7 @@ impl LinuxClient for WaylandClient {
         f(&mut self.0.borrow_mut().common)
     }
 
-    fn run(&self) {
+    fn run(&self) -> anyhow::Result<()> {
         let mut event_loop = self
             .0
             .borrow_mut()
@@ -1195,7 +1195,8 @@ impl LinuxClient for WaylandClient {
                 &mut WaylandClientStatePtr(Rc::downgrade(&self.0)),
                 |_| {},
             )
-            .log_err();
+            .context("Wayland event loop failed")?;
+        Ok(())
     }
 
     fn write_to_primary(&self, item: gpui::ClipboardItem) {

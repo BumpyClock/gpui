@@ -89,7 +89,7 @@ pub(crate) trait LinuxClient {
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn active_window(&self) -> Option<AnyWindowHandle>;
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>>;
-    fn run(&self);
+    fn run(&self) -> anyhow::Result<()>;
 
     fn handle_system_wake(&self) {
         let Some(mut callback) = self.with_common(|common| common.callbacks.system_wake.take())
@@ -126,6 +126,23 @@ pub(crate) struct PlatformHandlers {
     pub(crate) system_wake: Option<Box<dyn FnMut()>>,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct EventLoopTestHooks {
+    terminal_failure: Option<anyhow::Error>,
+}
+
+#[cfg(test)]
+impl EventLoopTestHooks {
+    pub(crate) fn fail_with(&mut self, error: anyhow::Error) {
+        self.terminal_failure = Some(error);
+    }
+
+    pub(crate) fn take_failure(&mut self) -> Option<anyhow::Error> {
+        self.terminal_failure.take()
+    }
+}
+
 pub(crate) struct LinuxCommon {
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
@@ -144,6 +161,8 @@ pub(crate) struct LinuxCommon {
     wake_sender: CalloopSender<()>,
     wake_listener_started: bool,
     wake_listener_abort: Option<AbortHandle>,
+    #[cfg(test)]
+    pub(crate) event_loop_test_hooks: EventLoopTestHooks,
 }
 
 impl LinuxCommon {
@@ -185,6 +204,8 @@ impl LinuxCommon {
             wake_sender,
             wake_listener_started: false,
             wake_listener_abort: None,
+            #[cfg(test)]
+            event_loop_test_hooks: EventLoopTestHooks::default(),
         };
 
         Ok((common, main_receiver, wake_receiver))
@@ -279,7 +300,7 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         ThermalState::Nominal
     }
 
-    fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+    fn run(&self, on_finish_launching: Box<dyn FnOnce()>) -> anyhow::Result<()> {
         let run_started = self
             .inner
             .with_common(|common| std::mem::replace(&mut common.run_started, true));
@@ -288,9 +309,11 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         on_finish_launching();
 
         let quit_requested = self.inner.with_common(|common| common.quit_requested);
-        if !quit_requested {
-            LinuxClient::run(&self.inner);
-        }
+        let run_result = if quit_requested {
+            Ok(())
+        } else {
+            LinuxClient::run(&self.inner)
+        };
 
         let quit = self
             .inner
@@ -298,6 +321,7 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         if let Some(mut fun) = quit {
             fun();
         }
+        run_result
     }
 
     fn quit(&self) {
@@ -1334,6 +1358,52 @@ mod tests {
     }
 
     #[test]
+    fn terminal_event_loop_failure_returns_error_after_cleanup() {
+        let platform = headless_platform();
+        let cleanup_called = Rc::new(Cell::new(false));
+        platform.inner.with_common({
+            let cleanup_called = cleanup_called.clone();
+            move |common| {
+                common
+                    .event_loop_test_hooks
+                    .fail_with(anyhow!("injected terminal event-loop failure"));
+                common.callbacks.quit = Some(Box::new(move || cleanup_called.set(true)));
+            }
+        });
+
+        let result = gpui::Platform::run(platform.as_ref(), Box::new(|| {}));
+
+        assert_eq!(
+            format!("{:#}", result.unwrap_err()),
+            "injected terminal event-loop failure"
+        );
+        assert!(cleanup_called.get());
+    }
+
+    #[test]
+    fn application_run_panics_on_terminal_event_loop_failure() {
+        let platform = headless_platform();
+        platform.inner.with_common(|common| {
+            common
+                .event_loop_test_hooks
+                .fail_with(anyhow!("injected terminal event-loop failure"));
+        });
+        let platform: Rc<dyn gpui::Platform> = platform;
+
+        let result = catch_unwind(AssertUnwindSafe(move || {
+            Application::with_platform(platform).run(|_| {});
+        }));
+
+        let panic = result.expect_err("terminal event-loop failure must not return successfully");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        assert!(message.contains("injected terminal event-loop failure"));
+    }
+
+    #[test]
     fn headless_background_executor_outlives_platform() {
         let platform = headless_platform();
         let executor = gpui::Platform::background_executor(platform.as_ref());
@@ -1384,7 +1454,8 @@ mod tests {
         gpui::Platform::run(
             platform.as_ref(),
             Box::new(move || gpui::Platform::quit(first_run_platform.as_ref())),
-        );
+        )
+        .unwrap();
 
         let second_launch_ran = Rc::new(Cell::new(false));
         let result = catch_unwind(AssertUnwindSafe({
@@ -1393,7 +1464,8 @@ mod tests {
                 gpui::Platform::run(
                     platform.as_ref(),
                     Box::new(move || second_launch_ran.set(true)),
-                );
+                )
+                .unwrap();
             }
         }));
 

@@ -293,18 +293,23 @@ unsafe fn register_notification_observer(
         let token = token.clone();
         DispatchQueue::main().exec_async(move || invoke_notification_callback(token, kind));
     });
-    let observer: id = msg_send![center,
-        addObserverForName: name
-        object: object
-        queue: nil
-        usingBlock: &*block
-    ];
-    if center != nil {
-        let _: id = msg_send![center, retain];
-    }
-    if observer != nil {
-        let _: id = msg_send![observer, retain];
-    }
+    // SAFETY: the caller supplies valid Objective-C notification objects, and each non-null
+    // object retained here is balanced by `MacObserverToken::drop`.
+    let observer: id = unsafe {
+        let observer: id = msg_send![center,
+            addObserverForName: name
+            object: object
+            queue: nil
+            usingBlock: &*block
+        ];
+        if center != nil {
+            let _: id = msg_send![center, retain];
+        }
+        if observer != nil {
+            let _: id = msg_send![observer, retain];
+        }
+        observer
+    };
     MacObserverToken { center, observer }
 }
 
@@ -670,7 +675,7 @@ impl Platform for MacPlatform {
         self.0.lock().text_system.clone()
     }
 
-    fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
+    fn run(&self, on_finish_launching: Box<dyn FnOnce()>) -> anyhow::Result<()> {
         let mut state = self.0.lock();
         assert!(
             !state.run_started,
@@ -693,7 +698,7 @@ impl Platform for MacPlatform {
             };
             if quit_requested {
                 invoke_quit_callback(callback);
-                return;
+                return Ok(());
             }
 
             // SAFETY: GPUI owns and drives the main CF run loop until it is stopped.
@@ -706,7 +711,7 @@ impl Platform for MacPlatform {
                 state.quit.take()
             };
             invoke_quit_callback(callback);
-            return;
+            return Ok(());
         }
 
         state.finish_launching = Some(on_finish_launching);
@@ -762,6 +767,7 @@ impl Platform for MacPlatform {
             let _: () = msg_send![app_delegate, release];
             pool.drain();
         }
+        Ok(())
     }
 
     fn quit(&self) {

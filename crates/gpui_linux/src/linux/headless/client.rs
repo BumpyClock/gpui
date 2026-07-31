@@ -3,7 +3,6 @@ use std::rc::Rc;
 
 use anyhow::Context as _;
 use calloop::{EventLoop, LoopHandle};
-use gpui_util::ResultExt;
 
 use crate::linux::headless::window::{HeadlessDisplay, HeadlessWindow};
 use crate::linux::{LinuxClient, LinuxCommon, LinuxKeyboardLayout};
@@ -138,7 +137,13 @@ impl LinuxClient for HeadlessClient {
         None
     }
 
-    fn run(&self) {
+    fn run(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(error) = self.with_common(|common| common.event_loop_test_hooks.take_failure())
+        {
+            return Err(error);
+        }
+
         let mut event_loop = self
             .0
             .borrow_mut()
@@ -146,6 +151,9 @@ impl LinuxClient for HeadlessClient {
             .take()
             .expect("App is already running");
 
-        event_loop.run(None, &mut self.clone(), |_| {}).log_err();
+        event_loop
+            .run(None, &mut self.clone(), |_| {})
+            .context("headless event loop failed")?;
+        Ok(())
     }
 }
