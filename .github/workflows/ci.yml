@@ -15,7 +15,7 @@ env:
 jobs:
   quality:
     name: Quality and tests
-    runs-on: ubuntu-latest
+    runs-on: boat
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -28,6 +28,7 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
       - name: Install Linux dependencies
         uses: ./.github/actions/install-linux-dependencies
+      - run: python3 tooling/tests/test_hooks.py
       - run: cargo fmt --all -- --check
       - run: cargo metadata --locked --format-version 1 > /dev/null
       - run: cargo test --locked -p xtask
@@ -84,7 +85,7 @@ jobs:
       fail-fast: false
       matrix:
         backend: [wayland, x11]
-    runs-on: ubuntu-latest
+    runs-on: boat
     timeout-minutes: 45
     env:
       BACKEND: ${{ matrix.backend }}
@@ -112,7 +113,7 @@ jobs:
 
   wasm:
     name: WebAssembly
-    runs-on: ubuntu-latest
+    runs-on: boat
     timeout-minutes: 45
     env:
       CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS: -C target-feature=+atomics,+bulk-memory,+mutable-globals
